@@ -22,7 +22,7 @@ t = dolfinx_adjoint.Function(Q)
 t.name = "time"
 d = 16 * x[0] * (x[0] - 1) * x[1] * (x[1] - 1) * ufl.sin(ufl.pi * t)
 
-dt = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.1))
+dt = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.1))  # type: ignore
 T = 1
 
 V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))  # type: ignore[arg-type]
