@@ -121,7 +121,7 @@ opt_ctrls = pyadjoint.minimize(
     rf,
     method="BFGS",
     # method="Newton-CG",
-    options={"maxiter": 50, "disp": True},
+    options={"maxiter": 100, "disp": True},
 )
 
 out_ctrl = dolfinx.fem.Function(V, name="optimal_control")
@@ -130,5 +130,6 @@ with dolfinx.io.VTXWriter(mesh.comm, "opt_ctrl.bp", [out_ctrl]) as vtx:
         out_ctrl.x.array[:] = c.x.array[:]
         vtx.write(t_val)
 
-assert np.isclose(np.linalg.norm(opt_ctrls[0].x.array), 4.925369634)
-assert np.isclose(np.linalg.norm(opt_ctrls[-1].x.array), 2.871728934)
+
+assert np.isclose(np.linalg.norm(opt_ctrls[0].x.array), 4.930056079391683)
+assert np.isclose(np.linalg.norm(opt_ctrls[-1].x.array), 2.8756312728703963)
