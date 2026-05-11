@@ -9,7 +9,7 @@ import pyadjoint
 import pytest
 import ufl
 
-from dolfinx_adjoint import Function, assemble_scalar, assign
+from dolfinx_adjoint import Function, assemble_scalar, assign, Constant
 
 
 @pytest.fixture(scope="module")
@@ -126,3 +126,36 @@ def test_assign_constant(mesh_var_name: str, request, constant: typing.Union[flo
         options={"maxiter": 200, "disp": True},
     )
     np.testing.assert_allclose(float(opt), float(c), atol=1e-5)
+
+
+def test_assign_constant_derivative():
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dolfinx.mesh.create_unit_interval(MPI.COMM_WORLD, 10)
+
+    # Target constant
+    c = Constant(mesh, dolfinx.default_scalar_type(0.5))
+
+    # Control variable
+    d = pyadjoint.AdjFloat(0.2)
+
+    # Tape the assignment
+    assign(d, c)
+
+    # Assemble a functional: J = c^2 * dx
+    J_form = c**2 * ufl.dx(domain=mesh)
+    J = assemble_scalar(J_form)
+
+    control = pyadjoint.Control(d)
+    Jhat = pyadjoint.ReducedFunctional(J, control)
+
+    # Forward check: J(0.2) = 0.2^2 * 1.0 = 0.04
+    assert np.isclose(Jhat(d), 0.04)
+
+    # Gradient check: dJ/dd = 2*d * 1.0 = 2(0.2) = 0.4
+    dJ = Jhat.derivative()
+    assert np.isclose(dJ, 0.4)
+
+    # Taylor test validation
+    dd = pyadjoint.AdjFloat(0.1)
+    min_rate = pyadjoint.taylor_test(Jhat, d, dd)
+    assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2)

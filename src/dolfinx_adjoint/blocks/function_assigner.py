@@ -45,8 +45,16 @@ class FunctionAssignBlock(Block):
         return ufl.replace(self.expr, replace_map)
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
-        V = self.get_outputs()[0].output.function_space
-        adj_input_func = function_from_vector(V, adj_inputs[0])
+        out_obj = self.get_outputs()[0].output
+
+        # Determine if it's a Function or a Constant
+        if hasattr(out_obj, "function_space"):
+            V = out_obj.function_space
+            adj_input_func = function_from_vector(V, adj_inputs[0])
+        elif isinstance(out_obj, dolfinx.fem.Constant):
+            adj_input_func = adj_inputs[0]  # Just pass the float/array through
+        else:
+            raise NotImplementedError(f"Adjoint preparation for {type(out_obj)} not implemented.")
 
         if self.expr is None:
             return adj_input_func
@@ -57,64 +65,66 @@ class FunctionAssignBlock(Block):
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
         if self.expr is None:
             if isinstance(block_variable.output, AdjFloat):
-                # Adjoint of a broadcast is just a sum
                 if isinstance(adj_inputs[0], dolfinx.la.Vector):
                     vec = adj_inputs[0]
-                    one = dolfinx.la.vector(
-                        adj_inputs[0].index_map, adj_inputs[0].block_size, adj_inputs[0].array.dtype
-                    )
+                    one = _vector(adj_inputs[0].index_map, adj_inputs[0].block_size, adj_inputs[0].array.dtype)
                     one.array[:] = 1
                     return dolfinx.cpp.la.inner_product(vec._cpp_object, one._cpp_object)
                 else:
                     try:
                         return adj_inputs[0].sum()
                     except AttributeError:
-                        # Catch the case where adj_inputs[0] is just a float
                         return adj_inputs[0]
             elif isinstance(func := block_variable.output, dolfinx.fem.Function):
+                adj_output = dolfinx.fem.Function(func.function_space)
                 assert func.function_space == prepared.function_space
+                adj_output.x.array[:] = prepared.x.array[:]
                 vec = _vector(
-                    prepared.x.index_map, prepared.x.block_size, func.function_space, dtype=prepared.x.array.dtype
+                    adj_output.x.index_map, adj_output.x.block_size, func.function_space, dtype=adj_output.x.array.dtype
                 )
-                vec.array[:] = prepared.x.array[:]
+                vec.array[:] = adj_output.x.array[:]
                 return vec
+
+            elif isinstance(block_variable.output, dolfinx.fem.Constant):
+                return prepared  # The adjoint passes through directly
 
             else:
                 raise NotImplementedError(f"Adjoint for {block_variable=} not implemented.")
-            # elif isinstance(block_variable.output, dolfinx.fem.Constant):
-        #         R = block_variable.output._ad_function_space(prepared.function_space.mesh)
-        #         return self._adj_assign_constant(prepared, R)
-        #     else:
-        #         adj_output = dolfinx.fem.Function(
-        #             block_variable.output.function_space())
-        #         adj_output.assign(prepared)
-        #         return adj_output.vector()
-        # else:
-        #     # Linear combination
-        #     expr, adj_input_func = prepared
-        #     adj_output = dolfinx.fem.Function(adj_input_func.function_space)
-        #     if not isinstance(block_variable.output, dolfinx.fem.Constant):
-        #         diff_expr = ufl.algorithms.expand_derivatives(
-        #             ufl.derivative(expr, block_variable.saved_output, adj_input_func)
-        #         )
-        #         adj_output.assign(diff_expr)
-        #     else:
-        #         mesh = adj_output.function_space().mesh()
-        #         diff_expr = ufl.algorithms.expand_derivatives(
-        #             ufl.derivative(
-        #                 expr,
-        #                 block_variable.saved_output,
-        #                 create_constant(1., domain=mesh)
-        #             )
-        #         )
-        #         adj_output.assign(diff_expr)
-        #         return adj_output.vector().inner(adj_input_func.vector())
 
-        #     if isinstance(block_variable.output, dolfin.Constant):
-        #         R = block_variable.output._ad_function_space(adj_output.function_space().mesh())
-        #         return self._adj_assign_constant(adj_output, R)
-        #     else:
-        #         return adj_output.vector()
+    # elif isinstance(block_variable.output, dolfinx.fem.Constant):
+    #         R = block_variable.output._ad_function_space(prepared.function_space.mesh)
+    #         return self._adj_assign_constant(prepared, R)
+    #     else:
+    #         adj_output = dolfinx.fem.Function(
+    #             block_variable.output.function_space())
+    #         adj_output.assign(prepared)
+    #         return adj_output.vector()
+    # else:
+    #     # Linear combination
+    #     expr, adj_input_func = prepared
+    #     adj_output = dolfinx.fem.Function(adj_input_func.function_space)
+    #     if not isinstance(block_variable.output, dolfinx.fem.Constant):
+    #         diff_expr = ufl.algorithms.expand_derivatives(
+    #             ufl.derivative(expr, block_variable.saved_output, adj_input_func)
+    #         )
+    #         adj_output.assign(diff_expr)
+    #     else:
+    #         mesh = adj_output.function_space().mesh()
+    #         diff_expr = ufl.algorithms.expand_derivatives(
+    #             ufl.derivative(
+    #                 expr,
+    #                 block_variable.saved_output,
+    #                 create_constant(1., domain=mesh)
+    #             )
+    #         )
+    #         adj_output.assign(diff_expr)
+    #         return adj_output.vector().inner(adj_input_func.vector())
+
+    #     if isinstance(block_variable.output, dolfin.Constant):
+    #         R = block_variable.output._ad_function_space(adj_output.function_space().mesh())
+    #         return self._adj_assign_constant(adj_output, R)
+    #     else:
+    #         return adj_output.vector()
 
     def _adj_assign_constant(self, adj_output, constant_fs):
         r = dolfinx.fem.Function(constant_fs)
@@ -178,14 +188,18 @@ class FunctionAssignBlock(Block):
     def recompute_component(self, inputs, block_variable, idx, prepared):
         if self.expr is None:
             prepared = inputs[0]
+
+        if isinstance(block_variable.output, dolfinx.fem.Constant):
+            domain = block_variable.output.ufl_domain()
+            return type(block_variable.output)(domain, prepared)
+
         output = dolfinx.fem.Function(
-            block_variable.output.function_space, name="f{block_variable.output.name}_AssignBlockRecompute"
+            block_variable.output.function_space, name=f"{block_variable.output.name}_AssignBlockRecompute"
         )
         try:
             if output.function_space == prepared.function_space:
                 output.x.array[:] = prepared.x.array[:]
         except AttributeError:
-            # Handling float value
             output.x.array[:] = prepared
         return output
 
