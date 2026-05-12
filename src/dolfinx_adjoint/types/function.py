@@ -206,6 +206,24 @@ class Function(dolfinx.fem.Function, FloatingType):
         return dst, offset
 
 
+class Constant(Function):
+    def __init__(
+        self,
+        domain: dolfinx.mesh.Mesh,
+        c: float | numpy.floating | complex | numpy.complexfloating | typing.Sequence | numpy.ndarray,
+    ):
+        import scifem
+
+        value_shape = numpy.shape(c)
+        V = scifem.create_real_functionspace(domain, value_shape=value_shape)
+        super().__init__(V)
+        self.x.array[:] = c
+
+    @property
+    def value(self):
+        return self.x.array[:]
+
+
 register_overloaded_type(Function, (dolfinx.fem.Function, Function))
 
 
