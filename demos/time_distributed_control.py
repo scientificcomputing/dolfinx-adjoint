@@ -14,11 +14,11 @@ import dolfinx_adjoint
 
 mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
 x = ufl.SpatialCoordinate(mesh)
-# FIXME: Until constant is taped we need to use Function
+
 nu = dolfinx.fem.Constant(mesh, np.float64(1e-5))
 nu.name = "nu"  # type: ignore
-Q = dolfinx.fem.functionspace(mesh, ("DG", 0))  # type: ignore[arg-type]
-t = dolfinx_adjoint.Function(Q)
+
+t = dolfinx_adjoint.Constant(mesh, dolfinx.default_scalar_type(0.0))
 t.name = "time"
 d = 16 * x[0] * (x[0] - 1) * x[1] * (x[1] - 1) * ufl.sin(ufl.pi * t)
 
