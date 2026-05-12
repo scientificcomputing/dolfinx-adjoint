@@ -10,9 +10,7 @@ from ufl.formatting.ufl2unicode import ufl2unicode
 from ._vector import _create_vector, _SpecialVector
 
 
-def assemble_compiled_form(
-    form: dolfinx.fem.Form, tensor: typing.Optional[typing.Union[dolfinx.la.Vector, _SpecialVector | float]] = None
-) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
+def assemble_compiled_form(form: dolfinx.fem.Form, tensor: typing.Optional[typing.Union[dolfinx.la.Vector, _SpecialVector | float]] = None) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
     """Assemble a compiled form and optionally apply Dirichlet boundary condition.
 
     Args:
@@ -68,15 +66,15 @@ class AssembleBlock(Block):
 
         # Store compiled and original form
         self.form = form
-        self.compiled_form = dolfinx.fem.form(
-            form, jit_options=jit_options, form_compiler_options=form_compiler_options, entity_maps=entity_maps
-        )
+        self.compiled_form = dolfinx.fem.form(form, jit_options=jit_options, form_compiler_options=form_compiler_options, entity_maps=entity_maps)
 
         # NOTE: Add when we want to do shape optimization
         # mesh = self.form.ufl_domain().ufl_cargo()
         # self.add_dependency(mesh)
         for coefficient in self.form.coefficients():
             self.add_dependency(coefficient, no_duplicates=True)
+        for constant in self.form.constants():
+            self.add_dependency(constant, no_duplicates=True)
         # Set up cache for vectors that can be reused in adjoint action
         # self._cached_vectors: dict[int, _SpecialVector] = {}
 
@@ -115,12 +113,21 @@ class AssembleBlock(Block):
             space: The function space associated with the `c_rep` to form an `ufl.Argument` in.
             dform: Pre-computed derivative form, :math:`\\frac{\\partial form}{\\partial c_{rep}}`.
         """
+
         if arity_form == 0:
             assert arity_form == self.compiled_form.rank, "Inconsistent arity of input form and block form."
             if dform is None:
                 assert space is not None
-                dc = ufl.TestFunction(space)
-                dform = ufl.derivative(form, c_rep, dc)
+                if isinstance(c_rep, dolfinx.fem.Constant):
+                    # Substitute Constant with Real space Function
+                    c_func = dolfinx.fem.Function(space)
+                    c_func.x.array[:] = c_rep.value
+                    form_v = ufl.replace(form, {c_rep: c_func})
+                    dc = ufl.TestFunction(space)
+                    dform = ufl.derivative(form_v, c_func, dc)
+                else:
+                    dc = ufl.TestFunction(space)
+                    dform = ufl.derivative(form, c_rep, dc)
 
             assert isinstance(dform, ufl.Form), "dform must be a UFL form."
             compiled_adjoint = dolfinx.fem.form(
@@ -142,38 +149,41 @@ class AssembleBlock(Block):
             # self._cached_vectors[id(space)].array[:] = 0.0
             # assemble_compiled_form(compiled_adjoint, self._cached_vectors[id(space)])
             assemble_compiled_form(compiled_adjoint, vector)
-            # return a vector scaled by the scalar `adj_input`
             vector.array[:] *= vector.x.array.dtype.type(adj_input)
             vector.scatter_forward()
+
+            # Return a scalar for Constant adjoint output
+            if isinstance(c_rep, dolfinx.fem.Constant):
+                return float(vector.array[0]) if len(vector.array) > 0 else 0.0, dform
 
             return vector, dform
             # Return a Vector scaled by the scalar `adj_input`
             # self._cached_vectors[id(space)].array[:] *= adj_input
             # self._cached_vectors[id(space)].scatter_forward()
             # return self._cached_vectors[id(space)], dform
-        # elif arity_form == 1:
-        #     if dform is None:
-        #         dc = dolfin.TrialFunction(space)
-        #         dform = dolfin.derivative(form, c_rep, dc)
-        #     # Get the Function
-        #     adj_input = adj_input.function
-        #     # Symbolic operators such as action/adjoint require derivatives to have been expanded beforehand.
-        #     # However, UFL doesn't support expanding coordinate derivatives of Coefficients in physical space,
-        #     # implying that we can't symbolically take the action/adjoint of the Jacobian for SpatialCoordinates.
-        #     # -> Workaround: Apply action/adjoint numerically (using PETSc).
-        #     if not isinstance(c_rep, dolfin.SpatialCoordinate):
-        #         # Symbolically compute: (dform/dc_rep)^* * adj_input
-        #         adj_output = dolfin.action(dolfin.adjoint(dform), adj_input)
-        #         adj_output = assemble_adjoint_value(adj_output)
-        #     else:
-        #         # Get PETSc matrix
-        #         dform_mat = assemble_adjoint_value(dform).petscmat
-        #         # Action of the adjoint (Hermitian transpose)
-        #         adj_output = dolfin.Function(space)
-        #         with adj_input.dat.vec_ro as v_vec:
-        #             with adj_output.dat.vec as res_vec:
-        #                 dform_mat.multHermitian(v_vec, res_vec)
-        #     return adj_output, dform
+            # elif arity_form == 1:
+            #     if dform is None:
+            #         dc = dolfin.TrialFunction(space)
+            #         dform = dolfin.derivative(form, c_rep, dc)
+            #     # Get the Function
+            #     adj_input = adj_input.function
+            #     # Symbolic operators such as action/adjoint require derivatives to have been expanded beforehand.
+            #     # However, UFL doesn't support expanding coordinate derivatives of Coefficients in physical space,
+            #     # implying that we can't symbolically take the action/adjoint of the Jacobian for SpatialCoordinates.
+            #     # -> Workaround: Apply action/adjoint numerically (using PETSc).
+            #     if not isinstance(c_rep, dolfin.SpatialCoordinate):
+            #         # Symbolically compute: (dform/dc_rep)^* * adj_input
+            #         adj_output = dolfin.action(dolfin.adjoint(dform), adj_input)
+            #         adj_output = assemble_adjoint_value(adj_output)
+            #     else:
+            #         # Get PETSc matrix
+            #         dform_mat = assemble_adjoint_value(dform).petscmat
+            #         # Action of the adjoint (Hermitian transpose)
+            #         adj_output = dolfin.Function(space)
+            #         with adj_input.dat.vec_ro as v_vec:
+            #             with adj_output.dat.vec as res_vec:
+            #                 dform_mat.multHermitian(v_vec, res_vec)
+            #     return adj_output, dform
         else:
             raise ValueError("Forms with arity > 1 are not handled yet!")
 
@@ -183,6 +193,8 @@ class AssembleBlock(Block):
             coeff = block_variable.output
             c_rep = block_variable.saved_output
             if coeff in self.form.coefficients():
+                replaced_coeffs[coeff] = c_rep
+            if coeff in self.form.coefficients() or coeff in self.form.constants():
                 replaced_coeffs[coeff] = c_rep
 
         form = ufl.replace(self.form, replaced_coeffs)
@@ -198,14 +210,15 @@ class AssembleBlock(Block):
 
         arity_form = len(extract_arguments(form))
 
-        # if isinstance(c, dolfin.Constant):
-        #     mesh = extract_mesh_from_form(self.form)
-        #     space = c._ad_function_space(mesh)
         if isinstance(c, dolfinx.fem.Function):
             space = c.function_space
-        # elif isinstance(c, dolfin.Mesh):
-        #     c_rep = dolfin.SpatialCoordinate(c_rep)
-        #     space = c._ad_function_space()
+        elif isinstance(c, dolfinx.fem.Constant):
+            domain = form.ufl_domain()
+            mesh = dolfinx.mesh.Mesh(domain.ufl_cargo(), domain)
+            space = c._ad_function_space(mesh)
+
+        else:
+            raise NotImplementedError(f"Adjoint evaluation for {type(c)} not implemented.")
 
         return self.compute_action_adjoint(adj_input, arity_form, form, c_rep, space)[0]
 

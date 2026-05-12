@@ -176,9 +176,7 @@ class LinearProblemBlock(pyadjoint.Block):
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
         lhs = self._replace_coefficients_in_form(self._lhs)
         rhs = self._replace_coefficients_in_form(self._rhs)
-        preconditioner = (
-            self._replace_coefficients_in_form(self._preconditioner) if self._preconditioner is not None else None
-        )
+        preconditioner = self._replace_coefficients_in_form(self._preconditioner) if self._preconditioner is not None else None
         compiled_lhs = dolfinx.fem.form(
             lhs,
             jit_options=self._jit_options,
@@ -209,16 +207,12 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver.bcs = bcs
         self._forward_solver._u = initial_guess
 
-    def recompute_component(
-        self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
-    ) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
+    def recompute_component(self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
         """Recompute the block with the prepared linear problem."""
         solution = self._forward_solver.solve()
         return solution
 
-    def _should_compute_boundary_adjoint(
-        self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
-    ) -> bool:
+    def _should_compute_boundary_adjoint(self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]) -> bool:
         """Determine if the adjoint should be computed with respect to the boundary conditions."""
         bdy = False
         for _, dep in relevant_dependencies:
@@ -228,9 +222,7 @@ class LinearProblemBlock(pyadjoint.Block):
         return bdy
 
     @classmethod
-    def _compute_adjoint(
-        cls, form: typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]
-    ) -> typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]:
+    def _compute_adjoint(cls, form: typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]) -> typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]:
         """
         Compute adjoint of a bilinear form :math:`a(u, v)`, which could be written as a blocked system.
         """
@@ -259,15 +251,11 @@ class LinearProblemBlock(pyadjoint.Block):
         replacement_functions = self.get_outputs()
         F_form: typing.Union[ufl.Form, list[ufl.Form]] = []
         if isinstance(self._u, Function):
-            assert len(replacement_functions) == 1, (
-                f"Expected a single output function, got {len(replacement_functions)}"
-            )
+            assert len(replacement_functions) == 1, f"Expected a single output function, got {len(replacement_functions)}"
             F_form = ufl.action(self._lhs, replacement_functions[0].saved_output) - self._rhs
         else:
             # Blocked formulation (assuming no mixed function-space)
-            assert len(self._u) == len(replacement_functions), (
-                f"Expected {len(self._u)} output functions, got {len(replacement_functions)}"
-            )
+            assert len(self._u) == len(replacement_functions), f"Expected {len(self._u)} output functions, got {len(replacement_functions)}"
             for i in range(len(self._u)):
                 assert isinstance(F_form, list)
                 res_i = ufl.ZeroBaseForm((self._u[i],))
@@ -303,9 +291,7 @@ class LinearProblemBlock(pyadjoint.Block):
                     dFdu[-1].append(ufl.derivative(F_form[i], outputs[j], ufl.TrialFunction(outputs[j].function_space)))
         return dFdu
 
-    def prepare_evaluate_tlm(
-        self, inputs, tlm_inputs, relevant_outputs
-    ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
+    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
         F_form = self._compute_residual()
         dFdu_compiled = dolfinx.fem.form(
             self._compute_residual_derivative(),  # type: ignore[arg-type]
@@ -340,7 +326,20 @@ class LinearProblemBlock(pyadjoint.Block):
             if tlm_value is None:
                 continue
 
-            dFdm += ufl.derivative(-F, c_rep, tlm_value)
+            if isinstance(c_rep, dolfinx.fem.Constant):
+                mesh = F.ufl_domain()
+                space = c_rep._ad_function_space(mesh)
+
+                c_func = dolfinx.fem.Function(space)
+                c_func.x.array[:] = c_rep.value
+                F_v = ufl.replace(F, {c_rep: c_func})
+
+                tlm_func = dolfinx.fem.Function(space)
+                tlm_func.x.array[:] = tlm_value
+
+                dFdm += ufl.derivative(-F_v, c_func, tlm_func)
+            else:
+                dFdm += ufl.derivative(-F, c_rep, tlm_value)
 
         if isinstance(dFdm, float):
             v = dFdu.arguments()[0]
@@ -421,6 +420,15 @@ class LinearProblemBlock(pyadjoint.Block):
         c_rep = block_variable.saved_output
         if isinstance(c, dolfinx.fem.Function):
             dc = ufl.TrialFunction(c.function_space)
+        elif isinstance(c_rep, dolfinx.fem.Constant):
+            mesh = residual.ufl_domain()
+            space = c_rep._ad_function_space(mesh)
+
+            c_func = dolfinx.fem.Function(space)
+            c_func.x.array[:] = c_rep.value
+            residual_v = ufl.replace(residual, {c_rep: c_func})
+            dc = ufl.TrialFunction(space)
+            dFdm = -ufl.derivative(residual_v, c_func, dc)
         else:
             raise NotImplementedError(f"Unsupported control {type(c)}")
 
@@ -463,6 +471,19 @@ class LinearProblemBlock(pyadjoint.Block):
                 continue
             if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
                 raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+            elif isinstance(c_rep, dolfinx.fem.Constant):
+                mesh = dFdu_form.ufl_domain()
+                space = c_rep._ad_function_space(mesh)
+
+                c_func = dolfinx.fem.Function(space)
+                c_func.x.array[:] = c_rep.value
+
+                tlm_func = dolfinx.fem.Function(space)
+                tlm_func.x.array[:] = tlm_input
+
+                dFdu_adj = ufl.action(ufl.adjoint(dFdu_form), self._adjoint_solutions)
+                dFdu_adj_v = ufl.replace(dFdu_adj, {c_rep: c_func})
+                b_form += ufl.derivative(dFdu_adj_v, c_func, tlm_func)
             else:
                 dFdu_adj = ufl.action(ufl.adjoint(dFdu_form), self._adjoint_solutions)
                 b_form += ufl.derivative(dFdu_adj, c_rep, tlm_input)
@@ -523,9 +544,10 @@ class LinearProblemBlock(pyadjoint.Block):
             raise NotImplementedError("Hessian computation for DirichletBC control not implemented yet.")
 
         if isinstance(c_rep, dolfinx.fem.Constant):
-            raise NotImplementedError("Hessian computation for Constant control not implemented yet.")
-            # mesh = extract_mesh_from_form(F_form)
-            # W = c._ad_function_space(mesh)
+            mesh = F_form.ufl_domain()
+            W = c_rep._ad_function_space(mesh)
+            c_eval = dolfinx.fem.Function(W)
+            c_eval.x.array[:] = c_rep.value
 
         elif isinstance(c, dolfinx.mesh.Mesh):
             raise NotImplementedError("Hessian computation for Mesh control not implemented yet.")
@@ -638,6 +660,11 @@ class NonlinearProblemBlock(pyadjoint.Block):
                 self.add_dependency(c, no_duplicates=True)
             for c in self._rhs.coefficients():  # type: ignore
                 self.add_dependency(c, no_duplicates=True)
+
+            for c in self._lhs.constants():
+                self.add_dependency(c, no_duplicates=True)
+            for c in self._rhs.constants():
+                self.add_dependency(c, no_duplicates=True)
         except AttributeError:
             raise NotImplementedError("Blocked systems not implemented yet.")
         self._compiled_lhs = dolfinx.fem.form(
@@ -718,8 +745,10 @@ class NonlinearProblemBlock(pyadjoint.Block):
         replace_map = {}
         for block_variable in self.get_dependencies():
             coeff = block_variable.output
-            if coeff in form.coefficients():
+
+            if coeff in form.coefficients() or coeff in form.constants():
                 replace_map[coeff] = block_variable.saved_output
+
         return replace_map
 
     def _replace_coefficients_in_form(self, form: ufl.Form) -> ufl.Form:
@@ -755,9 +784,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
         lhs = self._replace_coefficients_in_form(self._lhs)
         rhs = self._replace_coefficients_in_form(self._rhs)
-        preconditioner = (
-            self._replace_coefficients_in_form(self._preconditioner) if self._preconditioner is not None else None
-        )
+        preconditioner = self._replace_coefficients_in_form(self._preconditioner) if self._preconditioner is not None else None
         compiled_lhs = dolfinx.fem.form(
             lhs,
             jit_options=self._jit_options,
@@ -788,16 +815,12 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._forward_solver.bcs = bcs
         self._forward_solver._u = initial_guess
 
-    def recompute_component(
-        self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
-    ) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
+    def recompute_component(self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
         """Recompute the block with the prepared linear problem."""
         solution = self._forward_solver.solve()
         return solution
 
-    def _should_compute_boundary_adjoint(
-        self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
-    ) -> bool:
+    def _should_compute_boundary_adjoint(self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]) -> bool:
         """Determine if the adjoint should be computed with respect to the boundary conditions."""
         bdy = False
         for _, dep in relevant_dependencies:
@@ -807,9 +830,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         return bdy
 
     @classmethod
-    def _compute_adjoint(
-        cls, form: typing.Union[ufl.Form, typing.Iterable[typing.Iterable[ufl.Form]]]
-    ) -> typing.Union[ufl.Form, typing.Sequence[typing.Iterable[ufl.Form]]]:
+    def _compute_adjoint(cls, form: typing.Union[ufl.Form, typing.Iterable[typing.Iterable[ufl.Form]]]) -> typing.Union[ufl.Form, typing.Sequence[typing.Iterable[ufl.Form]]]:
         """
         Compute adjoint of a bilinear form :math:`a(u, v)`, which could be written as a blocked system.
         """
@@ -870,9 +891,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
                     dFdu[-1].append(ufl.derivative(F_form[i], outputs[j], ufl.TrialFunction(outputs[j].function_space)))
         return dFdu
 
-    def prepare_evaluate_tlm(
-        self, inputs, tlm_inputs, relevant_outputs
-    ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
+    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
         F_form = self._compute_residual()
 
         dFdu_compiled = dolfinx.fem.form(

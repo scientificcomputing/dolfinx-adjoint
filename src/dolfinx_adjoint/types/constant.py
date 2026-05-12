@@ -21,13 +21,14 @@ class Constant(dolfinx.fem.Constant, FloatingType):
             **kwargs,
         )
 
-    def _ad_init_object(self, obj):
-        return type(self)(self.ufl_domain(), obj)
+    @classmethod
+    def _ad_init_object(cls, obj):
+        return cls(obj.ufl_domain(), obj.value)
 
     @no_annotations
     def _ad_create_checkpoint(self):
         # Create a checkpoint using the underlying value
-        return create_overloaded_object(dolfinx.fem.Constant(None, self.value.copy()))
+        return create_overloaded_object(dolfinx.fem.Constant(self.ufl_domain(), self.value.copy()))
 
     def _ad_restore_at_checkpoint(self, checkpoint):
         return checkpoint
@@ -37,6 +38,11 @@ class Constant(dolfinx.fem.Constant, FloatingType):
 
     def _ad_copy(self):
         return Constant(self.ufl_domain(), self.value.copy())
+
+    def _ad_function_space(self, mesh):
+        import scifem
+
+        return scifem.create_real_functionspace(mesh)
 
 
 register_overloaded_type(Constant, (dolfinx.fem.Constant, Constant))
