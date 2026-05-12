@@ -7,7 +7,7 @@ import ufl
 from pyadjoint import Block, create_overloaded_object
 from ufl.formatting.ufl2unicode import ufl2unicode
 
-from ._vector import _create_vector, _SpecialVector
+from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
 
 
 def assemble_compiled_form(form: dolfinx.fem.Form, tensor: typing.Optional[typing.Union[dolfinx.la.Vector, _SpecialVector | float]] = None) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
