@@ -18,7 +18,7 @@ x = ufl.SpatialCoordinate(mesh)
 nu = dolfinx.fem.Constant(mesh, np.float64(1e-5))
 nu.name = "nu"  # type: ignore
 
-t = dolfinx_adjoint.Constant(mesh, dolfinx.default_scalar_type(0.0))
+t = dolfinx_adjoint.Constant(mesh, dolfinx.default_scalar_type(0.0))  # type: ignore
 t.name = "time"
 d = 16 * x[0] * (x[0] - 1) * x[1] * (x[1] - 1) * ufl.sin(ufl.pi * t)
 
