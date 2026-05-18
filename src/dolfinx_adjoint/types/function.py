@@ -2,6 +2,7 @@ from __future__ import annotations  # for Python<3.11
 
 import dolfinx
 import numpy
+import numpy.typing as npt
 import ufl
 from pyadjoint.overloaded_type import (
     FloatingType,
@@ -40,7 +41,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         V: dolfinx.fem.FunctionSpace,
         x: typing.Optional[dolfinx.la.Vector] = None,
         name: typing.Optional[str] = None,
-        dtype: numpy.dtype = dolfinx.default_scalar_type,
+        dtype: npt.DTypeLike = dolfinx.default_scalar_type,
         **kwargs,
     ):
         super(Function, self).__init__(
