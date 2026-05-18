@@ -254,6 +254,7 @@ class Constant(Function):
 
 
 register_overloaded_type(Function, (dolfinx.fem.Function, Function))
+register_overloaded_type(Constant, (dolfinx.fem.Constant, Constant))
 
 
 def assign(value: typing.Union[numpy.inexact, float, int], function: Function, **kwargs: typing.Unpack[ad_kwargs]):
