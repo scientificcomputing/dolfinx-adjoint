@@ -41,7 +41,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         V: dolfinx.fem.FunctionSpace,
         x: typing.Optional[dolfinx.la.Vector] = None,
         name: typing.Optional[str] = None,
-        dtype: numpy.dtype = dolfinx.default_scalar_type,
+        dtype: numpy.dtype = dolfinx.default_scalar_type,  # type: ignore[assignment]
         **kwargs,
     ):
         super(Function, self).__init__(
