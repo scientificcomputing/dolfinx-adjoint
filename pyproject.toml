@@ -12,7 +12,6 @@ dependencies = [
       "fenics-dolfinx>=0.10.0",
       "pyadjoint-ad>=2025.10.0",
       "typing_extensions; python_version < '3.11'",
-      "scifem",
 ]
 
 
