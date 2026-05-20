@@ -563,8 +563,10 @@ class LinearProblemBlock(pyadjoint.Block):
             if tlm_input is None:
                 continue
 
-            if c2 == self._u and not self.linear:
-                continue
+            # If problem is non-linear we need to skip the output variable as a control, as we can't differentiate with
+            # respect to the initial guess
+            # if c2 == self._u and not self.linear:
+            #     continue
 
             # TODO: If tlm_input is a Sum, this crashes in some instances?
             if isinstance(c2_rep, dolfinx.mesh.Mesh):

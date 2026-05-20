@@ -8,6 +8,8 @@ from ufl.formatting.ufl2unicode import ufl2unicode
 
 from dolfinx_adjoint.utils import function_from_vector
 
+from ._vector import _vector
+
 
 class FunctionAssignBlock(Block):
     def __init__(
@@ -70,10 +72,13 @@ class FunctionAssignBlock(Block):
                         # Catch the case where adj_inputs[0] is just a float
                         return adj_inputs[0]
             elif isinstance(func := block_variable.output, dolfinx.fem.Function):
-                adj_output = dolfinx.fem.Function(func.function_space)
                 assert func.function_space == prepared.function_space
-                adj_output.x.array[:] = prepared.x.array[:]
-                return adj_output.x
+                vec = _vector(
+                    prepared.x.index_map, prepared.x.block_size, func.function_space, dtype=prepared.x.array.dtype
+                )
+                vec.array[:] = prepared.x.array[:]
+                return vec
+
             else:
                 raise NotImplementedError(f"Adjoint for {block_variable=} not implemented.")
             # elif isinstance(block_variable.output, dolfinx.fem.Constant):

@@ -1,5 +1,6 @@
 from __future__ import annotations  # for Python<3.11
 
+import basix.ufl
 import dolfinx
 import numpy
 import numpy.typing as npt
@@ -207,7 +208,54 @@ class Function(dolfinx.fem.Function, FloatingType):
         return dst, offset
 
 
+class Constant(Function):
+    """A class overloading {py:class}`dolfinx.fem.Constant`
+    to support it being used as a control variable in
+    the adjoint framework.
+
+    Args:
+        domain: The mesh on which the constant is defined.
+        c: The value of the constant. Can be a scalar, a sequence, or a numpy array.
+
+    Note:
+        The {py:class}`Constant` class is implemented as a subclass of {py:class}`Function` to leverage the
+        existing functionality for handling function spaces and vectors. The value of
+        the constant is stored in the underlying vector of the function, and the class
+        provides a property to access this value conveniently.
+
+        If {py:func}`basix.ufl.real_element` is not available, the class will attempt to use
+        {py:mod}`scifem` to create a function space for the constant (which would then require
+        {py:mod}`scifem` to be installed - :code:`pip install scifem`).
+
+    """
+
+    def __init__(
+        self,
+        domain: dolfinx.mesh.Mesh,
+        c: float | numpy.floating | complex | numpy.complexfloating | typing.Sequence | numpy.ndarray,
+    ):
+        value_shape = numpy.shape(c)
+        try:
+            el = basix.ufl.real_element(domain.basix_cell(), value_shape=numpy.shape(c))
+            V = dolfinx.fem.functionspace(domain, el)
+
+        except AttributeError:
+            try:
+                import scifem
+            except ImportError as e:
+                raise ImportError("scifem is required to use Constant 'pip install scifem") from e
+
+            V = scifem.create_real_functionspace(domain, value_shape=value_shape)
+        super().__init__(V)
+        self.x.array[:] = c
+
+    @property
+    def value(self):
+        return self.x.array[:]
+
+
 register_overloaded_type(Function, (dolfinx.fem.Function, Function))
+register_overloaded_type(Constant, (dolfinx.fem.Constant, Constant))
 
 
 def assign(value: typing.Union[numpy.inexact, float, int], function: Function, **kwargs: typing.Unpack[ad_kwargs]):

@@ -24,6 +24,8 @@ docs = [
       "moola@git+https://github.com/funsim/moola.git",
       "pandas",
       "pyvista[all]>0.45",
+      "networkx", 
+      "pygraphviz"
 ]
 all = ["dolfinx_adjoint[test]", "dolfinx_adjoint[dev]", "dolfinx_adjoint[docs]"]
 
