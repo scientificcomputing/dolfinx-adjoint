@@ -209,7 +209,7 @@ class Function(dolfinx.fem.Function, FloatingType):
 
 
 class Constant(Function):
-    """A class overloading `dolfinx.fem.Constant`
+    """A class overloading {py:class}`dolfinx.fem.Constant`
     to support it being used as a control variable in
     the adjoint framework.
 
@@ -218,14 +218,14 @@ class Constant(Function):
         c: The value of the constant. Can be a scalar, a sequence, or a numpy array.
 
     Note:
-        The `Constant` class is implemented as a subclass of `Function` to leverage the
+        The {py:class}`Constant` class is implemented as a subclass of {py:class}`Function` to leverage the
         existing functionality for handling function spaces and vectors. The value of
         the constant is stored in the underlying vector of the function, and the class
         provides a property to access this value conveniently.
 
-        If :code:`basix.ufl.real_element` is not available, the class will attempt to use
-        :code:`scifem` to create a function space for the constant (which would then require
-        :code:`scifem` to be installed - :code:`pip install scifem`).
+        If {py:func}`basix.ufl.real_element` is not available, the class will attempt to use
+        {py:mod}`scifem` to create a function space for the constant (which would then require
+        {py:mod}`scifem` to be installed - :code:`pip install scifem`).
 
     """
 
