@@ -24,7 +24,7 @@ html:
 
 
 bibtex_bibfiles:
-  - bibliography.bib
+  - docs/bibliography.bib
 
 
 parse:
