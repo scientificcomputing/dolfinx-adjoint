@@ -31,7 +31,9 @@ jobs:
         run: apt-get update && apt-get install -y mesa-utils
 
       - name: Install dependencies
-        run: python3 -m pip install ".[docs]"
+        run: |
+          python3 -m pip install git+https://github.com/funsim/moola.git
+          python3 -m pip install ".[docs]"
 
       - name: Build docs
         run: jupyter book build -W .
