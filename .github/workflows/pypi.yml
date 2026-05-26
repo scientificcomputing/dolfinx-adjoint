@@ -1,31 +1,31 @@
-name: Release
+name: PyPI
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - "main"
+
 
 jobs:
   dist:
     runs-on: ubuntu-latest
-    container: ghcr.io/fenics/dolfinx/dolfinx:nightly
-    env:
-      DEB_PYTHON_INSTALL_LAYOUT: deb_system
-
     steps:
     - uses: actions/checkout@v6
 
-    - name: Install build dependencies
-      run: |
-        python3 -m pip install --upgrade build twine
-        python3 -m pip install -r build-requirements.txt
-
     - name: Build SDist and wheel
-      run: python3 -m build --no-isolation --sdist
+      run: pipx run build
 
     - uses: actions/upload-artifact@v7
       with:
         path: dist/*
 
     - name: Check metadata
-      run: python3 -m twine check dist/*
+      run: pipx run twine check dist/*
 
   publish:
     needs: [dist]
