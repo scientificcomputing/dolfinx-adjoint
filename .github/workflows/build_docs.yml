@@ -26,17 +26,17 @@ jobs:
 
       - name: Install graphviz
         run: apt update && apt install -y graphviz-dev
-        
+
       - name: Install mesa-utils
-        run: apt-get update && apt-get install -y mesa-utils 
-       
+        run: apt-get update && apt-get install -y mesa-utils
+
       - name: Install dependencies
         run: python3 -m pip install ".[docs]"
 
       - name: Build docs
         run: jupyter book build -W .
 
-      - name: Upload artifact 
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         # always upload artifact, which can include error messages
         if: always()

@@ -15,7 +15,7 @@ concurrency:
   group: "pages"
   cancel-in-progress: true
 
-jobs:  
+jobs:
 
   check-formatting:
     uses: ./.github/workflows/check_formatting.yml
@@ -48,7 +48,7 @@ jobs:
     #     with:
     #       name: code-coverage-report
     #       path: "./public/code-coverage-report"
-  
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
         with:
