@@ -6,7 +6,8 @@ name = "dolfinx_adjoint"
 version = "0.2.0"
 description = "Automatic differentation compatible with DOLFINx"
 authors = [{ name = "Jørgen S. Dokken", email = "dokken@simula.no" }]
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 readme = "README.md"
 dependencies = [
       "fenics-dolfinx>=0.10.0",
