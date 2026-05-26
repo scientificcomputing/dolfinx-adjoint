@@ -97,3 +97,14 @@ current_version = "0.2.0"
 filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
+
+
+[[tool.bumpversion.files]]
+filename = "README.md"
+search = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{current_version}"
+replace = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{new_version}"
+
+[[tool.bumpversion.files]]
+filename = "Dockerfile"
+search = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{current_version}"
+replace = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{new_version}"

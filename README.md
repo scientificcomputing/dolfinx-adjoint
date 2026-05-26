@@ -49,7 +49,7 @@ python3 -m pip install -e ".[all]"
 A pre-built Docker image is automatically published by the CI. You can pull the nightly build which comes with DOLFINx and DOLFINx-Adjoint pre-installed:
 
 ```bash
-docker run -ti ghcr.io/scientificcomputing/dolfinx-adjoint:v0.1.0
+docker run -ti ghcr.io/scientificcomputing/dolfinx-adjoint:v0.2.0
 ```
 
 *(Note: Adjust the tag to the latest release or build).*
