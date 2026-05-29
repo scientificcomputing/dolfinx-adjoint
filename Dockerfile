@@ -1,5 +1,5 @@
 # Use github pages for docker image
-FROM ghcr.io/jorgensd/dxa:v0.1.0
+FROM ghcr.io/scientificcomputing/dolfinx-adjoint:v0.2.0
 
 # Create user with a home directory
 ARG NB_USER

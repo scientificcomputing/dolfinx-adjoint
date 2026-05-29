@@ -32,6 +32,6 @@ jobs:
         run: |
           ruff check .
           ruff format --check .
-      
+
       - name: Mypy check
         run: python3 -m mypy .

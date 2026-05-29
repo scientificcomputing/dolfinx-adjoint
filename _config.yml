@@ -24,7 +24,7 @@ html:
 
 
 bibtex_bibfiles:
-  - bibliography.bib
+  - docs/bibliography.bib
 
 
 parse:
@@ -46,4 +46,4 @@ sphinx:
   - 'sphinx.ext.autodoc'
   - 'sphinx.ext.napoleon'
   - 'sphinx.ext.viewcode'
-exclude_patterns: ["README.md",".pytest_cache/*"]
+exclude_patterns: [".pytest_cache/*"]

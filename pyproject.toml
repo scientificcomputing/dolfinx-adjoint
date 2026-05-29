@@ -2,11 +2,12 @@
 requires = ["setuptools>=61.0.0", "wheel"]
 
 [project]
-name = "dolfinx_adjoint"
+name = "dolfinx-adjoint"
 version = "0.2.0"
 description = "Automatic differentation compatible with DOLFINx"
 authors = [{ name = "Jørgen S. Dokken", email = "dokken@simula.no" }]
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 readme = "README.md"
 dependencies = [
       "fenics-dolfinx>=0.10.0",
@@ -21,10 +22,10 @@ dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",
       "jupytext",
-      "moola@git+https://github.com/funsim/moola.git",
+      # "moola@git+https://github.com/funsim/moola.git",
       "pandas",
       "pyvista[all]>0.45",
-      "networkx", 
+      "networkx",
       "pygraphviz"
 ]
 all = ["dolfinx_adjoint[test]", "dolfinx_adjoint[dev]", "dolfinx_adjoint[docs]"]
@@ -80,3 +81,31 @@ section-order = [
 
 [tool.ruff.lint.isort.sections]
 "mpi" = ["mpi4py", "petsc4py"]
+
+
+[tool.bumpversion]
+allow_dirty = false
+commit = true
+message = "Bump version: {current_version} → {new_version}"
+tag = true
+sign_tags = false
+tag_name = "v{new_version}"
+tag_message = "Bump version: {current_version} → {new_version}"
+current_version = "0.2.0"
+
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+
+[[tool.bumpversion.files]]
+filename = "README.md"
+search = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{current_version}"
+replace = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{new_version}"
+
+[[tool.bumpversion.files]]
+filename = "Dockerfile"
+search = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{current_version}"
+replace = "ghcr.io/scientificcomputing/dolfinx-adjoint:v{new_version}"
