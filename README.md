@@ -18,7 +18,7 @@ Read the [Latest Documentation here](https://scientificcomputing.github.io/dolfi
 
 ### Dependencies
 
-DOLFINx-Adjoint requires **DOLFINx** (>=0.10.0) and **pyadjoint-ad**.
+DOLFINx-Adjoint requires **DOLFINx** (>=0.11.0) and **pyadjoint-ad**.
 
 ### via pip
 
