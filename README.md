@@ -63,6 +63,7 @@ Using `dolfinx_adjoint` is designed to be as close to standard `dolfinx` syntax 
 import dolfinx
 from mpi4py import MPI
 import pyadjoint
+import ufl
 import dolfinx_adjoint
 
 # Create mesh and function space
@@ -72,16 +73,31 @@ V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
 # Use dolfinx_adjoint overloaded types
 # This ensures operations are tracked on the pyadjoint tape!
 f = dolfinx_adjoint.Function(V, name="Control")
+f.interpolate(lambda x: x[0] + x[1]) # Initial guess for control
 uh = dolfinx_adjoint.Function(V, name="State")
 
-# ... Define your UFL forms ...
+# Define UFL forms for a simple Poisson problem: - \Delta u = f
+u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+a = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+L = f * v * ufl.dx
+
+# Set up Dirichlet boundary condition (u = 0 on boundary)
+mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+exterior_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+exterior_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, exterior_facets)
+bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), exterior_dofs, V)
 
 # Use overloaded solvers
 problem = dolfinx_adjoint.LinearProblem(a, L, u=uh, bcs=[bc])
 problem.solve()
 
+# Define a desired temperature profile 'd' and regularization parameter 'alpha'
+x = ufl.SpatialCoordinate(mesh)
+d = ufl.sin(ufl.pi * x[0]) * ufl.sin(ufl.pi * x[1])
+alpha = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1e-6))
+
 # Assemble the objective scalar using the overloaded assembly
-J_symbolic = 0.5 * ufl.inner(uh - d, uh - d) * ufl.dx
+J_symbolic = 0.5 * ufl.inner(uh - d, uh - d) * ufl.dx + 0.5 * alpha * ufl.inner(f, f) * ufl.dx
 J = dolfinx_adjoint.assemble_scalar(J_symbolic)
 
 # Create a ReducedFunctional for optimization
