@@ -28,7 +28,7 @@ docs = [
       "networkx",
       "pygraphviz"
 ]
-all = ["dolfinx_adjoint[test]", "dolfinx_adjoint[dev]", "dolfinx_adjoint[docs]"]
+all = ["dolfinx-adjoint[test]", "dolfinx-adjoint[dev]", "dolfinx-adjoint[docs]"]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
