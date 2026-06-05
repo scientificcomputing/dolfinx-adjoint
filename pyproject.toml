@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0.0", "wheel"]
 
 [project]
 name = "dolfinx-adjoint"
-version = "0.2.0"
+version = "0.2.1"
 description = "Automatic differentation compatible with DOLFINx"
 authors = [{ name = "Jørgen S. Dokken", email = "dokken@simula.no" }]
 license = "MIT"
@@ -91,7 +91,7 @@ tag = true
 sign_tags = false
 tag_name = "v{new_version}"
 tag_message = "Bump version: {current_version} → {new_version}"
-current_version = "0.2.0"
+current_version = "0.2.1"
 
 
 [[tool.bumpversion.files]]
