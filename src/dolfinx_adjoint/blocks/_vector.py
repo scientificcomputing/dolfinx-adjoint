@@ -72,6 +72,8 @@ def _create_vector(L: dolfinx.fem.Form, space: dolfinx.fem.FunctionSpace) -> _Sp
     """
     # Can just take the first dofmap here, since all dof maps have the same
     # index map in mixed-topology meshes
-    dofmap = L.function_spaces[0].dofmaps(0)  # type: ignore
+
+    dofmap = L.function_spaces[0].dofmaps[0]  # type: ignore
+
     assert space._cpp_object == L.function_spaces[0], "Function space mismatch when creating vector."
     return _vector(dofmap.index_map, dofmap.index_map_bs, dtype=L.dtype, function_space=space)
