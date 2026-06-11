@@ -64,6 +64,7 @@ class LinearProblemBlock(pyadjoint.Block):
                 self.add_dependency(c, no_duplicates=True)
             for c in self._rhs.coefficients():  # type: ignore
                 self.add_dependency(c, no_duplicates=True)
+
         except AttributeError:
             raise NotImplementedError("Blocked systems not implemented yet.")
         self._compiled_lhs = dolfinx.fem.form(
@@ -86,6 +87,11 @@ class LinearProblemBlock(pyadjoint.Block):
         self._petsc_options = petsc_options if petsc_options is not None else {}
         self._petsc_options_prefix = petsc_options_prefix
         self._bcs = bcs if bcs is not None else []
+
+        # Add dependencies from the boundary conditions
+        for bc in self._bcs:
+            self.add_dependency(bc, no_duplicates=True)
+
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
             a=self._lhs,
@@ -164,13 +170,20 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Replace values in the DirichletBC if it is dependent on a control
         # NOTE: Currently assume that BCS are control independent.
-        bcs = self._bcs
+        # bcs = self._bcs
         # for block_variable in self.get_dependencies():
         #     c = block_variable.output
         #     c_rep = block_variable.saved_output
 
         #     if isinstance(c, dolfinx.fem.DirichletBC):
         #         bcs.append(c_rep)
+        bcs = []
+        for bc in self._bcs:
+            if hasattr(bc, "block_variable") and bc.block_variable in self.get_dependencies():
+                # Extract the newly minted dolfinx.fem.DirichletBC from the DirichletBCBlock
+                bcs.append(bc.block_variable.saved_output)
+            else:
+                bcs.append(bc)
 
         # Replace form coefficients with checkpointed values.
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form

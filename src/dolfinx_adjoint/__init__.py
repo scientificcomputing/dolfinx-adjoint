@@ -7,7 +7,7 @@ import pyadjoint as _pyad
 
 from .assembly import assemble_scalar, error_norm
 from .solvers import LinearProblem, NonlinearProblem
-from .types import Constant, Function
+from .types import Constant, Function, dirichletbc
 from .types.function import assign
 
 meta = metadata("dolfinx_adjoint")
@@ -24,6 +24,7 @@ _pyad.continue_annotation()
 __all__ = [
     "Constant",
     "Function",
+    "dirichletbc",
     "LinearProblem",
     "NonlinearProblem",
     "assemble_scalar",
