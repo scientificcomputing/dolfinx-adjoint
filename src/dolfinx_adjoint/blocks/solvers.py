@@ -89,8 +89,12 @@ class LinearProblemBlock(pyadjoint.Block):
         self._bcs = bcs if bcs is not None else []
 
         # Add dependencies from the boundary conditions
-        for bc in self._bcs:
-            self.add_dependency(bc, no_duplicates=True)
+        # for bc in self._bcs:
+        #     self.add_dependency(bc, no_duplicates=True)
+        if self._bcs is not None:
+            for bc in self._bcs:
+                if hasattr(bc, "g") and hasattr(bc.g, "block_variable"):
+                    self.add_dependency(bc.g, no_duplicates=True)
 
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
@@ -177,6 +181,10 @@ class LinearProblemBlock(pyadjoint.Block):
 
         #     if isinstance(c, dolfinx.fem.DirichletBC):
         #         bcs.append(c_rep)
+        if self._bcs is not None:
+            for bc in self._bcs:
+                if hasattr(bc, "g") and hasattr(bc.g, "block_variable"):
+                    bc.g.x.array[:] = bc.g.block_variable.saved_output.x.array[:]
         bcs = []
         for bc in self._bcs:
             if hasattr(bc, "block_variable") and bc.block_variable in self.get_dependencies():
