@@ -93,8 +93,7 @@ class LinearProblemBlock(pyadjoint.Block):
         #     self.add_dependency(bc, no_duplicates=True)
         if self._bcs is not None:
             for bc in self._bcs:
-                if hasattr(bc, "g") and hasattr(bc.g, "block_variable"):
-                    self.add_dependency(bc.g, no_duplicates=True)
+                self.add_dependency(bc, no_duplicates=True)
 
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(

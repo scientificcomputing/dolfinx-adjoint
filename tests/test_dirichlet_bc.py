@@ -6,7 +6,7 @@ import pyadjoint
 import ufl
 
 from dolfinx_adjoint import Function, LinearProblem, assemble_scalar, assign, dirichletbc
-from dolfinx_adjoint.types.dirichletbc import DirichletBCBlock
+from dolfinx_adjoint.blocks.dirichletbc import DirichletBCBlock
 
 
 def test_dirichletbc_recording():
@@ -113,7 +113,7 @@ def test_time_dependent_bc_replay():
     boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
 
     # Use native dolfinx here! PyAdjoint traces the bc_func inside it.
-    bc = dolfinx.fem.dirichletbc(bc_func, boundary_dofs)
+    bc = dirichletbc(bc_func, boundary_dofs)
 
     problem = LinearProblem(a, L, bcs=[bc], u=uh)
 
