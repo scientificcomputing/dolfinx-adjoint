@@ -78,6 +78,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self._entity_maps = entity_maps
         self._petsc_options = petsc_options
         self._kind = kind
+        self._petsc_options_prefix = petsc_options_prefix
 
         # Initialize linear solver
         super().__init__(
@@ -114,6 +115,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
                 ad_block_tag=self.ad_block_tag,
                 adjoint_petsc_options=self._adj_options,
                 tlm_petsc_options=self._tlm_options,
+                petsc_options_prefix=f"{self._petsc_options_prefix}_block",
             )
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)

@@ -87,6 +87,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._petsc_options_prefix = petsc_options_prefix
         self._bcs = bcs if bcs is not None else []
         # Solver for recomputing the linear problem
+
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
             a=self._lhs,
             L=self._rhs,
@@ -157,10 +158,14 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Create initial guess for the KSP solver
         # Form independnet compilation would make it possible to use the same KSP for all re-evaluations.
-        if isinstance(self._u, Function):
-            initial_guess = dolfinx.fem.Function(self._u.function_space, name=self._u.name + "_initial_guess")
-        else:
-            initial_guess = [dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u]
+        if not hasattr(self, "_initial_guess"):
+            if isinstance(self._u, Function):
+                initial_guess = dolfinx.fem.Function(self._u.function_space, name=self._u.name + "_initial_guess")
+            else:
+                initial_guess = [
+                    dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u
+                ]
+            self._initial_guess = initial_guess
 
         # Replace values in the DirichletBC if it is dependent on a control
         # NOTE: Currently assume that BCS are control independent.
@@ -207,7 +212,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver._L = compiled_rhs
         self._forward_solver._P = compiled_preconditioner
         self._forward_solver.bcs = bcs
-        self._forward_solver._u = initial_guess
+        self._forward_solver._u = self._initial_guess
 
     def recompute_component(
         self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
