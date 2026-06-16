@@ -1,6 +1,4 @@
-import dolfinx
 from pyadjoint.block import Block
-from pyadjoint.tape import stop_annotating
 
 
 class DirichletBCBlock(Block):
@@ -16,13 +14,12 @@ class DirichletBCBlock(Block):
         return "dirichletbc"
 
     def prepare_recompute_component(self, inputs, relevant_outputs):
-        # Extract the checkpointed `value` from the inputs
         return inputs[0] if inputs else None
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
-        # Re-instantiate the FEniCSx boundary condition with the rewound tape value
-        with stop_annotating():
-            return dolfinx.fem.dirichletbc(prepared, self.dofs, self.V)
+        # PyAdjoint relies on checkpoints. The dynamic `_cpp_object` property
+        # in DirichletBC ensures FEniCSx handles the C++ updates internally.
+        return block_variable.saved_output
 
     # Empty stubs required by the PyAdjoint Block interface for passive nodes
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):

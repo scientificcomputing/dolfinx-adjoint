@@ -4,6 +4,7 @@ import dolfinx
 import numpy as np
 import pyadjoint
 import ufl
+from pyadjoint.overloaded_type import Weakref
 
 from dolfinx_adjoint import Function, LinearProblem, assemble_scalar, assign, dirichletbc
 from dolfinx_adjoint.blocks.dirichletbc import DirichletBCBlock
@@ -38,6 +39,7 @@ def test_dirichletbc_recording():
 
 def test_dirichletbc_no_annotate():
     """Test that setting annotate=False bypasses tape recording entirely."""
+
     pyadjoint.get_working_tape().clear_tape()
     mesh = dolfinx.mesh.create_unit_interval(MPI.COMM_WORLD, 10)
     V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
@@ -53,7 +55,8 @@ def test_dirichletbc_no_annotate():
     tape = pyadjoint.get_working_tape()
 
     assert len(tape.get_blocks()) == 0
-    assert not hasattr(bc, "block_variable")
+    # FIX: Check the underlying weak reference rather than invoking the property
+    assert getattr(bc, "_block_variable", Weakref())() is None
 
 
 def test_dirichletbc_recompute():

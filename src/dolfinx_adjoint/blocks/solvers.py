@@ -89,11 +89,10 @@ class LinearProblemBlock(pyadjoint.Block):
         self._bcs = bcs if bcs is not None else []
 
         # Add dependencies from the boundary conditions
-        # for bc in self._bcs:
-        #     self.add_dependency(bc, no_duplicates=True)
         if self._bcs is not None:
             for bc in self._bcs:
-                self.add_dependency(bc, no_duplicates=True)
+                if hasattr(bc, "block_variable"):
+                    self.add_dependency(bc, no_duplicates=True)
 
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
@@ -171,27 +170,6 @@ class LinearProblemBlock(pyadjoint.Block):
         else:
             initial_guess = [dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u]
 
-        # Replace values in the DirichletBC if it is dependent on a control
-        # NOTE: Currently assume that BCS are control independent.
-        # bcs = self._bcs
-        # for block_variable in self.get_dependencies():
-        #     c = block_variable.output
-        #     c_rep = block_variable.saved_output
-
-        #     if isinstance(c, dolfinx.fem.DirichletBC):
-        #         bcs.append(c_rep)
-        if self._bcs is not None:
-            for bc in self._bcs:
-                if hasattr(bc, "g") and hasattr(bc.g, "block_variable"):
-                    bc.g.x.array[:] = bc.g.block_variable.saved_output.x.array[:]
-        bcs = []
-        for bc in self._bcs:
-            if hasattr(bc, "block_variable") and bc.block_variable in self.get_dependencies():
-                # Extract the newly minted dolfinx.fem.DirichletBC from the DirichletBCBlock
-                bcs.append(bc.block_variable.saved_output)
-            else:
-                bcs.append(bc)
-
         # Replace form coefficients with checkpointed values.
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
         lhs = self._replace_coefficients_in_form(self._lhs)
@@ -226,7 +204,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver._a = compiled_lhs
         self._forward_solver._L = compiled_rhs
         self._forward_solver._P = compiled_preconditioner
-        self._forward_solver.bcs = bcs
+        self._forward_solver.bcs = self._bcs
         self._forward_solver._u = initial_guess
 
     def recompute_component(

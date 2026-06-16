@@ -1,14 +1,11 @@
 import dolfinx
 import numpy as np
 import numpy.typing as npt
+import pyadjoint
 import ufl
-from pyadjoint.overloaded_type import (
-    FloatingType,
-    create_overloaded_object,
-)
+from pyadjoint.overloaded_type import FloatingType
 
-# from pyadjoint.block_variable import BlockVariable
-# from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
+from ..blocks.dirichletbc import DirichletBCBlock
 
 
 def extract_dtype(expr: ufl.core.expr.Expr) -> npt.DTypeLike:
@@ -35,43 +32,19 @@ def extract_dtype(expr: ufl.core.expr.Expr) -> npt.DTypeLike:
 
 
 class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
-    _pack_expression: dolfinx.fem.Expression | None
-    _ufl_expr: ufl.core.expr.Expr | None  # Store original UFL expression
-
-    def __init__(
-        self,
-        g: ufl.core.expr.Expr,
-        dofs: npt.NDArray[np.int32],
-        V: dolfinx.fem.FunctionSpace,
-        name: str = "dirichletbc",
-        **kwargs,
-    ):
-        """
-        Create an Irksome compatible DirichletBC from an existing DOLFINx bc.
-
-        :param g: The boundary condition expression
-        :param dofs: An array of degree-of-freedom indices in V
-        :param V: The space to construct the BC on.
-        :param name: The name of the boundary condition.
-        """
-        # Attach UFL function space (to be able to reconstruct functions and constants on the same UFL domain)
+    def __init__(self, g, dofs, V, name="dirichletbc", **kwargs):
         self.name = name
         self._ufl_space = V.ufl_function_space()
 
-        # Store original UFL expression for time-varying BCs
         if not isinstance(g, (dolfinx.fem.Function, dolfinx.fem.Constant, int, float, complex)):
-            self._ufl_expr = g  # Save the symbolic expression
+            self._ufl_expr = g
         else:
             self._ufl_expr = None
-        self._ufl_space = V.ufl_function_space()
 
-        # If reconstructing with a sub space, we need to get the subspace dof indices
-        # If working with a subspace of a single stage, we need to create the (parent_dof, sub_dof) mapping
         if V.component() != []:
             V_sub, sub_to_parent = V.collapse()
             if len(sub_to_parent) != 1:
-                msg = "Mixed topology is not supported for reconstructing BCs with UFL expressions"
-                raise NotImplementedError(msg)
+                raise NotImplementedError("Mixed topology is not supported for reconstructing BCs")
             else:
                 sub_to_parent = sub_to_parent[0]
                 parent_to_sub = np.full(
@@ -83,25 +56,14 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
                 sub_dofs = parent_to_sub[dofs]
                 dofs = (dofs, sub_dofs)
 
-        # If we are not reconstructing the BC with a new value,
-        #  we can reuse existing C++ objects
-        self._pack_expression = None
-
-        # If we are reconstructing the BC with a new value,
-        # we need to check if the new value is a DOLFINx function or Constant.
-        # If True, we do not need to do anything for reconstruction.
         if isinstance(g, (dolfinx.fem.Function, dolfinx.fem.Constant)):
             val = g
             self._pack_expression = None
         else:
-            # If not, we need to take the ufl.core.expr.Expr and pack it into a DOLFINx Expression
-            if V.component() != []:
-                val = dolfinx.fem.Function(V_sub, name=f"bc_{str(g)}")._cpp_object
-            else:
-                val = dolfinx.fem.Function(V, name=f"bc_{str(g)}")._cpp_object
-            self._pack_expression = dolfinx.fem.Expression(g, V.element.interpolation_points)
+            val = dolfinx.fem.Function(V_sub if V.component() != [] else V, name=f"bc_{str(g)}")
+            self._pack_expression = dolfinx.fem.Expression(g, V.element.interpolation_points())
+            val.interpolate(self._pack_expression)
 
-        # Get correct C++ implementation based on dtype of expression
         dtype = extract_dtype(g)
         if np.issubdtype(dtype, np.float32):
             bctype = dolfinx.cpp.fem.DirichletBC_float32
@@ -114,57 +76,59 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         else:
             raise NotImplementedError(f"Type {dtype} not supported.")
 
-        if (
-            isinstance(
-                val,
-                (
-                    dolfinx.cpp.fem.Function_complex128,
-                    dolfinx.cpp.fem.Function_complex64,
-                    dolfinx.cpp.fem.Function_float32,
-                    dolfinx.cpp.fem.Function_float64,
-                ),
-            )
-            and val.function_space == V._cpp_object
-        ):
-            new_cpp_object = bctype(val, dofs)
-        elif isinstance(val, dolfinx.fem.Function):
-            new_cpp_object = bctype(val._cpp_object, dofs)
-        else:
-            # Depending on your FEniCSx version, the C++ constructor might strictly
-            # expect the C++ FunctionSpace instead of the Python FunctionSpace wrapper.
-            try:
-                new_cpp_object = bctype(val, dofs, V._cpp_object)
-            except TypeError:
-                new_cpp_object = bctype(val._cpp_object, dofs, V._cpp_object)
+        # Save internal references for dynamic C++ object generation
+        self._g_val = val
+        self._dofs_array = dofs
+        self._V_space = V
+        self._bctype = bctype
 
-        # 4. Initialize the parent dolfinx.fem.DirichletBC wrapper with the newly minted C++ object
-        super().__init__(new_cpp_object)
+        # Initialize FEniCSx wrapper. This will trigger our _cpp_object.setter
+        super().__init__(self._generate_cpp_object())
 
-        # 5. Store your custom properties
-        # self._orig_g = val
+        annotate = kwargs.pop("annotate", True)
+        annotate = annotate and pyadjoint.annotate_tape()
+
         FloatingType.__init__(
             self,
             V,
             val,
-            # name=name,
             dtype=dtype,
-            block_class=kwargs.pop("block_class", None),
-            _ad_floating_active=kwargs.pop("_ad_floating_active", False),
-            _ad_args=kwargs.pop("_ad_args", None),
-            output_block_class=kwargs.pop("output_block_class", None),
-            _ad_output_args=kwargs.pop("_ad_output_args", None),
-            _ad_outputs=kwargs.pop("_ad_outputs", None),
-            annotate=kwargs.pop("annotate", True),
+            block_class=kwargs.pop("block_class", DirichletBCBlock),
+            _ad_floating_active=False,
+            _ad_args=kwargs.pop("_ad_args", (val, dofs, V)),
+            annotate=annotate,
             **kwargs,
         )
 
+        if annotate:
+            self._ad_annotate_block()
+
+    def _generate_cpp_object(self):
+        """Dynamically construct a C++ BC reflecting the current array memory."""
+        val_cpp = self._g_val._cpp_object if hasattr(self._g_val, "_cpp_object") else self._g_val
+        if isinstance(self._g_val, dolfinx.fem.Function):
+            return self._bctype(val_cpp, self._dofs_array)
+        else:
+            try:
+                return self._bctype(val_cpp, self._dofs_array, self._V_space._cpp_object)
+            except TypeError:
+                return self._bctype(val_cpp, self._dofs_array)
+
+    @property
+    def _cpp_object(self):
+        # Solvers internally read this property every time they assemble/set_bcs
+        return self._generate_cpp_object()
+
+    @_cpp_object.setter
+    def _cpp_object(self, value):
+        # Absorb the assignment from dolfinx.fem.DirichletBC.__init__
+        self._initial_cpp_object = value
+
     def _ad_create_checkpoint(self):
-        checkpoint = create_overloaded_object(self)
-        checkpoint.name = self.name + "_checkpoint"
-        return checkpoint
+        return self
 
     def _ad_restore_at_checkpoint(self, checkpoint):
-        return checkpoint
+        return self
 
 
 def dirichletbc(
