@@ -253,6 +253,10 @@ class Constant(Function):
     def value(self):
         return self.x.array[:]
 
+    @classmethod
+    def _ad_init_object(cls, obj):
+        return cls(obj.function_space.mesh, obj.x.array[:])
+
 
 register_overloaded_type(Function, (dolfinx.fem.Function, Function))
 register_overloaded_type(Constant, (dolfinx.fem.Constant, Constant))
