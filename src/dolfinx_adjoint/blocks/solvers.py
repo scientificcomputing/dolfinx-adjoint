@@ -432,6 +432,7 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         vec = _create_vector(compiled_sensitivity, sensitivity.arguments()[0].ufl_function_space())
+        vec.array[:] = 0.0
         assemble_compiled_form(compiled_sensitivity, tensor=vec)
         return vec
 
@@ -582,6 +583,7 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         hessian_output = _create_vector(compiled_hessian, hessian_form.arguments()[0].ufl_function_space())
+        hessian_output.array[:] = 0.0
         assemble_compiled_form(compiled_hessian, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output
@@ -997,6 +999,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         vec = _create_vector(compiled_sensitivity, sensitivity.arguments()[0].ufl_function_space())
+        vec.array[:] = 0.0
         assemble_compiled_form(compiled_sensitivity, tensor=vec)
         return vec
 
@@ -1053,7 +1056,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
 
-        # Solve adjoint problem
         self._adjoint_solver._a = dFdu_adj
         self._adjoint_solver._b = b.petsc_vec
         self._adjoint_solver._u = self._second_adjoint_solutions
@@ -1145,6 +1147,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         hessian_output = _create_vector(compiled_hessian, hessian_form.arguments()[0].ufl_function_space())
+        hessian_output.array[:] = 0.0
         assemble_compiled_form(compiled_hessian, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output
