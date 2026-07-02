@@ -10,3 +10,5 @@ parts:
     chapters:
     - file: "docs/api"
     - file: "docs/api_blocks"
+    - file: "CONTRIBUTING.md"
+    - file: "CODE_OF_CONDUCT.md"
