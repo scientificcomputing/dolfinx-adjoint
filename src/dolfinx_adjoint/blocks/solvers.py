@@ -480,6 +480,7 @@ class LinearProblemBlock(pyadjoint.Block):
             b.array[:] *= -1
 
         b.array[:] += hessian_inputs[0].array
+        b.scatter_forward()
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
