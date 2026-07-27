@@ -28,6 +28,14 @@ The main way to install the package is via pip:
 python3 -m pip install dolfinx-adjoint
 ```
 
+### via conda
+
+You can also install dolfinx-adjoint via conda which also comes with **DOLFINx**
+
+```bash
+conda install -c conda-forge dolfinx-adjoint
+```
+
 ### Development Install
 
 To install the latest development version directly from the repository, use:
