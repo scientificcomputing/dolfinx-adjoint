@@ -18,7 +18,7 @@ jobs:
     container: ghcr.io/fenics/dolfinx/dolfinx:nightly
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install package
         run: python3 -m pip install .[test]

@@ -28,6 +28,14 @@ The main way to install the package is via pip:
 python3 -m pip install dolfinx-adjoint
 ```
 
+### via conda
+
+You can also install dolfinx-adjoint via conda which also comes with **DOLFINx**
+
+```bash
+conda install -c conda-forge dolfinx-adjoint
+```
+
 ### Development Install
 
 To install the latest development version directly from the repository, use:
@@ -44,15 +52,6 @@ cd dolfinx-adjoint
 python3 -m pip install -e ".[all]"
 ```
 
-### Docker
-
-A pre-built Docker image is automatically published by the CI. You can pull the nightly build which comes with DOLFINx and DOLFINx-Adjoint pre-installed:
-
-```bash
-docker run -ti ghcr.io/scientificcomputing/dolfinx-adjoint:v0.2.1
-```
-
-*(Note: Adjust the tag to the latest release or build).*
 
 ## Quick Start
 
@@ -73,7 +72,7 @@ V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
 # Use dolfinx_adjoint overloaded types
 # This ensures operations are tracked on the pyadjoint tape!
 f = dolfinx_adjoint.Function(V, name="Control")
-f.interpolate(lambda x: x[0] + x[1]) # Initial guess for control
+f.interpolate(lambda x: x[0] + x[1])  # Initial guess for control
 uh = dolfinx_adjoint.Function(V, name="State")
 
 # Define UFL forms for a simple Poisson problem: - \Delta u = f
