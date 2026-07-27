@@ -72,7 +72,7 @@ V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
 # Use dolfinx_adjoint overloaded types
 # This ensures operations are tracked on the pyadjoint tape!
 f = dolfinx_adjoint.Function(V, name="Control")
-f.interpolate(lambda x: x[0] + x[1]) # Initial guess for control
+f.interpolate(lambda x: x[0] + x[1])  # Initial guess for control
 uh = dolfinx_adjoint.Function(V, name="State")
 
 # Define UFL forms for a simple Poisson problem: - \Delta u = f
