@@ -3,6 +3,7 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pyadjoint
+import pytest
 import ufl
 from pyadjoint.overloaded_type import Weakref
 
@@ -37,6 +38,9 @@ def test_dirichletbc_recording():
     assert hasattr(bc, "block_variable")
 
 
+@pytest.mark.xfail(
+    reason="This test is currently failing due to update in https://github.com/FEniCS/dolfinx/pull/4342."
+)
 def test_dirichletbc_no_annotate():
     """Test that setting annotate=False bypasses tape recording entirely."""
 
