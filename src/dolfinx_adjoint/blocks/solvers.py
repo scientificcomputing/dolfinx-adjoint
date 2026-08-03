@@ -352,8 +352,23 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         dudm = dolfinx.fem.Function(V, name="du_dm_tlm_linearblock")
-        A_tlm = dolfinx.fem.petsc.assemble_matrix(dFdu, bcs=bcs)
-        A_tlm.assemble()
+
+        if not hasattr(self, "_A_tlm"):
+            self._A_tlm = dolfinx.fem.petsc.assemble_matrix(dFdu, bcs=bcs)
+            self._A_tlm.assemble()
+
+            self._ksp_tlm = PETSc.KSP().create(self._A_tlm.getComm())
+            self._ksp_tlm.setOperators(self._A_tlm)
+
+            prefix = self._petsc_options_prefix + "tlm_"
+            self._ksp_tlm.setOptionsPrefix(prefix)
+            if self._tlm_petsc_options is not None:
+                opts = PETSc.Options()
+                for k, v in self._tlm_petsc_options.items():
+                    opts[prefix + k] = v
+            self._ksp_tlm.setFromOptions()
+            self._ksp_tlm.setUp()
+
         b_tlm = dolfinx.fem.create_vector(dolfinx.fem.extract_function_spaces(dFdm_compiled))  # type: ignore[arg-type]
         b_tlm.array[:] = 0.0
         dolfinx.fem.petsc.assemble_vector(b_tlm.petsc_vec, dFdm_compiled)
@@ -366,7 +381,14 @@ class LinearProblemBlock(pyadjoint.Block):
                 bc.set(b_tlm.array, alpha=0)
         else:
             dolfinx.la.petsc._ghost_update(b_tlm, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[arg-type]
-        solve_linear_problem(A_tlm, dudm.x, b_tlm, petsc_options=self._tlm_petsc_options)
+
+        # Use the cached solver to skip reallocation and factorization!
+        self._ksp_tlm.solve(b_tlm.petsc_vec, dudm.x.petsc_vec)
+        dudm.x.scatter_forward()
+
+        # Explicitly free the temporary RHS vector memory
+        b_tlm.petsc_vec.destroy()
+
         return dudm
 
     def prepare_evaluate_adj(
