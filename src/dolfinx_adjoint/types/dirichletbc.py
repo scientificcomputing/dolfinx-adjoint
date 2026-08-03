@@ -35,11 +35,14 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         kwargs = {}
         # If dolfinx-version is 0.12 we need to pass the following
         # due to https://github.com/FEniCS/dolfinx/pull/4342/
-        # TODO: Add conditional check if we want backwards compatibility with dolfinx < 0.12
         kwargs["V"] = g.function_space
         kwargs["g"] = g
 
-        super().__init__(bctype(g._cpp_object, dofs), **kwargs)
+        try:
+            super().__init__(bctype(g._cpp_object, dofs), **kwargs)
+        except TypeError:
+            # Fallback for older dolfinx versions
+            super().__init__(bctype(g._cpp_object, dofs))
 
         annotate = kwargs.pop("annotate", True)
         annotate = annotate and pyadjoint.annotate_tape()
