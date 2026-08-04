@@ -41,6 +41,15 @@ def _vector(
     Returns:
         A distributed vector.
     """
+    vtype: (
+        type[dolfinx.cpp.la.Vector_float32]
+        | type[dolfinx.cpp.la.Vector_float64]
+        | type[dolfinx.cpp.la.Vector_complex64]
+        | type[dolfinx.cpp.la.Vector_complex128]
+        | type[dolfinx.cpp.la.Vector_int8]
+        | type[dolfinx.cpp.la.Vector_int32]
+        | type[dolfinx.cpp.la.Vector_int64]
+    )
     if np.issubdtype(dtype, np.float32):
         vtype = dolfinx.cpp.la.Vector_float32
     elif np.issubdtype(dtype, np.float64):

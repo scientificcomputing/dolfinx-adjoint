@@ -89,7 +89,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         options = {} if options is None else options
         riesz_representation = options.get("riesz_representation", "l2")
         if riesz_representation == "l2":
-            return dolfinx.cpp.la.inner_product(self.x._cpp_object, other.x._cpp_object)
+            return dolfinx.cpp.la.inner_product(self.x._cpp_object, other.x._cpp_object)  # type: ignore[arg-type]
         elif riesz_representation == "L2":
             form_compiler_options = options.get("form_compiler_options", None)
             jit_options = options.get("jit_options", None)
