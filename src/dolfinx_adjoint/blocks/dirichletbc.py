@@ -20,7 +20,7 @@ class DirichletBCBlock(Block):
         value: dolfinx.fem.Function | dolfinx.fem.Constant,
         dofs: npt.NDArray[np.int32],
         V: dolfinx.fem.FunctionSpace | None = None,
-        ad_block_tag=None,
+        ad_block_tag: str = None,
     ):
         super().__init__(ad_block_tag=ad_block_tag)
         self._dofs = dofs
