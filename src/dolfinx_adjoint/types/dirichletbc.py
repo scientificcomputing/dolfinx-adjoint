@@ -32,14 +32,14 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         else:
             raise NotImplementedError(f"Type {dtype} not supported.")
 
-        kwargs = {}
+        bc_kwargs = {}
         # If dolfinx-version is 0.12 we need to pass the following
         # due to https://github.com/FEniCS/dolfinx/pull/4342/
-        kwargs["V"] = g.function_space
-        kwargs["g"] = g
+        bc_kwargs["V"] = g.function_space
+        bc_kwargs["g"] = g
 
         try:
-            super().__init__(bctype(g._cpp_object, dofs), **kwargs)
+            super().__init__(bctype(g._cpp_object, dofs), **bc_kwargs)
         except TypeError:
             # Fallback for older dolfinx versions
             super().__init__(bctype(g._cpp_object, dofs))
