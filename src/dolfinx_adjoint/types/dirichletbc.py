@@ -9,13 +9,13 @@ from .function import Function
 
 
 class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
-    """A class overloading `dolfinx.fem.DirichletBC` to support it being used as a control variable
+    """A class overloading :py:class:`dolfinx.fem.DirichletBC` to support it being used as a control variable
     in the adjoint framework.
 
     Args:
         g: The value of the Dirichlet BC.
         dofs: An array of degree-of-freedom indices in `V` where the BC should be applied.
-        **kwargs: Additional keyword arguments to pass to the `pyadjoint.overloaded_type.FloatingType` constructor.
+        **kwargs: Additional keyword arguments to pass to the :py:func:`pyadjoint.overloaded_type.FloatingType` constructor.
 
     """
 
