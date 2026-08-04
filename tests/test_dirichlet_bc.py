@@ -73,6 +73,7 @@ def test_dirichletbc_recompute():
 
     tape = pyadjoint.get_working_tape()
     block = tape.get_blocks()[0]
+    assert isinstance(block, DirichletBCBlock)
 
     # Simulate an optimizer changing the function value
     c.interpolate(lambda x: np.full_like(x[0], 15.0))
