@@ -2,6 +2,7 @@ import dolfinx
 import numpy as np
 import numpy.typing as npt
 import pyadjoint
+from packaging.version import Version
 from pyadjoint.overloaded_type import FloatingType
 
 from ..blocks.dirichletbc import DirichletBCBlock
@@ -35,14 +36,12 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         bc_kwargs = {}
         # If dolfinx-version is 0.12 we need to pass the following
         # due to https://github.com/FEniCS/dolfinx/pull/4342/
-        bc_kwargs["V"] = g.function_space
-        bc_kwargs["g"] = g
 
-        try:
-            super().__init__(bctype(g._cpp_object, dofs), **bc_kwargs)
-        except TypeError:
-            # Fallback for older dolfinx versions
-            super().__init__(bctype(g._cpp_object, dofs))
+        if Version(dolfinx.__version__).minor >= 11:
+            bc_kwargs["V"] = g.function_space
+            bc_kwargs["g"] = g
+
+        super().__init__(bctype(g._cpp_object, dofs), **bc_kwargs)
 
         annotate = kwargs.pop("annotate", True)
         annotate = annotate and pyadjoint.annotate_tape()
