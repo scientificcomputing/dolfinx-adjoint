@@ -1,3 +1,5 @@
+from typing import Any
+
 import dolfinx
 import numpy as np
 import numpy.typing as npt
@@ -23,25 +25,36 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
 
     def __init__(self, g: Function, dofs: npt.NDArray[np.int32], **kwargs):
         dtype = g.dtype
+
+        cpp_bc: (
+            dolfinx.cpp.fem.DirichletBC_float32
+            | dolfinx.cpp.fem.DirichletBC_float64
+            | dolfinx.cpp.fem.DirichletBC_complex64
+            | dolfinx.cpp.fem.DirichletBC_complex128
+        )
         if np.issubdtype(dtype, np.float32):
-            bctype = dolfinx.cpp.fem.DirichletBC_float32
+            assert isinstance(g._cpp_object, dolfinx.cpp.fem.Function_float32)
+            cpp_bc = dolfinx.cpp.fem.DirichletBC_float32(g._cpp_object, dofs)
         elif np.issubdtype(dtype, np.float64):
-            bctype = dolfinx.cpp.fem.DirichletBC_float64
+            assert isinstance(g._cpp_object, dolfinx.cpp.fem.Function_float64)
+            cpp_bc = dolfinx.cpp.fem.DirichletBC_float64(g._cpp_object, dofs)
         elif np.issubdtype(dtype, np.complex64):
-            bctype = dolfinx.cpp.fem.DirichletBC_complex64
+            assert isinstance(g._cpp_object, dolfinx.cpp.fem.Function_complex64)
+            cpp_bc = dolfinx.cpp.fem.DirichletBC_complex64(g._cpp_object, dofs)
         elif np.issubdtype(dtype, np.complex128):
-            bctype = dolfinx.cpp.fem.DirichletBC_complex128
+            assert isinstance(g._cpp_object, dolfinx.cpp.fem.Function_complex128)
+            cpp_bc = dolfinx.cpp.fem.DirichletBC_complex128(g._cpp_object, dofs)
         else:
             raise NotImplementedError(f"Type {dtype} not supported.")
 
-        bc_kwargs = {}
+        bc_kwargs: dict[str, Any] = {}
         # If dolfinx-version is 0.12 we need to pass the following
         # due to https://github.com/FEniCS/dolfinx/pull/4342/
         if Version(dolfinx.__version__).minor >= 11:
             bc_kwargs["V"] = g.function_space
             bc_kwargs["g"] = g
 
-        super().__init__(bctype(g._cpp_object, dofs), **bc_kwargs)
+        super().__init__(cpp_bc, **bc_kwargs)
 
         annotate = kwargs.pop("annotate", True)
         annotate = annotate and pyadjoint.annotate_tape()

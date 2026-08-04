@@ -355,8 +355,9 @@ class LinearProblemBlock(pyadjoint.Block):
         # Create and assemble TLM matrix
         if not hasattr(self, "_A_tlm"):
             self._A_tlm = dolfinx.fem.petsc.create_matrix(dFdu)
+
         self._A_tlm.zeroEntries()
-        dolfinx.fem.petsc.assemble_matrix(self._A_tlm, dFdu, bcs=bcs)
+        dolfinx.fem.petsc.assemble_matrix(self._A_tlm, dFdu, bcs=bcs)  # type: ignore[misc,arg-type]
         self._A_tlm.assemble()
 
         # Create TLM KSP and attach matrix
