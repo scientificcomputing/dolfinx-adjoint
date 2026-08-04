@@ -358,29 +358,28 @@ class LinearProblemBlock(pyadjoint.Block):
         self._A_tlm.zeroEntries()
         dolfinx.fem.petsc.assemble_matrix(self._A_tlm, dFdu, bcs=bcs)
         self._A_tlm.assemble()
-        
+
         # Create TLM KSP and attach matrix
-        if not hasattr(self, "_ksp_tlm")
+        if not hasattr(self, "_ksp_tlm"):
             self._ksp_tlm = PETSc.KSP().create(self._A_tlm.getComm())
         self._ksp_tlm.setOperators(self._A_tlm)
-  
+
         # Set TLM solver options
         if self._tlm_petsc_options is not None:
             prefix = self._petsc_options_prefix + "tlm_"
             self._ksp_tlm.setOptionsPrefix(prefix)
             opts = PETSc.Options()
-            opts.prefixPush(solver_prefix)
-            for k, v in solver_parameters.items():
+            opts.prefixPush(prefix)
+            for k, v in self._tlm_petsc_options.items():
                 opts.setValue(k, v)
             self._ksp_tlm.setFromOptions()
             opts.prefixPop()
-   
+
             # For some strange reason delValue doesn't respect prefixes
-            for k, v in solver_parameters.items():
-                opts.delValue(f"{solver_prefix}{k}")
+            for k, v in self._tlm_petsc_options.items():
+                opts.delValue(f"{prefix}{k}")
         # Setup preconditioner
         self._ksp_tlm.setUp()
-
 
         b_tlm = dolfinx.fem.create_vector(dolfinx.fem.extract_function_spaces(dFdm_compiled))  # type: ignore[arg-type]
         b_tlm.array[:] = 0.0
