@@ -1,28 +1,12 @@
-from typing import Generic, TypeVar
-
 import dolfinx
 import numpy as np
 import numpy.typing as npt
 
-_T = TypeVar("_T", np.float32, np.float64, np.complex64, np.complex128, np.int8, np.int32, np.int64)
 
-
-class _SpecialVector(dolfinx.la.Vector, Generic[_T]):
+class _SpecialVector(dolfinx.la.Vector):
     """Workaround adding __iadd__ to `dolfinx.la.Vector`."""
 
-    def __init__(
-        self,
-        x: (
-            dolfinx.cpp.la.Vector_float32
-            | dolfinx.cpp.la.Vector_float64
-            | dolfinx.cpp.la.Vector_complex64
-            | dolfinx.cpp.la.Vector_complex128
-            | dolfinx.cpp.la.Vector_int8
-            | dolfinx.cpp.la.Vector_int32
-            | dolfinx.cpp.la.Vector_int64
-        ),
-        function_space: dolfinx.fem.FunctionSpace,
-    ):
+    def __init__(self, x, function_space: dolfinx.fem.FunctionSpace):
         super().__init__(x)
         self._function_space = function_space
 
