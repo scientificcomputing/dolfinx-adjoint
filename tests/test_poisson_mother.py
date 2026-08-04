@@ -136,8 +136,8 @@ def reference_solution(
     J_org = mesh.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(J_compiled)), op=MPI.SUM)
     steps = [step_length * (1 / 2) ** i for i in range(num_steps)]
 
-    dJac_dm = dolfinx.cpp.la.inner_product(Jac_vec._cpp_object, dm.x._cpp_object)
-    Hm_dm = dolfinx.cpp.la.inner_product(Hm_vec._cpp_object, dm.x._cpp_object)
+    dJac_dm = dolfinx.cpp.la.inner_product(Jac_vec._cpp_object, dm.x._cpp_object)  # type: ignore[arg-type]
+    Hm_dm = dolfinx.cpp.la.inner_product(Hm_vec._cpp_object, dm.x._cpp_object)  # type: ignore[arg-type]
 
     errors = []
     errors_der = []
