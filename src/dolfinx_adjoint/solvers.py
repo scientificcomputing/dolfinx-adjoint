@@ -1,18 +1,18 @@
-try:
-    import typing_extensions as typing
-except ModuleNotFoundError:
-    import typing  # type: ignore[no-redef]
+from __future__ import annotations
+
+import typing
 
 import dolfinx.fem.petsc
 import pyadjoint
 import ufl
-
-from dolfinx_adjoint.types import Function
+from dolfinx.fem.function import Function as _Function
 
 from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock
+from .petsc_utils import _U
+from .types import Function
 
 
-class LinearProblem(dolfinx.fem.petsc.LinearProblem):
+class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
     """A linear problem that can be used with adjoint methods.
 
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
@@ -34,19 +34,58 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         tlm_petsc_options: Optional PETSc options for TLM problems.
     """
 
+    @typing.overload
+    def __init__(
+        self: LinearProblem[_Function],
+        a: ufl.Form,
+        L: ufl.Form,
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: _Function | None = None,
+        P: ufl.Form | None = None,
+        kind: str | None = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_linear_problem_",
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: typing.Optional[str] = None,
+        adjoint_petsc_options: typing.Optional[dict] = None,
+        tlm_petsc_options: typing.Optional[dict] = None,
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self: LinearProblem[typing.Sequence[_Function]],
+        a: typing.Sequence[typing.Sequence[ufl.Form]],
+        L: typing.Sequence[ufl.Form],
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: typing.Sequence[_Function] | None = None,
+        P: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_linear_problem_",
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: typing.Optional[str] = None,
+        adjoint_petsc_options: typing.Optional[dict] = None,
+        tlm_petsc_options: typing.Optional[dict] = None,
+    ) -> None: ...
     def __init__(
         self,
-        a: typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]],
-        L: typing.Union[ufl.Form, typing.Sequence[ufl.Form]],
-        bcs: typing.Optional[typing.Sequence[dolfinx.fem.DirichletBC]] = None,
-        u: typing.Optional[typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]] = None,
-        P: typing.Optional[typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]] = None,
-        kind: typing.Optional[typing.Union[str, typing.Sequence[typing.Sequence[str]]]] = None,
-        petsc_options: typing.Optional[dict] = None,
+        a: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
+        L: ufl.Form | typing.Sequence[ufl.Form],
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: _Function | typing.Sequence[_Function] | None = None,
+        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
         petsc_options_prefix: str = "dxa_linear_problem_",
-        form_compiler_options: typing.Optional[dict] = None,
-        jit_options: typing.Optional[dict] = None,
-        entity_maps: typing.Optional[typing.Sequence[dolfinx.mesh.EntityMap]] = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
         ad_block_tag: typing.Optional[str] = None,
         adjoint_petsc_options: typing.Optional[dict] = None,
         tlm_petsc_options: typing.Optional[dict] = None,
@@ -54,6 +93,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self.ad_block_tag = ad_block_tag
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options
+        self._u: _Function | typing.Sequence[_Function]
         if u is None:
             try:
                 # Extract function space for unknown from the right hand
@@ -94,7 +134,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             entity_maps=entity_maps,
         )
 
-    def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
+    def solve(self, annotate: bool = True) -> _U:
         """
         Solve the linear problem and return the solution.
         """
@@ -129,7 +169,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         return out
 
 
-class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
+class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
     """A linear problem that can be used with adjoint methods.
 
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
@@ -151,24 +191,63 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
         tlm_petsc_options: Optional PETSc options for TLM problems.
     """
 
+    @typing.overload
+    def __init__(
+        self: NonlinearProblem[_Function],
+        F: ufl.form.Form,
+        u: _Function,
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        J: ufl.form.Form | None = None,
+        P: ufl.form.Form | None = None,
+        kind: str | None = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_nonlinear_problem_",
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: typing.Optional[str] = None,
+        adjoint_petsc_options: typing.Optional[dict] = None,
+        tlm_petsc_options: typing.Optional[dict] = None,
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self: NonlinearProblem[typing.Sequence[_Function]],
+        F: typing.Sequence[ufl.form.Form],
+        u: typing.Sequence[_Function],
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        J: typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
+        P: typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_nonlinear_problem_",
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: typing.Optional[str] = None,
+        adjoint_petsc_options: typing.Optional[dict] = None,
+        tlm_petsc_options: typing.Optional[dict] = None,
+    ) -> None: ...
     def __init__(
         self,
-        F: typing.Union[ufl.Form, typing.Sequence[ufl.Form]],
-        u: typing.Optional[typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]] = None,
-        bcs: typing.Optional[typing.Sequence[dolfinx.fem.DirichletBC]] = None,
+        F: ufl.form.Form | typing.Sequence[ufl.form.Form],
+        u: _Function | typing.Sequence[_Function],
         *,
-        J: typing.Optional[typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]] = None,
-        P: typing.Optional[typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]] = None,
-        kind: typing.Optional[typing.Union[str, typing.Sequence[typing.Sequence[str]]]] = None,
-        petsc_options: typing.Optional[dict] = None,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        J: ufl.form.Form | typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
+        P: ufl.form.Form | typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
         petsc_options_prefix: str = "dxa_nonlinear_problem_",
-        form_compiler_options: typing.Optional[dict] = None,
-        jit_options: typing.Optional[dict] = None,
-        entity_maps: typing.Optional[typing.Sequence[dolfinx.mesh.EntityMap]] = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
         ad_block_tag: typing.Optional[str] = None,
         adjoint_petsc_options: typing.Optional[dict] = None,
         tlm_petsc_options: typing.Optional[dict] = None,
     ) -> None:
+
         self.ad_block_tag = ad_block_tag
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options

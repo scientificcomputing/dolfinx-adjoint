@@ -6,8 +6,7 @@ import ufl
 from pyadjoint import AdjFloat, Block, OverloadedType
 from ufl.formatting.ufl2unicode import ufl2unicode
 
-from dolfinx_adjoint.utils import function_from_vector
-
+from ..utils import function_from_vector
 from ._vector import _vector
 
 
