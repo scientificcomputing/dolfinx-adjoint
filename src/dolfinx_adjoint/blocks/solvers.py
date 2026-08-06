@@ -64,6 +64,7 @@ class LinearProblemBlock(pyadjoint.Block):
                 self.add_dependency(c, no_duplicates=True)
             for c in self._rhs.coefficients():  # type: ignore
                 self.add_dependency(c, no_duplicates=True)
+
         except AttributeError:
             raise NotImplementedError("Blocked systems not implemented yet.")
         self._compiled_lhs = dolfinx.fem.form(
@@ -86,6 +87,13 @@ class LinearProblemBlock(pyadjoint.Block):
         self._petsc_options = petsc_options if petsc_options is not None else {}
         self._petsc_options_prefix = petsc_options_prefix
         self._bcs = bcs if bcs is not None else []
+
+        # Add dependencies from the boundary conditions
+        if self._bcs is not None:
+            for bc in self._bcs:
+                if hasattr(bc, "block_variable"):
+                    self.add_dependency(bc, no_duplicates=True)
+
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
             a=self._lhs,
@@ -162,16 +170,6 @@ class LinearProblemBlock(pyadjoint.Block):
         else:
             initial_guess = [dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u]
 
-        # Replace values in the DirichletBC if it is dependent on a control
-        # NOTE: Currently assume that BCS are control independent.
-        bcs = self._bcs
-        # for block_variable in self.get_dependencies():
-        #     c = block_variable.output
-        #     c_rep = block_variable.saved_output
-
-        #     if isinstance(c, dolfinx.fem.DirichletBC):
-        #         bcs.append(c_rep)
-
         # Replace form coefficients with checkpointed values.
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
         lhs = self._replace_coefficients_in_form(self._lhs)
@@ -206,7 +204,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver._a = compiled_lhs
         self._forward_solver._L = compiled_rhs
         self._forward_solver._P = compiled_preconditioner
-        self._forward_solver.bcs = bcs
+        self._forward_solver.bcs = self._bcs
         self._forward_solver._u = initial_guess
 
     def recompute_component(
@@ -354,8 +352,36 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         dudm = dolfinx.fem.Function(V, name="du_dm_tlm_linearblock")
-        A_tlm = dolfinx.fem.petsc.assemble_matrix(dFdu, bcs=bcs)
-        A_tlm.assemble()
+        # Create and assemble TLM matrix
+        if not hasattr(self, "_A_tlm"):
+            self._A_tlm = dolfinx.fem.petsc.create_matrix(dFdu)
+
+        self._A_tlm.zeroEntries()
+        dolfinx.fem.petsc.assemble_matrix(self._A_tlm, dFdu, bcs=bcs)  # type: ignore[misc,arg-type]
+        self._A_tlm.assemble()
+
+        # Create TLM KSP and attach matrix
+        if not hasattr(self, "_ksp_tlm"):
+            self._ksp_tlm = PETSc.KSP().create(self._A_tlm.getComm())
+        self._ksp_tlm.setOperators(self._A_tlm)
+
+        # Set TLM solver options
+        if self._tlm_petsc_options is not None:
+            prefix = self._petsc_options_prefix + "tlm_"
+            self._ksp_tlm.setOptionsPrefix(prefix)
+            opts = PETSc.Options()
+            opts.prefixPush(prefix)
+            for k, v in self._tlm_petsc_options.items():
+                opts.setValue(k, v)
+            self._ksp_tlm.setFromOptions()
+            opts.prefixPop()
+
+            # For some strange reason delValue doesn't respect prefixes
+            for k, v in self._tlm_petsc_options.items():
+                opts.delValue(f"{prefix}{k}")
+        # Setup preconditioner
+        self._ksp_tlm.setUp()
+
         b_tlm = dolfinx.fem.create_vector(dolfinx.fem.extract_function_spaces(dFdm_compiled))  # type: ignore[arg-type]
         b_tlm.array[:] = 0.0
         dolfinx.fem.petsc.assemble_vector(b_tlm.petsc_vec, dFdm_compiled)
@@ -368,7 +394,14 @@ class LinearProblemBlock(pyadjoint.Block):
                 bc.set(b_tlm.array, alpha=0)
         else:
             dolfinx.la.petsc._ghost_update(b_tlm, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[arg-type]
-        solve_linear_problem(A_tlm, dudm.x, b_tlm, petsc_options=self._tlm_petsc_options)
+
+        # Use the cached solver to skip reallocation and factorization!
+        self._ksp_tlm.solve(b_tlm.petsc_vec, dudm.x.petsc_vec)
+        dudm.x.scatter_forward()
+
+        # Explicitly free the temporary RHS vector memory
+        b_tlm.petsc_vec.destroy()
+
         return dudm
 
     def prepare_evaluate_adj(
@@ -434,6 +467,7 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         vec = _create_vector(compiled_sensitivity, sensitivity.arguments()[0].ufl_function_space())
+        vec.array[:] = 0.0
         assemble_compiled_form(compiled_sensitivity, tensor=vec)
         return vec
 
@@ -481,6 +515,7 @@ class LinearProblemBlock(pyadjoint.Block):
             b.array[:] *= -1
 
         b.array[:] += hessian_inputs[0].array
+        b.scatter_forward()
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
@@ -584,6 +619,7 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         hessian_output = _create_vector(compiled_hessian, hessian_form.arguments()[0].ufl_function_space())
+        hessian_output.array[:] = 0.0
         assemble_compiled_form(compiled_hessian, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output
@@ -999,6 +1035,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         vec = _create_vector(compiled_sensitivity, sensitivity.arguments()[0].ufl_function_space())
+        vec.array[:] = 0.0
         assemble_compiled_form(compiled_sensitivity, tensor=vec)
         return vec
 
@@ -1055,7 +1092,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
 
-        # Solve adjoint problem
         self._adjoint_solver._a = dFdu_adj
         self._adjoint_solver._b = b.petsc_vec
         self._adjoint_solver._u = self._second_adjoint_solutions
@@ -1147,6 +1183,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         hessian_output = _create_vector(compiled_hessian, hessian_form.arguments()[0].ufl_function_space())
+        hessian_output.array[:] = 0.0
         assemble_compiled_form(compiled_hessian, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output

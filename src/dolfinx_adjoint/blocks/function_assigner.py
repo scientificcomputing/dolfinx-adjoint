@@ -178,15 +178,18 @@ class FunctionAssignBlock(Block):
     def recompute_component(self, inputs, block_variable, idx, prepared):
         if self.expr is None:
             prepared = inputs[0]
-        output = dolfinx.fem.Function(
-            block_variable.output.function_space, name="f{block_variable.output.name}_AssignBlockRecompute"
-        )
+
+        # We should return the exact object instance to maintain C++ memory bindings
+        # (especially for DirichletBCs), updating it in-place.
+        output = block_variable.saved_output
+
         try:
             if output.function_space == prepared.function_space:
                 output.x.array[:] = prepared.x.array[:]
         except AttributeError:
             # Handling float value
             output.x.array[:] = prepared
+
         return output
 
     def __str__(self):

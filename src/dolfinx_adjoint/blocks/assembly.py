@@ -129,6 +129,7 @@ class AssembleBlock(Block):
                 form_compiler_options=self._form_compiler_options,
                 entity_maps=self._entity_maps,
             )
+
             if space is None:
                 # If space is not supplied infer it from the form
                 assert len(dform.arguments()) == 1
@@ -143,6 +144,9 @@ class AssembleBlock(Block):
             # assemble_compiled_form(compiled_adjoint, self._cached_vectors[id(space)])
             assemble_compiled_form(compiled_adjoint, vector)
             # return a vector scaled by the scalar `adj_input`
+            # Safegaurd against None seeds from PyAdjoint
+            if adj_input is None:
+                adj_input = 1.0
             vector.array[:] *= vector.x.array.dtype.type(adj_input)
             vector.scatter_forward()
 
