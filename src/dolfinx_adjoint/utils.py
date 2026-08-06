@@ -1,7 +1,4 @@
-try:
-    import typing_extensions as typing
-except ModuleNotFoundError:
-    import typing  # type: ignore[no-redef]
+import typing
 
 import dolfinx
 import numpy
