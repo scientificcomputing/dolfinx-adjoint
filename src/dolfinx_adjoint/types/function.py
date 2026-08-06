@@ -20,7 +20,7 @@ from dolfinx_adjoint.blocks.function_assigner import FunctionAssignBlock
 from dolfinx_adjoint.utils import ad_kwargs, function_from_vector, gather
 
 
-class Function(dolfinx.fem.Function, FloatingType, typing.Generic[dolfinx.typing.Scalar]):
+class Function(dolfinx.fem.Function, FloatingType):
     """A class overloading `dolfinx.fem.Function` to support it being used as a control variable
     in the adjoint framework.
 
@@ -204,7 +204,7 @@ class Function(dolfinx.fem.Function, FloatingType, typing.Generic[dolfinx.typing
         return dst, offset
 
 
-class Constant(Function[dolfinx.typing.Scalar]):
+class Constant(Function):
     """A class overloading {py:class}`dolfinx.fem.Constant`
     to support it being used as a control variable in
     the adjoint framework.

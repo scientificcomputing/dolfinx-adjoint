@@ -5,9 +5,6 @@ import typing
 from petsc4py import PETSc
 
 import dolfinx.fem.petsc
-from dolfinx.fem.function import Function as _Function
-
-_U = typing.TypeVar("_U", bound=_Function | typing.Sequence[_Function])
 
 
 def solve_linear_problem(
@@ -60,12 +57,12 @@ def solve_linear_problem(
     x.scatter_forward()
 
 
-class LinearAdjointProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
+class LinearAdjointProblem(dolfinx.fem.petsc.LinearProblem):
     """Linear problem helper class that homogenizes the boundary conditions, meaning that no lifting is applied."""
 
     def solve(
         self,
-    ) -> _U:
+    ) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """Solve the problem."""
 
         # Assemble lhs
@@ -91,4 +88,4 @@ class LinearAdjointProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
         self._solver.solve(self._b, self._x)
         dolfinx.la.petsc._ghost_update(self._x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)  # type: ignore
         dolfinx.fem.petsc.assign(self._x, self._u)  # type: ignore
-        return typing.cast(_U, self._u)
+        return self._u

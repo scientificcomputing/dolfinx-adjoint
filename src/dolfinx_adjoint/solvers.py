@@ -8,11 +8,35 @@ import ufl
 from dolfinx.fem.function import Function as _Function
 
 from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock
-from .petsc_utils import _U
 from .types import Function
 
 
-class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
+@typing.overload
+def resolve_u(u: _Function | None, L: ufl.Form) -> _Function: ...
+@typing.overload
+def resolve_u(u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]) -> typing.Sequence[_Function]: ...
+
+
+def resolve_u(
+    u: _Function | typing.Sequence[_Function] | None, L: ufl.Form | typing.Sequence[ufl.Form]
+) -> _Function | typing.Sequence[_Function]:
+    if u is None:
+        try:
+            # Extract function space for unknown from the right hand
+            # side of the equation.
+            assert isinstance(L, ufl.Form)
+            return Function(L.arguments()[0].ufl_function_space())
+        except AttributeError:
+            assert isinstance(L, typing.Iterable)
+            return [Function(Li.arguments()[0].ufl_function_space()) for Li in L]
+    else:
+        if isinstance(u, dolfinx.fem.Function):
+            return pyadjoint.create_overloaded_object(u)
+        else:
+            return [pyadjoint.create_overloaded_object(ui) for ui in u]
+
+
+class LinearProblem(dolfinx.fem.petsc.LinearProblem):
     """A linear problem that can be used with adjoint methods.
 
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
@@ -36,7 +60,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
 
     @typing.overload
     def __init__(
-        self: LinearProblem[_Function],
+        self,
         a: ufl.Form,
         L: ufl.Form,
         *,
@@ -55,7 +79,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
     ) -> None: ...
     @typing.overload
     def __init__(
-        self: LinearProblem[typing.Sequence[_Function]],
+        self,
         a: typing.Sequence[typing.Sequence[ufl.Form]],
         L: typing.Sequence[ufl.Form],
         *,
@@ -93,26 +117,11 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
         self.ad_block_tag = ad_block_tag
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options
-        self._u: _Function | typing.Sequence[_Function]
-        if u is None:
-            try:
-                # Extract function space for unknown from the right hand
-                # side of the equation.
-                assert isinstance(L, ufl.Form)
-                self._u = Function(L.arguments()[0].ufl_function_space())
-            except AttributeError:
-                assert isinstance(L, typing.Iterable)
-                self._u = [Function(Li.arguments()[0].ufl_function_space()) for Li in L]  # type: ignore[assignment]
-        else:
-            if isinstance(u, dolfinx.fem.Function):
-                self._u = pyadjoint.create_overloaded_object(u)
-            else:
-                self._u = [pyadjoint.create_overloaded_object(ui) for ui in u]  # type: ignore[assignment]
+        self._u = resolve_u(u, L)  # type: ignore[arg-type]
 
         # Cache some objects
         self._lhs = a
         self._rhs = L
-        self._preconditioner = P
         self._jit_options = jit_options
         self._form_compiler_options = form_compiler_options
         self._entity_maps = entity_maps
@@ -121,32 +130,32 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
 
         # Initialize linear solver
         super().__init__(
-            a=a,
-            L=L,
+            a=a,  # type: ignore[arg-type]
+            L=L,  # type: ignore[arg-type]
             bcs=bcs,
-            u=self._u,
-            P=P,
-            kind=kind,
+            u=self._u,  # type: ignore[arg-type]
+            P=P,  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
             petsc_options_prefix=petsc_options_prefix,
             petsc_options=petsc_options,
             form_compiler_options=form_compiler_options,
             jit_options=jit_options,
             entity_maps=entity_maps,
-        )
+        )  # type: ignore[misc]
 
-    def solve(self, annotate: bool = True) -> _U:
+    def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
         Solve the linear problem and return the solution.
         """
         annotate = pyadjoint.annotate_tape({"annotate": annotate})
         if annotate:
             block = LinearProblemBlock(
-                self._lhs,  # type: ignore
-                self._rhs,  # type: ignore
+                self._lhs,  # type: ignore[arg-type]
+                self._rhs,  # type: ignore[arg-type]
                 bcs=self.bcs,
                 u=self.u,
-                P=self._preconditioner,
-                kind=self._kind,
+                P=self._preconditioner,  # type: ignore[arg-type]
+                kind=self._kind,  # type: ignore[arg-type]
                 petsc_options=self._petsc_options,
                 form_compiler_options=self._form_compiler_options,
                 jit_options=self._jit_options,
@@ -154,7 +163,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
                 ad_block_tag=self.ad_block_tag,
                 adjoint_petsc_options=self._adj_options,
                 tlm_petsc_options=self._tlm_options,
-            )
+            )  # type: ignore[misc]
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
 
@@ -169,7 +178,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem, typing.Generic[_U]):
         return out
 
 
-class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
+class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
     """A linear problem that can be used with adjoint methods.
 
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
@@ -193,7 +202,7 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
 
     @typing.overload
     def __init__(
-        self: NonlinearProblem[_Function],
+        self,
         F: ufl.form.Form,
         u: _Function,
         *,
@@ -212,7 +221,7 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
     ) -> None: ...
     @typing.overload
     def __init__(
-        self: NonlinearProblem[typing.Sequence[_Function]],
+        self,
         F: typing.Sequence[ufl.form.Form],
         u: typing.Sequence[_Function],
         *,
@@ -251,26 +260,10 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
         self.ad_block_tag = ad_block_tag
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options
-        if u is None:
-            try:
-                # Extract function space for unknown from the right hand
-                # side of the equation.
-                assert isinstance(F, ufl.Form)
-                self._u = Function(F.arguments()[0].ufl_function_space())
-            except AttributeError:
-                assert isinstance(F, typing.Iterable)
-                self._u = [Function(Fi.arguments()[0].ufl_function_space()) for Fi in F]  # type: ignore[assignment]
-        else:
-            if isinstance(u, dolfinx.fem.Function):
-                self._u = pyadjoint.create_overloaded_object(u)
-            else:
-                self._u = [pyadjoint.create_overloaded_object(ui) for ui in u]  # type: ignore[assignment]
-
-        # Cache some objects
+        self._u = resolve_u(u, F)  # type: ignore[arg-type]
         self._bcs = [] if bcs is None else bcs
-        self._lhs = dolfinx.fem.forms.derivative_block(F, self._u)
+        self._lhs = dolfinx.fem.forms.derivative_block(F, self._u)  # type: ignore[arg-type]
         self._rhs = F
-        self._preconditioner = P
         self._jit_options = jit_options
         self._form_compiler_options = form_compiler_options
         self._entity_maps = entity_maps
@@ -279,18 +272,18 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
 
         # Initialize linear solver
         super().__init__(
-            F=F,
-            J=J,
-            P=P,
+            F=F,  # type: ignore[arg-type]
+            J=J,  # type: ignore[arg-type]
+            P=P,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._u,
-            kind=kind,
+            u=self._u,  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
             petsc_options_prefix=petsc_options_prefix,
             petsc_options=petsc_options,
             form_compiler_options=form_compiler_options,
             jit_options=jit_options,
             entity_maps=entity_maps,
-        )
+        )  # type: ignore[misc]
 
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
@@ -299,12 +292,12 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
         annotate = pyadjoint.annotate_tape({"annotate": annotate})
         if annotate:
             block = NonlinearProblemBlock(
-                J=self._lhs,  # type: ignore
-                F=self._rhs,  # type: ignore
+                J=self._lhs,
+                F=self._rhs,  # type: ignore[arg-type]
                 bcs=self._bcs,
                 u=self.u,
-                P=self._preconditioner,
-                kind=self._kind,
+                P=self._preconditioner,  # type: ignore[arg-type]
+                kind=self._kind,  # type: ignore[arg-type]
                 petsc_options=self._petsc_options,
                 form_compiler_options=self._form_compiler_options,
                 jit_options=self._jit_options,
@@ -312,7 +305,7 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem, typing.Generic[_U]):
                 ad_block_tag=self.ad_block_tag,
                 adjoint_petsc_options=self._adj_options,
                 tlm_petsc_options=self._tlm_options,
-            )
+            )  # type: ignore[misc]
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
 
