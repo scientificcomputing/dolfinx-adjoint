@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import typing
 
 from petsc4py import PETSc
@@ -5,10 +7,10 @@ from petsc4py import PETSc
 import dolfinx.fem.petsc
 import pyadjoint
 import ufl
+from dolfinx.fem.function import Function as _Function
 
-from dolfinx_adjoint.petsc_utils import LinearAdjointProblem, solve_linear_problem
-from dolfinx_adjoint.types import Function
-
+from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
+from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
 
@@ -18,26 +20,69 @@ class LinearProblemBlock(pyadjoint.Block):
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
     """
 
-    _adjoint_solutions: typing.Union[Function, typing.Sequence[Function]]
-    _second_adjoint_solutions: typing.Union[Function, typing.Sequence[Function]]
+    _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+
+    # 2. Overload for the SCALAR case
+    @typing.overload
+    def __init__(
+        self,
+        a: ufl.Form,
+        L: ufl.Form,
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: _Function | None = None,
+        P: ufl.Form | None = None,
+        kind: str | None = None,
+        petsc_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_linear_problem_block_",
+    ) -> None: ...
+
+    @typing.overload
+    def __init__(
+        self,
+        a: typing.Sequence[typing.Sequence[ufl.Form]],
+        L: typing.Sequence[ufl.Form],
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: typing.Sequence[_Function] | None = None,
+        P: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_linear_problem_block_",
+    ) -> None: ...
 
     def __init__(
         self,
         a: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
         L: ufl.Form | typing.Sequence[ufl.Form],
-        bcs: typing.Sequence[dolfinx.fem.DirichletBC],
-        u: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None,
-        kind: str | typing.Sequence[typing.Sequence[str]] | None,
-        petsc_options: dict | None,
-        form_compiler_options: dict | None,
-        jit_options: dict | None,
-        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None,
-        ad_block_tag: str | None,
-        adjoint_petsc_options: dict | None,
-        tlm_petsc_options: dict | None,
+        *,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: _Function | typing.Sequence[_Function] | None = None,
+        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         petsc_options_prefix: str = "dxa_linear_problem_block_",
     ) -> None:
+
         self._adjoint_petsc_options = adjoint_petsc_options
         self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
@@ -46,6 +91,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._preconditioner = P
 
         # Create overloaded functions
+        self._u: _Function | typing.Sequence[_Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
         elif u is None:
@@ -68,7 +114,7 @@ class LinearProblemBlock(pyadjoint.Block):
         except AttributeError:
             raise NotImplementedError("Blocked systems not implemented yet.")
         self._compiled_lhs = dolfinx.fem.form(
-            self._lhs,  # type: ignore
+            self._lhs,
             jit_options=jit_options,
             form_compiler_options=form_compiler_options,
             entity_maps=entity_maps,
@@ -96,41 +142,42 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
-            a=self._lhs,
-            L=self._rhs,
+            a=self._lhs,  # type: ignore[arg-type]
+            L=self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._u,
-            P=self._preconditioner,
+            u=self._u,  # type: ignore[arg-type]
+            P=self._preconditioner,  # type: ignore[arg-type]
             petsc_options=self._petsc_options,
             petsc_options_prefix=petsc_options_prefix,
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
-            kind=kind,
+            kind=kind,  # type: ignore[arg-type]
             entity_maps=self._entity_maps,
-        )
+        )  # type: ignore[misc]
 
         self._kind = "nest" if self._forward_solver.A.getType() == "nest" else kind
 
         if isinstance(self._u, dolfinx.fem.Function):
-            self._adjoint_solutions = self._u.copy()  # type: ignore[assignment]
-            self._second_adjoint_solutions = self._u.copy()  # type: ignore[assignment]
+            self._adjoint_solutions = self._u.copy()
+            self._second_adjoint_solutions = self._u.copy()
         else:
             assert isinstance(self._u, typing.Iterable)
             self._adjoint_solutions = [u.copy() for u in self._u]
             self._second_adjoint_solutions = [u.copy() for u in self._u]
+
         self._adjoint_solver = LinearAdjointProblem(
-            self._compute_adjoint(self._lhs),
-            self._rhs,
+            self._compute_adjoint(self._lhs),  # type: ignore[arg-type]
+            self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._adjoint_solutions,
-            P=self._preconditioner,
+            u=self._adjoint_solutions,  # type: ignore[arg-type]
+            P=self._preconditioner,  # type: ignore[arg-type]
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
             petsc_options=self._adjoint_petsc_options,
             petsc_options_prefix=self._petsc_options_prefix,
-            kind=kind,
+            kind=kind,  # type: ignore[arg-type]
             entity_maps=self._entity_maps,
-        )
+        )  # type: ignore[misc]
 
     def _recover_bcs(self):
         bcs = []
@@ -226,6 +273,16 @@ class LinearProblemBlock(pyadjoint.Block):
         return bdy
 
     @classmethod
+    @typing.overload
+    def _compute_adjoint(
+        cls, form: typing.Sequence[typing.Sequence[ufl.Form]]
+    ) -> typing.Sequence[typing.Sequence[ufl.Form]]: ...
+
+    @classmethod
+    @typing.overload
+    def _compute_adjoint(cls, form: ufl.Form) -> ufl.Form: ...
+
+    @classmethod
     def _compute_adjoint(
         cls, form: typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]
     ) -> typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]:
@@ -306,12 +363,12 @@ class LinearProblemBlock(pyadjoint.Block):
     ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
         F_form = self._compute_residual()
         dFdu_compiled = dolfinx.fem.form(
-            self._compute_residual_derivative(),  # type: ignore[arg-type]
+            self._compute_residual_derivative(),
             jit_options=self._jit_options,
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
         )
-        return F_form, dFdu_compiled
+        return F_form, dFdu_compiled  # type: ignore[return-value]
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None) -> dolfinx.fem.Function:
         """Solve the TLM equation for the block variable.
@@ -382,7 +439,7 @@ class LinearProblemBlock(pyadjoint.Block):
         # Setup preconditioner
         self._ksp_tlm.setUp()
 
-        b_tlm = dolfinx.fem.create_vector(dolfinx.fem.extract_function_spaces(dFdm_compiled))  # type: ignore[arg-type]
+        b_tlm = dolfinx.fem.create_vector(dolfinx.fem.extract_function_spaces(dFdm_compiled))
         b_tlm.array[:] = 0.0
         dolfinx.fem.petsc.assemble_vector(b_tlm.petsc_vec, dFdm_compiled)
 
@@ -631,27 +688,66 @@ class NonlinearProblemBlock(pyadjoint.Block):
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
     """
 
-    _adjoint_solutions: typing.Union[Function, typing.Sequence[Function]]
-    _second_adjoint_solutions: typing.Union[Function, typing.Sequence[Function]]
+    _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
     _rhs: ufl.Form | typing.Sequence[ufl.Form]
+
+    @typing.overload
+    def __init__(
+        self,
+        F: ufl.Form,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: dolfinx.fem.Function | None = None,
+        J: ufl.Form | None = None,
+        P: ufl.Form | None = None,
+        kind: str | None = None,
+        petsc_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_nonlinear_block_",
+    ) -> None: ...
+
+    @typing.overload
+    def __init__(
+        self,
+        F: typing.Sequence[ufl.Form],
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: typing.Sequence[dolfinx.fem.Function] | None = None,
+        J: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        P: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
+        petsc_options_prefix: str = "dxa_nonlinear_block_",
+    ) -> None: ...
 
     def __init__(
         self,
         F: ufl.Form | typing.Sequence[ufl.Form],
-        bcs: typing.Sequence[dolfinx.fem.DirichletBC],
-        u: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
-        J: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
-        kind: str | typing.Sequence[typing.Sequence[str]] | None,
-        petsc_options: dict | None,
-        form_compiler_options: dict | None,
-        jit_options: dict | None,
-        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None,
-        ad_block_tag: str | None,
-        adjoint_petsc_options: dict | None,
-        tlm_petsc_options: dict | None,
+        bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
+        u: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None,
+        J: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        petsc_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        jit_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        ad_block_tag: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         petsc_options_prefix: str = "dxa_nonlinear_block_",
     ) -> None:
+
         self._adjoint_petsc_options = adjoint_petsc_options
         self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
@@ -659,6 +755,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._preconditioner = P
 
         # Create overloaded functions
+        assert u is not None, "Control variable(s) must be provided."
+        self._u: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
             self._rhs = F
@@ -698,18 +796,18 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._bcs = bcs if bcs is not None else []
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.NonlinearProblem(
-            J=self._lhs,
-            F=self._rhs,
+            J=self._lhs,  # type: ignore[arg-type]
+            F=self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._u,
-            P=self._preconditioner,
+            u=self._u,  # type: ignore[arg-type]
+            P=self._preconditioner,  # type: ignore[arg-type]
             petsc_options=self._petsc_options,
             petsc_options_prefix=petsc_options_prefix,
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
-            kind=kind,
+            kind=kind,  # type: ignore[arg-type]
             entity_maps=self._entity_maps,
-        )
+        )  # type: ignore[misc]
 
         self._kind = "nest" if self._forward_solver.A.getType() == "nest" else kind
 
@@ -726,18 +824,18 @@ class NonlinearProblemBlock(pyadjoint.Block):
         else:
             raise NotImplementedError("Blocked systems not implemented yet.")
         self._adjoint_solver = LinearAdjointProblem(
-            dFdu_adj,
-            self._rhs,
+            dFdu_adj,  # type: ignore[arg-type]
+            self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._adjoint_solutions,
-            P=self._preconditioner,
+            u=self._adjoint_solutions,  # type: ignore[arg-type]
+            P=self._preconditioner,  # type: ignore[arg-type]
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
             petsc_options=self._adjoint_petsc_options,
             petsc_options_prefix=self._petsc_options_prefix,
-            kind=kind,
+            kind=kind,  # type: ignore[arg-type]
             entity_maps=self._entity_maps,
-        )
+        )  # type: ignore[misc]
 
     def _recover_bcs(self):
         bcs = []
@@ -843,9 +941,19 @@ class NonlinearProblemBlock(pyadjoint.Block):
         return bdy
 
     @classmethod
+    @typing.overload
     def _compute_adjoint(
-        cls, form: typing.Union[ufl.Form, typing.Iterable[typing.Iterable[ufl.Form]]]
-    ) -> typing.Union[ufl.Form, typing.Sequence[typing.Iterable[ufl.Form]]]:
+        cls, form: typing.Sequence[typing.Sequence[ufl.Form]]
+    ) -> typing.Sequence[typing.Sequence[ufl.Form]]: ...
+
+    @classmethod
+    @typing.overload
+    def _compute_adjoint(cls, form: ufl.Form) -> ufl.Form: ...
+
+    @classmethod
+    def _compute_adjoint(
+        cls, form: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]]
+    ) -> ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]]:
         """
         Compute adjoint of a bilinear form :math:`a(u, v)`, which could be written as a blocked system.
         """
@@ -917,7 +1025,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
         )
-        return F_form, dFdu_compiled
+        return F_form, dFdu_compiled  # type: ignore[return-value]
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None) -> dolfinx.fem.Function:
         """Solve the TLM equation for the block variable.

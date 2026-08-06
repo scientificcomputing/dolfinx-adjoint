@@ -1,4 +1,6 @@
-from __future__ import annotations  # for Python<3.11
+from __future__ import annotations
+
+import typing
 
 import basix.ufl
 import dolfinx
@@ -13,15 +15,9 @@ from pyadjoint.overloaded_type import (
 )
 from pyadjoint.tape import annotate_tape, get_working_tape, no_annotations, stop_annotating
 
-from dolfinx_adjoint.blocks.assembly import assemble_compiled_form
-from dolfinx_adjoint.utils import function_from_vector, gather
-
-try:
-    import typing_extensions as typing
-except ModuleNotFoundError:
-    import typing  # type: ignore[no-redef]
-from dolfinx_adjoint.blocks.function_assigner import FunctionAssignBlock
-from dolfinx_adjoint.utils import ad_kwargs
+from ..blocks.assembly import assemble_compiled_form
+from ..blocks.function_assigner import FunctionAssignBlock
+from ..utils import ad_kwargs, function_from_vector, gather
 
 
 class Function(dolfinx.fem.Function, FloatingType):
