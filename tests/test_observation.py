@@ -176,6 +176,37 @@ def test_ownership_is_unique_and_agreed_on_by_every_rank():
         assert np.array_equal(other, B.owner)
 
 
+def test_ambiguous_points_are_owned_exactly_once():
+    """Points on cell vertices and facets lie in several cells, and often on several processes.
+
+    These are the cases the ownership tie-break exists for, so they are worth pinning down
+    separately from randomly scattered interior points.
+    """
+    comm = MPI.COMM_WORLD
+    n = 8
+    mesh = unit_square(comm, n)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    axis = np.linspace(0.0, 1.0, n + 1)
+    vertices = np.stack(np.meshgrid(axis, axis, indexing="ij"), axis=-1).reshape(-1, 2)
+    midpoints = 0.5 * (vertices[:-1] + vertices[1:])
+    points = np.vstack([vertices, midpoints])
+
+    B = dolfinx_adjoint.PointObservation(V, points)
+    assert B.found.all()
+
+    claimed = np.zeros(B.num_points, dtype=np.int64)
+    claimed[B.local_indices] = 1
+    total = np.empty_like(claimed)
+    comm.Allreduce(claimed, total, op=MPI.SUM)
+    assert np.all(total == 1), "every point must be owned by exactly one process"
+
+    u = dolfinx.fem.Function(V)
+    u.interpolate(lambda x: 1.0 + 2.0 * x[0] - 3.0 * x[1])
+    expected = 1.0 + 2.0 * points[:, 0] - 3.0 * points[:, 1]
+    assert np.allclose(B.evaluate(u), expected, atol=1e-12)
+
+
 def test_transpose_is_the_adjoint_of_apply():
     """<Bu, v> == <u, B^T v> globally, including ghost contributions."""
     comm = MPI.COMM_WORLD
@@ -341,21 +372,22 @@ def test_distorted_hexahedra_are_handled():
     assert np.allclose(B.evaluate(u), expected, atol=1e-11)
 
 
-def test_affine_cell_types_classification():
-    """Only degree-1 simplices take the fast affine pull-back."""
+def test_matrix_is_distributed_over_the_points():
+    """The operator is an interpolation matrix onto a point mesh of the observed points."""
     comm = MPI.COMM_WORLD
-    triangles = unit_square(comm, 4)
-    assert observation._is_affine_simplex(triangles)
-    assert triangles.topology.cell_type in observation.AFFINE_CELL_TYPES
+    V = dolfinx.fem.functionspace(unit_square(comm, 8), ("Lagrange", 1))
+    points = sample_points(31, seed=91)
+    B = dolfinx_adjoint.PointObservation(V, points)
 
-    quads = dolfinx.mesh.create_rectangle(
-        comm,
-        [np.array([0.0, 0.0]), np.array([1.0, 1.0])],
-        [3, 3],
-        cell_type=dolfinx.mesh.CellType.quadrilateral,
-    )
-    assert not observation._is_affine_simplex(quads)
-    assert quads.topology.cell_type not in observation.AFFINE_CELL_TYPES
+    rows, columns = B.matrix.getSizes()
+    assert rows[1] == B.num_found  # one global row per located point
+    assert columns[1] == V.dofmap.index_map.size_global * V.dofmap.bs
+    assert rows[0] == B.num_local_rows
+    assert comm.allreduce(B.num_local_rows, op=MPI.SUM) == B.num_found
+
+    # The point mesh carries exactly the points this process owns.
+    owned = B.point_mesh.geometry.x[: B.num_local_rows, :2]
+    assert np.allclose(owned, points[B.local_indices])
 
 
 def test_quadrilateral_mesh_uses_the_generic_pull_back():
@@ -376,11 +408,9 @@ def test_quadrilateral_mesh_uses_the_generic_pull_back():
     assert np.allclose(B.gather(B.apply(u)), 2.0 * points[:, 0] + 3.0 * points[:, 1], atol=1e-12)
 
 
-def test_to_scipy_matches_apply():
+def test_matrix_action_matches_apply():
+    """`apply` is exactly a matrix-vector product with the interpolation matrix."""
     comm = MPI.COMM_WORLD
-    scipy_sparse = pytest.importorskip("scipy.sparse")
-    assert scipy_sparse is not None
-
     V = dolfinx.fem.functionspace(unit_square(comm, 6), ("Lagrange", 1))
     B = dolfinx_adjoint.PointObservation(V, sample_points(15, seed=89))
 
@@ -389,10 +419,15 @@ def test_to_scipy_matches_apply():
     u.x.array[:] = rng.random(u.x.array.shape)
     u.x.scatter_forward()
 
-    matrix = B.to_scipy()
-    assert matrix.shape[0] == B.num_local_rows
-    assert np.allclose(matrix @ u.x.array, B.apply(u))
-    assert np.allclose(np.asarray(matrix.sum(axis=1)).reshape(-1), 1.0)
+    result = dolfinx.fem.Function(B.observation_space)
+    B.matrix.mult(u.x.petsc_vec, result.x.petsc_vec)
+    result.x.scatter_forward()
+    assert np.allclose(result.x.array[: B.num_local_rows], B.apply(u))
+
+    # Rows form a partition of unity, so the matrix reproduces constants exactly.
+    ones = dolfinx.fem.Function(V)
+    ones.x.array[:] = 1.0
+    assert np.allclose(B.apply(ones), 1.0)
 
 
 # ---------------------------------------------------------------------------
