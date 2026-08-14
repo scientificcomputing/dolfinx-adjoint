@@ -203,7 +203,7 @@ else:
     cells, types, geometry = dolfinx.plot.vtk_mesh(V)
     sensor_cloud = pyvista.PolyData(np.column_stack([sensors, np.zeros(len(sensors))]))
 
-    plotter = pyvista.Plotter(shape=(1, 2), window_size=(900, 400))
+    plotter = pyvista.Plotter(shape=(1, 2), window_size=[900, 400])
     for column, (field, title) in enumerate([(f_true, "True source"), (f_opt, "Recovered source")]):
         grid = pyvista.UnstructuredGrid(cells, types, geometry)
         grid.point_data["f"] = field.x.array.real
@@ -212,7 +212,7 @@ else:
         plotter.add_text(title, font_size=10)
         plotter.add_mesh(grid, show_edges=False, clim=[0.0, 5.0])
         plotter.add_mesh(sensor_cloud, color="black", point_size=5, render_points_as_spheres=True)
-        plotter.view_xy()
+        plotter.view_xy() # type: ignore[call-arg]
     if pyvista.OFF_SCREEN:
         plotter.screenshot("point_observations.png")
     else:
