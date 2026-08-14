@@ -212,7 +212,7 @@ else:
         plotter.add_text(title, font_size=10)
         plotter.add_mesh(grid, show_edges=False, clim=[0.0, 5.0])
         plotter.add_mesh(sensor_cloud, color="black", point_size=5, render_points_as_spheres=True)
-        plotter.view_xy() # type: ignore[call-arg]
+        plotter.view_xy()  # type: ignore[call-arg]
     if pyvista.OFF_SCREEN:
         plotter.screenshot("point_observations.png")
     else:
