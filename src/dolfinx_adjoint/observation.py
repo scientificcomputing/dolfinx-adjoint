@@ -37,6 +37,8 @@ import dolfinx
 import numpy as np
 import numpy.typing as npt
 import pyadjoint
+from fenicsx_ii import create_interpolation_matrix
+from fenicsx_ii.quadrature import Quadrature
 from pyadjoint.overloaded_type import create_overloaded_object
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 
@@ -45,38 +47,35 @@ from .blocks.observation import PointObservationBlock
 __all__ = ["PointObservation", "point_observation_misfit"]
 
 
-def _geometry_dofmap(mesh: dolfinx.mesh.Mesh):
-    """``mesh.geometry.dofmap`` was renamed to ``dofmaps[0]``."""
-    try:
-        return mesh.geometry.dofmaps[0]
-    except AttributeError:
-        return mesh.geometry.dofmap
+class _PointCloudTrace:
+    """Reduction operator handing :mod:`fenicsx_ii` the coordinates of a point cloud.
 
+    ``fenicsx_ii.PointwiseTrace`` is written for 1D line meshes and obtains the physical
+    coordinates by compiling a ``SpatialCoordinate`` expression, which FFCx cannot do on a
+    point cell. On a point mesh each cell *is* a single geometry node, so the coordinates
+    can simply be read off the geometry.
+    """
 
-def _coordinate_map(mesh: dolfinx.mesh.Mesh):
-    """``mesh.geometry.cmap`` is deprecated in favour of ``cmaps[0]``."""
-    try:
-        return mesh.geometry.cmaps[0]
-    except (AttributeError, IndexError):
-        return mesh.geometry.cmap
+    def __init__(self, mesh: dolfinx.mesh.Mesh) -> None:
+        self._mesh = mesh
 
+    def compute_quadrature(self, cells: npt.NDArray[np.int32], reference_points: npt.NDArray[np.floating]):
+        gdim = self._mesh.geometry.dim
+        nodes = np.asarray(self._mesh.geometry.dofmaps[0])[cells].reshape(-1)
+        points = self._mesh.geometry.x[nodes][:, :gdim]
+        return Quadrature(
+            name="PointCloud",
+            points=points,
+            weights=np.ones((points.shape[0], 1), dtype=points.dtype),
+            scales=np.ones(points.shape[0], dtype=points.dtype),
+        )
 
-#: Cell types whose degree-1 coordinate map is affine. Tensor-product cells
-#: (quadrilateral, hexahedron, prism, pyramid) are multilinear rather than affine even at
-#: degree 1, so they take the general Newton pull-back.
-AFFINE_CELL_TYPES = frozenset(
-    {
-        dolfinx.mesh.CellType.point,
-        dolfinx.mesh.CellType.interval,
-        dolfinx.mesh.CellType.triangle,
-        dolfinx.mesh.CellType.tetrahedron,
-    }
-)
+    @property
+    def num_points(self) -> int:
+        return 1
 
-
-def _is_affine_simplex(mesh: dolfinx.mesh.Mesh) -> bool:
-    """True if every cell map is affine, i.e. a degree-1 simplex geometry."""
-    return _coordinate_map(mesh).degree == 1 and mesh.topology.cell_type in AFFINE_CELL_TYPES
+    def __str__(self) -> str:
+        return f"PointCloudTrace({self._mesh})"
 
 
 def _default_padding(mesh: dolfinx.mesh.Mesh) -> float:
@@ -162,7 +161,7 @@ class PointObservation:
                 "(for instance high-order elements on oriented, non-simplex cells)."
             )
         try:
-            self._basix_element = V.element.basix_element
+            V.element.basix_element
         except RuntimeError as exc:
             raise NotImplementedError(
                 "PointObservation needs a function space backed by a Basix element, which mixed "
@@ -183,11 +182,17 @@ class PointObservation:
         self.points = padded_points
 
         tdim = mesh.topology.dim
-        gdim = mesh.geometry.dim
         self.padding = _default_padding(mesh) if padding is None else float(padding)
 
-        # Search owned cells only: a point interior to a cell is then found on exactly one
-        # rank, and only points on a shared facet or vertex remain ambiguous.
+        # Locate the points with an exact containment test, over owned cells only.
+        #
+        # This is the one piece that is *not* delegated. `fenicsx_ii` locates points with
+        # `dolfinx.geometry.determine_point_ownership`, and asserts that every point is
+        # found -- but that routine snaps points to nearby cells rather than testing
+        # containment. On a brain-surface mesh it claimed 13.5% more points than are
+        # actually inside, every one verifiably outside the cell it was assigned to.
+        # Filtering here means only genuinely interior points reach the point mesh, so the
+        # assertion holds and no phantom observations enter the misfit.
         num_owned_cells = mesh.topology.index_map(tdim).size_local
         first_cell = np.full(num_points, -1, dtype=np.int32)
         if num_owned_cells > 0 and num_points > 0:
@@ -199,7 +204,9 @@ class PointObservation:
             has_cell = offsets[1:] > offsets[:-1]
             first_cell[has_cell] = colliding.array[offsets[:-1][has_cell]]
 
-        # Break ties by lowest rank, so every rank agrees on a single owner per point.
+        # Searching owned cells only means a point interior to a cell is found on exactly one
+        # process; break the remaining ties, on shared facets and vertices, by lowest rank so
+        # that every process agrees on a single owner per point.
         candidate_owner = np.where(first_cell >= 0, comm.rank, comm.size).astype(np.int32)
         owner = np.empty_like(candidate_owner)
         comm.Allreduce(candidate_owner, owner, op=MPI.MIN)
@@ -209,73 +216,40 @@ class PointObservation:
         self.num_found = int(self.found.sum())
         self.local_indices = np.flatnonzero(owner == comm.rank).astype(np.int32)
 
-        self._assemble(padded_points[self.local_indices], first_cell[self.local_indices], gdim)
+        self._build_matrix(padded_points[self.local_indices])
 
     # -------------------------------------------------------------------- assembly ---
-    def _assemble(self, points: np.ndarray, cells: np.ndarray, gdim: int) -> None:
-        """Tabulate the basis functions of the containing cell for every owned point.
+    def _build_matrix(self, local_points: np.ndarray) -> None:
+        """Build the interpolation matrix from ``V`` onto a point mesh of the owned points.
 
-        The operator is stored as two dense ``(num_local_rows, num_dofs_per_cell)`` arrays
-        -- the basis values and the corresponding *ghosted* local DOF indices -- rather
-        than a sparse matrix. Every row has exactly the same number of entries, so this is
-        both smaller and faster than a general sparse format, and keeps the package free
-        of a sparse-matrix dependency.
+        The point mesh carries one cell per observation point this process owns, and a
+        DG-0 space on it has exactly one degree of freedom per point (``block_size`` of
+        them for a vector space), so the interpolation matrix from ``V`` onto that space
+        *is* :math:`B`. :mod:`fenicsx_ii` assembles it, including all the cross-process
+        communication, and its transpose gives the adjoint for free.
         """
         V = self.function_space
-        dofmap = V.dofmap
-        bs = dofmap.bs
-        self._num_local_dofs = (dofmap.index_map.size_local + dofmap.index_map.num_ghosts) * bs
+        gdim = V.mesh.geometry.dim
+        bs = V.dofmap.bs
 
-        if len(points) == 0:
-            num_dofs_per_cell = dofmap.dof_layout.num_dofs
-            self._basis = np.zeros((0, num_dofs_per_cell))
-            self._cols = np.zeros((0, num_dofs_per_cell), dtype=np.int32)
-            return
+        self.point_mesh = dolfinx.mesh.create_point_mesh(
+            self.comm, np.ascontiguousarray(local_points[:, :gdim], dtype=V.mesh.geometry.x.dtype)
+        )
+        element = ("DG", 0) if bs == 1 else ("DG", 0, (bs,))
+        self.observation_space = dolfinx.fem.functionspace(self.point_mesh, element)
 
-        reference_points = self._pull_back(points, cells, gdim)
-
-        # The reference basis is shared by all cells, so a single tabulate call suffices.
-        basis = np.asarray(self._basix_element.tabulate(0, reference_points))[0, :, :, 0]
-        cell_dofs = np.asarray(dofmap.list)[cells]
-
-        if bs == 1:
-            self._basis = basis
-            self._cols = cell_dofs.astype(np.int32)
-        else:
-            # Unroll to one row per (point, component): row i*bs + c reads the DOFs of
-            # component c, weighted by the same scalar basis values.
-            num_rows, num_dofs_per_cell = basis.shape
-            self._basis = np.repeat(basis, bs, axis=0)
-            components = np.arange(bs, dtype=np.int32)
-            cols = cell_dofs[:, None, :] * bs + components[None, :, None]
-            self._cols = cols.reshape(num_rows * bs, num_dofs_per_cell).astype(np.int32)
-
-    def _pull_back(self, points: np.ndarray, cells: np.ndarray, gdim: int) -> np.ndarray:
-        """Map physical points to the reference coordinates of their containing cell."""
-        mesh = self.function_space.mesh
-        geometry_dofmap = _geometry_dofmap(mesh)
-        geometry_x = mesh.geometry.x
-        tdim = mesh.topology.dim
-        dtype = geometry_x.dtype
-
-        if _is_affine_simplex(mesh) and gdim == tdim:
-            # X = x0 + J xi, so xi = J^{-1} (X - x0) with a constant Jacobian per cell.
-            coords = geometry_x[np.asarray(geometry_dofmap)[cells]][:, : tdim + 1, :gdim]
-            jacobian = np.swapaxes(coords[:, 1:, :] - coords[:, :1, :], 1, 2)
-            offsets = (points[:, :gdim] - coords[:, 0, :])[..., None]
-            return np.linalg.solve(jacobian, offsets)[..., 0].astype(dtype)
-
-        # Otherwise fall back to the coordinate element's Newton iteration, which handles
-        # one cell at a time; group the points by cell to call it as rarely as possible.
-        cmap = _coordinate_map(mesh)
-        reference_points = np.zeros((len(points), tdim), dtype=dtype)
-        order = np.argsort(cells, kind="stable")
-        boundaries = np.flatnonzero(np.diff(cells[order])) + 1
-        for group in np.split(order, boundaries):
-            cell_coords = geometry_x[geometry_dofmap[cells[group[0]]]][:, :gdim]
-            physical = np.ascontiguousarray(points[group, :gdim], dtype=dtype)
-            reference_points[group] = cmap.pull_back(physical, cell_coords)
-        return reference_points
+        self._matrix, _, _ = create_interpolation_matrix(
+            V,
+            self.observation_space,
+            _PointCloudTrace(self.point_mesh),
+            tol=self.padding,
+            use_petsc=True,
+        )
+        # Reusable work vectors, so that apply/apply_transpose do not allocate per call.
+        self._observation_function = dolfinx.fem.Function(self.observation_space)
+        self._state_function = dolfinx.fem.Function(V)
+        index_map = self.observation_space.dofmap.index_map
+        self._num_local_rows = index_map.size_local * self.observation_space.dofmap.index_map_bs
 
     # --------------------------------------------------------------------- actions ---
     @property
@@ -285,23 +259,28 @@ class PointObservation:
 
     @property
     def num_local_rows(self) -> int:
-        """Number of rows owned by this rank, including the block-size unrolling."""
-        return self._basis.shape[0]
+        """Number of rows owned by this process, including the block-size unrolling."""
+        return self._num_local_rows
+
+    @property
+    def matrix(self):
+        """The interpolation matrix :math:`B`, as a distributed ``PETSc.Mat``."""
+        return self._matrix
 
     def apply(self, u: dolfinx.fem.Function) -> npt.NDArray[np.float64]:
-        """Evaluate :math:`Bu` for the rows owned by this rank.
+        """Evaluate :math:`Bu` for the rows owned by this process.
 
         Args:
             u: Function in :attr:`function_space`.
 
         Returns:
-            The point values of the rows owned by this rank, ordered as
+            The point values of the rows owned by this process, ordered as
             :attr:`local_indices` (component-fastest for vector spaces).
         """
         u.x.scatter_forward()
-        if self.num_local_rows == 0:
-            return np.zeros(0)
-        return np.einsum("ij,ij->i", self._basis, u.x.array[self._cols])
+        self._matrix.mult(u.x.petsc_vec, self._observation_function.x.petsc_vec)
+        self._observation_function.x.scatter_forward()
+        return np.asarray(self._observation_function.x.array[: self.num_local_rows], dtype=np.float64)
 
     def evaluate(self, u: dolfinx.fem.Function, fill: float = np.nan) -> npt.NDArray[np.float64]:
         """Evaluate ``u`` at every observation point.
@@ -335,13 +314,14 @@ class PointObservation:
         if out is None:
             out = dolfinx.la.vector(V.dofmap.index_map, V.dofmap.bs, dtype=V.mesh.geometry.x.dtype)
             out.array[:] = 0.0
-        if self.num_local_rows > 0:
-            weights = self._basis * np.asarray(values, dtype=np.float64)[:, None]
-            contributions = np.bincount(
-                self._cols.reshape(-1), weights=weights.reshape(-1), minlength=self._num_local_dofs
-            )
-            out.array[:] += contributions
-        out.scatter_reverse(dolfinx.la.InsertMode.add)
+
+        self._observation_function.x.array[: self.num_local_rows] = np.asarray(values, dtype=np.float64)
+        self._observation_function.x.scatter_forward()
+        # PETSc performs the reverse communication itself, so no scatter_reverse is needed.
+        self._matrix.multTranspose(self._observation_function.x.petsc_vec, self._state_function.x.petsc_vec)
+        self._state_function.x.scatter_forward()
+
+        out.array[:] += self._state_function.x.array
         out.scatter_forward()
         return out
 
@@ -382,22 +362,6 @@ class PointObservation:
             else:
                 total.reshape(self.num_points, bs)[missing] = fill
         return total
-
-    def to_scipy(self):
-        """This rank's block of :math:`B` as a ``scipy.sparse`` CSR matrix.
-
-        Columns index the ghosted local DOF array (``u.x.array``). Requires ``scipy``,
-        which is not a dependency of this package; :meth:`apply` and
-        :meth:`apply_transpose` do not need it.
-        """
-        import scipy.sparse
-
-        num_rows, num_dofs_per_cell = self._basis.shape
-        rows = np.repeat(np.arange(num_rows), num_dofs_per_cell)
-        return scipy.sparse.csr_matrix(
-            (self._basis.reshape(-1), (rows, self._cols.reshape(-1))),
-            shape=(num_rows, self._num_local_dofs),
-        )
 
 
 def point_observation_misfit(
