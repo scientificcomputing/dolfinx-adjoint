@@ -185,14 +185,6 @@ class PointObservation:
         self.padding = _default_padding(mesh) if padding is None else float(padding)
 
         # Locate the points with an exact containment test, over owned cells only.
-        #
-        # This is the one piece that is *not* delegated. `fenicsx_ii` locates points with
-        # `dolfinx.geometry.determine_point_ownership`, and asserts that every point is
-        # found -- but that routine snaps points to nearby cells rather than testing
-        # containment. On a brain-surface mesh it claimed 13.5% more points than are
-        # actually inside, every one verifiably outside the cell it was assigned to.
-        # Filtering here means only genuinely interior points reach the point mesh, so the
-        # assertion holds and no phantom observations enter the misfit.
         num_owned_cells = mesh.topology.index_map(tdim).size_local
         first_cell = np.full(num_points, -1, dtype=np.int32)
         if num_owned_cells > 0 and num_points > 0:
