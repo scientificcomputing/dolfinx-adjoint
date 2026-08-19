@@ -2,6 +2,7 @@ import typing
 
 from mpi4py import MPI
 
+import basix
 import dolfinx
 import numpy
 import numpy as np
@@ -25,6 +26,63 @@ def mesh_2D():
 @pytest.fixture(scope="module")
 def mesh_3D():
     return dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 50, 50, 50)
+
+
+def test_assign_linear_combination(mesh_1D):
+    V = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+    f = Function(V, name="f")
+    f.interpolate(lambda x: 2.0 * x[0])
+    g = Function(V, name="g")
+    g.interpolate(lambda x: 3.0 * x[0] ** 2)
+    u = Function(V, name="u")
+
+    assign(3 * f - g, u)
+
+    J = assemble_scalar(u**2 * ufl.dx)
+    rf = pyadjoint.ReducedFunctional(J, pyadjoint.Control(f))
+    h = Function(V)
+    rng = np.random.default_rng(seed=42)
+    num_dofs_local = (V.dofmap.index_map.size_local + V.dofmap.index_map.num_ghosts) * V.dofmap.index_map_bs
+    rand = rng.random(size=num_dofs_local, dtype=h.dtype)
+    h.x.array[:] = rand
+    h.x.scatter_forward()
+    assert pyadjoint.taylor_test(rf, f, h) > 1.9
+
+    rf2 = pyadjoint.ReducedFunctional(J, pyadjoint.Control(g))
+    assert pyadjoint.taylor_test(rf2, g, h) > 1.9
+
+
+def test_assign_lincomb_real_space(mesh_1D):
+    r_el = basix.ufl.real_element(mesh_1D.basix_cell(), value_shape=())
+    R = dolfinx.fem.functionspace(mesh_1D, r_el)
+    r = Function(R, name="r")
+    r.x.array[0] = 0.2
+
+    V = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 2))
+    v = Function(V, name="u")
+    v.interpolate(lambda x: 3.0 * x[0] ** 2)
+
+    z = -2 * v + 4 * r * v
+    u = Function(V, name="u_output")
+    assign(z, u)
+
+    J = assemble_scalar(u**2 * ufl.dx)
+    rf = pyadjoint.ReducedFunctional(J, pyadjoint.Control(r))
+    h = Function(R)
+    rng = np.random.default_rng(seed=42)
+    num_dofs_local = (R.dofmap.index_map.size_local + R.dofmap.index_map.num_ghosts) * R.dofmap.index_map_bs
+    rand = rng.random(size=num_dofs_local, dtype=h.dtype)
+    h.x.array[:] = rand
+    h.x.scatter_forward()
+    assert pyadjoint.taylor_test(rf, r, h) > 1.9
+
+    rf2 = pyadjoint.ReducedFunctional(J, pyadjoint.Control(v))
+    hv = Function(V)
+    num_dofs_local = (V.dofmap.index_map.size_local + V.dofmap.index_map.num_ghosts) * V.dofmap.index_map_bs
+    rand = rng.random(size=num_dofs_local, dtype=hv.dtype)
+    hv.x.array[:] = rand
+    hv.x.scatter_forward()
+    assert pyadjoint.taylor_test(rf2, v, hv) > 1.9
 
 
 def test_multiple_assign_adjoint_accumulation(mesh_1D):

@@ -17,7 +17,7 @@ from pyadjoint.tape import annotate_tape, get_working_tape, no_annotations, stop
 
 from ..blocks.assembly import assemble_compiled_form
 from ..blocks.function_assigner import FunctionAssignBlock
-from ..utils import ad_kwargs, function_from_vector, gather
+from ..utils import ad_kwargs, assign_linear_combination, function_from_vector, gather
 
 
 class Function(dolfinx.fem.Function, FloatingType):
@@ -273,7 +273,7 @@ def assign(value: typing.Union[numpy.inexact, float, int], function: Function, *
     if annotate:
         if not isinstance(value, ufl.core.operator.Operator):
             value = create_overloaded_object(value)
-        block = FunctionAssignBlock(value, function, ad_block_tag=ad_block_tag)
+        block = FunctionAssignBlock(value, ad_block_tag=ad_block_tag)
         tape = get_working_tape()
         tape.add_block(block)
 
@@ -285,6 +285,9 @@ def assign(value: typing.Union[numpy.inexact, float, int], function: Function, *
                 "Function spaces of the value and function must match for assignment."
             )
             function.x.array[:] = value.x.array[:]
+        elif isinstance(value, ufl.core.expr.Expr):
+            # Linear combination of functions, e.g., 2*u + 3*v
+            assign_linear_combination(value, function)
         else:
             raise ValueError(f"Unsupported value type for assignment: {type(value)})")
     if annotate:
