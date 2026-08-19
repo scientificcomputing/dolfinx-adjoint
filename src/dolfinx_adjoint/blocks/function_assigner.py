@@ -8,7 +8,7 @@ from pyadjoint import AdjFloat, Block, OverloadedType
 from ufl.corealg.traversal import traverse_unique_terminals
 from ufl.formatting.ufl2unicode import ufl2unicode
 
-from ..utils import assign_linear_combination, function_from_vector, extract_linear_combination
+from ..utils import assign_linear_combination, extract_linear_combination, function_from_vector
 from ._vector import _vector
 
 
