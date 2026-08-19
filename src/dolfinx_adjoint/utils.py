@@ -143,7 +143,7 @@ def extract_linear_combination(expr: ufl.core.expr.Expr) -> list[tuple[float, do
     """
 
     # Parse the expression, flattening nested Sums recursively
-    summands: list[ufl.core.expr.Expr]
+    summands: list[ufl.core.expr.Expr] | tuple[ufl.core.terminal.FormArgument, ...]
     if isinstance(expr, ufl.classes.Sum):
         summands = expr.ufl_operands
     else:
