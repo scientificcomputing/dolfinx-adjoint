@@ -8,6 +8,7 @@ from pyadjoint import AdjFloat, Block, OverloadedType
 from ufl.corealg.traversal import traverse_unique_terminals
 from ufl.formatting.ufl2unicode import ufl2unicode
 
+from ..types.function import Function as _Function
 from ..utils import assign_linear_combination, extract_linear_combination, function_from_vector
 from ._vector import _vector
 
@@ -21,7 +22,7 @@ class FunctionAssignBlock(Block):
 
     def __init__(
         self,
-        other: typing.Union[np.inexact, int, float],
+        other: np.inexact | int | float | _Function | ufl.core.expr.Expr,
         ad_block_tag: typing.Optional[str] = None,
     ):
         super().__init__(ad_block_tag=ad_block_tag)
@@ -34,6 +35,7 @@ class FunctionAssignBlock(Block):
             self.add_dependency(other, no_duplicates=True)
         else:
             # Extract linear combination
+            assert isinstance(other, ufl.core.expr.Expr), f"Expected UFL expression, got {type(other)}"
             lin_comb = extract_linear_combination(other)
             if len(lin_comb) == 0:
                 raise ValueError("No linear combination found in the expression.")

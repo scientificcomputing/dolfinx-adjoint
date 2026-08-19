@@ -13,11 +13,10 @@ from pyadjoint.overloaded_type import (
     get_overloaded_class,
     register_overloaded_type,
 )
-from pyadjoint.tape import annotate_tape, get_working_tape, no_annotations, stop_annotating
+from pyadjoint.tape import no_annotations
 
 from ..blocks.assembly import assemble_compiled_form
-from ..blocks.function_assigner import FunctionAssignBlock
-from ..utils import ad_kwargs, assign_linear_combination, function_from_vector, gather
+from ..utils import function_from_vector, gather
 
 
 class Function(dolfinx.fem.Function, FloatingType):
@@ -189,7 +188,7 @@ class Function(dolfinx.fem.Function, FloatingType):
     def _ad_copy(self):
         """Create a (deep) copy of the function."""
         r = get_overloaded_class(dolfinx.fem.Function)(self.function_space)
-        assign(self, r)
+        r.x.array[:] = self.x.array[:].copy()
         return r
 
     @staticmethod
@@ -256,39 +255,3 @@ class Constant(Function):
 
 register_overloaded_type(Function, (dolfinx.fem.Function, Function))
 register_overloaded_type(Constant, (dolfinx.fem.Constant, Constant))
-
-
-def assign(value: typing.Union[numpy.inexact, float, int], function: Function, **kwargs: typing.Unpack[ad_kwargs]):
-    """Assign a `value` to a :py:func:`dolfinx_adjoint.Function`.
-
-    Args:
-        value: The value to assign to the function.
-        function: The function to assign the value to.
-        *args: Additional positional arguments to pass to the assign method.
-        **kwargs: Additional keyword arguments to pass to the assign method.
-    """
-    # do not annotate in case of self assignment
-    ad_block_tag = kwargs.pop("ad_block_tag", None)
-    annotate = annotate_tape(kwargs) and value != function
-    if annotate:
-        if not isinstance(value, ufl.core.operator.Operator):
-            value = create_overloaded_object(value)
-        block = FunctionAssignBlock(value, ad_block_tag=ad_block_tag)
-        tape = get_working_tape()
-        tape.add_block(block)
-
-    with stop_annotating():
-        if isinstance(value, (numpy.inexact, float, int)):
-            function.x.array[:] = value
-        elif isinstance(value, dolfinx.fem.Function):
-            assert value.function_space == function.function_space, (
-                "Function spaces of the value and function must match for assignment."
-            )
-            function.x.array[:] = value.x.array[:]
-        elif isinstance(value, ufl.core.expr.Expr):
-            # Linear combination of functions, e.g., 2*u + 3*v
-            assign_linear_combination(value, function)
-        else:
-            raise ValueError(f"Unsupported value type for assignment: {type(value)})")
-    if annotate:
-        block.add_output(function.create_block_variable())
