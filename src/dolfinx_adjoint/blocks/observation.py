@@ -48,9 +48,12 @@ class PointObservationBlock(Block):
         super().__init__(ad_block_tag=ad_block_tag)
         self.add_dependency(u)
         self.observation = observation
-        self.data = data
+        # Copied: the tape holds this block for as long as it is needed for differentiation,
+        # so a caller mutating a data/weights buffer it passed in (for instance reusing one
+        # local-length array across a time-stepping loop) must not retroactively change it.
+        self.data = np.array(data, dtype=np.float64, copy=True)
         self.noise_variance = noise_variance
-        self.weights = weights
+        self.weights = None if weights is None else np.array(weights, dtype=np.float64, copy=True)
 
     def __str__(self) -> str:
         return f"point_observation_misfit({self.observation.num_found} points)"
@@ -63,13 +66,22 @@ class PointObservationBlock(Block):
             return values
         return self.weights * values
 
-    def _transpose_action(self, residual: npt.NDArray[np.float64], scale: float) -> _SpecialVector:
-        """:math:`\\mathrm{scale} \\cdot \\sigma^{-2} B^T W^2 r`, as a DOF vector."""
-        V = self.observation.function_space
-        out = _vector(V.dofmap.index_map, V.dofmap.bs, V, dtype=V.mesh.geometry.x.dtype)
-        out.array[:] = 0.0
+    def _weighted_row(self, values: npt.NDArray[np.float64], scale: float) -> npt.NDArray[np.float64]:
+        """:math:`\\mathrm{scale} \\cdot \\sigma^{-2} W^2 v`, in the row layout `apply` uses."""
         # W is applied twice: once to the residual, once from differentiating ||W r||^2.
-        weighted = self._apply_weights(self._apply_weights(residual)) * (scale / self.noise_variance)
+        return self._apply_weights(self._apply_weights(values)) * (scale / self.noise_variance)
+
+    def _transpose(self, weighted: npt.NDArray[np.float64]) -> _SpecialVector:
+        """:math:`B^T` applied to a row-space vector, as a freshly built DOF vector.
+
+        Built fresh on every call rather than reused: pyadjoint stores the returned vector by
+        reference on the tape (`BlockVariable.add_adj_output`/`add_hessian_output`), so handing
+        back the same buffer twice would let a later call silently overwrite a value pyadjoint
+        is still holding.
+        """
+        V = self.observation.function_space
+        out = _vector(V.dofmap.index_map, V.dofmap.bs, V, dtype=self.observation.dtype)
+        out.array[:] = 0.0
         self.observation.apply_transpose(weighted, out=out)
         return out
 
@@ -81,7 +93,7 @@ class PointObservationBlock(Block):
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
         adj_input = 1.0 if adj_inputs[0] is None else float(adj_inputs[0])
-        return self._transpose_action(self._residual(inputs[0]), adj_input)
+        return self._transpose(self._weighted_row(self._residual(inputs[0]), adj_input))
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
         tlm_u = tlm_inputs[0]
@@ -105,10 +117,11 @@ class PointObservationBlock(Block):
         hessian_input = 0.0 if hessian_inputs[0] is None else float(hessian_inputs[0])
         adj_input = 1.0 if adj_inputs[0] is None else float(adj_inputs[0])
 
-        # Second-order seed, propagated through the first derivative ...
-        out = self._transpose_action(self._residual(inputs[0]), hessian_input)
-        # ... plus the curvature of J applied to the TLM direction.
+        # Second-order seed, propagated through the first derivative, plus the curvature of J
+        # applied to the TLM direction and summed before B^T is applied, so that B^T (a full
+        # communication round-trip) runs once per Hessian action instead of twice.
+        combined = self._weighted_row(self._residual(inputs[0]), hessian_input)
         tlm_u = block_variable.tlm_value
         if tlm_u is not None:
-            out.array[:] += self._transpose_action(self.observation.apply(tlm_u), adj_input).array[:]
-        return out
+            combined += self._weighted_row(self.observation.apply(tlm_u), adj_input)
+        return self._transpose(combined)

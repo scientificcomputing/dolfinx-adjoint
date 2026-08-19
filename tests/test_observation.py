@@ -274,6 +274,37 @@ def test_points_must_match_across_processes():
         dolfinx_adjoint.PointObservation(V, points)
 
 
+def test_permuted_points_are_rejected():
+    """Reordering the rows leaves the sum of coordinates unchanged, so a plain-sum checksum
+    would miss it; the checksum must weight by position to catch this too."""
+    comm = MPI.COMM_WORLD
+    V = dolfinx.fem.functionspace(unit_square(comm, 4), ("Lagrange", 1))
+    if comm.size == 1:
+        pytest.skip("mismatched points require more than one process")
+
+    points = sample_points(6, seed=131)
+    if comm.rank == 1:
+        points = points[::-1].copy()
+    with pytest.raises(ValueError, match="differing coordinates"):
+        dolfinx_adjoint.PointObservation(V, points)
+
+
+def test_bad_point_shape_on_one_process_does_not_deadlock():
+    """A per-process malformed `points` array must raise on every rank, not just the bad one.
+
+    A validation failure on only some ranks would leave those ranks raising while the others
+    proceed into the collective replication check below and block forever.
+    """
+    comm = MPI.COMM_WORLD
+    V = dolfinx.fem.functionspace(unit_square(comm, 4), ("Lagrange", 1))
+    if comm.size == 1:
+        pytest.skip("a per-process shape mismatch requires more than one process")
+
+    points = np.zeros((2, 5)) if comm.rank == 1 else sample_points(5, seed=151)
+    with pytest.raises(ValueError, match="at most 3 components"):
+        dolfinx_adjoint.PointObservation(V, points)
+
+
 def test_padding_does_not_depend_on_the_partition():
     """The default padding comes from the global bounding box, not each process's own."""
     comm = MPI.COMM_WORLD
@@ -497,6 +528,30 @@ def test_mismatched_data_length_raises():
     B = dolfinx_adjoint.PointObservation(V, sample_points(6, seed=41))
     with pytest.raises(ValueError, match="Expected an array of length"):
         dolfinx_adjoint.point_observation_misfit(u, B, np.zeros(B.num_points + 3))
+
+
+def test_reusing_a_data_buffer_does_not_corrupt_earlier_blocks():
+    comm = MPI.COMM_WORLD
+    tape = pyadjoint.get_working_tape()
+    tape.clear_tape()
+    V = dolfinx.fem.functionspace(unit_square(comm, 4), ("Lagrange", 1))
+    u = dolfinx_adjoint.Function(V, name="u")
+    u.interpolate(lambda x: x[0])
+
+    B = dolfinx_adjoint.PointObservation(V, sample_points(5, seed=17))
+    buffer = B.restrict(np.zeros(B.num_points))
+
+    buffer[:] = 1.0
+    dolfinx_adjoint.point_observation_misfit(u, B, buffer)
+    first_block = tape.get_blocks()[-1]
+
+    buffer[:] = 2.0  # mutated after the block was built, as a caller reusing the array would
+    dolfinx_adjoint.point_observation_misfit(u, B, buffer)
+    second_block = tape.get_blocks()[-1]
+
+    assert np.allclose(first_block.data, 1.0)
+    assert np.allclose(second_block.data, 2.0)
+    tape.clear_tape()
 
 
 # ---------------------------------------------------------------------------

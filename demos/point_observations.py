@@ -219,15 +219,3 @@ else:
         plotter.show()
 
 # -
-
-# ## Going further
-#
-# * **Sensors outside the domain.** `B.found` flags any points that fall outside the mesh, and
-#   those are left out of the misfit rather than being treated as measurements of zero.
-# * **Unreliable sensors.** `point_observation_misfit(..., weights=...)` reweights individual
-#   measurements; a zero weight drops one entirely.
-# * **Noisier data.** `point_observation_misfit(..., noise_variance=...)` divides the misfit by
-#   $\sigma^2$, which is what makes it a negative log-likelihood when the regularization term is
-#   a genuine prior.
-# * **Time-dependent data.** Build `B` once and call `point_observation_misfit` once per
-#   observation time, summing the results -- the operator only depends on the sensor positions.

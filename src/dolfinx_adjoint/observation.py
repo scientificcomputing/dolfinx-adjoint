@@ -97,7 +97,16 @@ def _default_padding(mesh: dolfinx.mesh.Mesh) -> float:
 
 
 def _pad_points(points: npt.ArrayLike) -> np.ndarray:
-    """Return points as a contiguous ``(num_points, 3)`` float64 array."""
+    """Return points as a contiguous ``(num_points, 3)`` float64 array.
+    Add zero padding for points in 1D or 2D, so that the bounding-box tree can be
+    built once and used for all points.
+
+    Args:
+        points: Input points, shape ``(num_points, dim)`` with ``dim <= 3``.
+
+    Returns:
+        Padded points, shape ``(num_points, 3)``.
+    """
     padded_input = np.atleast_2d(np.asarray(points, dtype=np.float64))
     if padded_input.ndim != 2:
         raise ValueError(f"Points must be 2D with shape (num_points, dim), got shape {padded_input.shape}")
@@ -169,13 +178,18 @@ class PointObservation:
                 "`V.sub(0).collapse()[0]`, and build the operator on that."
             ) from exc
 
+        # Make sure all points are 3D. For dim < 3, pad with zeros so that the bounding-box
+        # tree can be built once and used for all points.
         padded_points = _pad_points(points)
         num_points = padded_points.shape[0]
         if comm.allreduce(num_points, op=MPI.MIN) != comm.allreduce(num_points, op=MPI.MAX):
             raise ValueError("`points` must be replicated on all processes (got differing lengths).")
         # A checksum costs one scalar reduction and catches the far nastier case of equally
         # many but *different* points, which would otherwise silently corrupt the operator.
-        checksum = float(padded_points.sum())
+        # Weighting each entry by its position makes the checksum sensitive to permuted rows
+        # too, not just to changed coordinates.
+        position_weights = np.arange(1, padded_points.size + 1, dtype=np.float64)
+        checksum = float(np.dot(padded_points.ravel(), position_weights))
         if comm.allreduce(checksum, op=MPI.MIN) != comm.allreduce(checksum, op=MPI.MAX):
             raise ValueError("`points` must be replicated on all processes (got differing coordinates).")
         self.num_points = num_points
@@ -184,7 +198,7 @@ class PointObservation:
         tdim = mesh.topology.dim
         self.padding = _default_padding(mesh) if padding is None else float(padding)
 
-        # Locate the points with an exact containment test, over owned cells only.
+        # Locate the points in the mesh
         num_owned_cells = mesh.topology.index_map(tdim).size_local
         first_cell = np.full(num_points, -1, dtype=np.int32)
         if num_owned_cells > 0 and num_points > 0:
@@ -203,14 +217,35 @@ class PointObservation:
         owner = np.empty_like(candidate_owner)
         comm.Allreduce(candidate_owner, owner, op=MPI.MIN)
 
-        self.found = owner < comm.size
-        self.owner = np.where(self.found, owner, -1).astype(np.int32)
-        self.num_found = int(self.found.sum())
+        self._found = owner < comm.size
+        self._owner = np.where(self._found, owner, -1).astype(np.int32)
+        self.num_found = int(self._found.sum())
         self.local_indices = np.flatnonzero(owner == comm.rank).astype(np.int32)
 
         self._build_matrix(padded_points[self.local_indices])
 
-    # -------------------------------------------------------------------- assembly ---
+    def __repr__(self) -> str:
+        return type(self).__name__ + f"(V={self.function_space}, points={self.points}, padding={self.padding})"
+
+    def __str__(self) -> str:
+        return f"PointObservation({self.num_found} points, {self.function_space})"
+
+    @property
+    def found(self) -> npt.NDArray[np.bool_]:
+        """Boolean array of length ``num_points``, ``True`` where the point was located in the mesh on some rank.
+
+        Identical on every rank.
+        """
+        return self._found
+
+    @property
+    def owner(self) -> npt.NDArray[np.int32]:
+        """Rank owning each point, ``-1`` where it was not found.
+
+        Identical on every rank.
+        """
+        return self._owner
+
     def _build_matrix(self, local_points: np.ndarray) -> None:
         """Build the interpolation matrix from ``V`` onto a point mesh of the owned points.
 
@@ -240,8 +275,8 @@ class PointObservation:
         # Reusable work vectors, so that apply/apply_transpose do not allocate per call.
         self._observation_function = dolfinx.fem.Function(self.observation_space)
         self._state_function = dolfinx.fem.Function(V)
-        index_map = self.observation_space.dofmap.index_map
-        self._num_local_rows = index_map.size_local * self.observation_space.dofmap.index_map_bs
+        dm = self.observation_space.dofmap
+        self._num_local_rows = dm.index_map.size_local * dm.index_map_bs
 
     # --------------------------------------------------------------------- actions ---
     @property
@@ -258,6 +293,15 @@ class PointObservation:
     def matrix(self):
         """The interpolation matrix :math:`B`, as a distributed ``PETSc.Mat``."""
         return self._matrix
+
+    @property
+    def dtype(self) -> np.dtype:
+        """Scalar dtype of the observed function space.
+
+        Independent of the mesh geometry's dtype, which is always real -- a complex-valued
+        ``V`` still has real geometry.
+        """
+        return self._state_function.x.array.dtype
 
     def apply(self, u: dolfinx.fem.Function) -> npt.NDArray[np.float64]:
         """Evaluate :math:`Bu` for the rows owned by this process.
@@ -304,7 +348,7 @@ class PointObservation:
         """
         V = self.function_space
         if out is None:
-            out = dolfinx.la.vector(V.dofmap.index_map, V.dofmap.bs, dtype=V.mesh.geometry.x.dtype)
+            out = dolfinx.la.vector(V.dofmap.index_map, V.dofmap.bs, dtype=self.dtype)
             out.array[:] = 0.0
 
         self._observation_function.x.array[: self.num_local_rows] = np.asarray(values, dtype=np.float64)
@@ -322,13 +366,14 @@ class PointObservation:
 
         Args:
             data: Array of length ``num_points * block_size``, identical on every rank.
+
+        Returns:
+            Array of length ``num_local_rows``, in the layout produced by :meth:`apply`.
         """
         values = np.asarray(data, dtype=np.float64)
         bs = self.block_size
         if values.shape[0] != self.num_points * bs:
             raise ValueError(f"Expected data of length {self.num_points * bs}, got {values.shape[0]}")
-        if bs == 1:
-            return values[self.local_indices]
         return values.reshape(self.num_points, bs)[self.local_indices].reshape(-1)
 
     def gather(self, values: npt.ArrayLike, fill: float = np.nan) -> npt.NDArray[np.float64]:
@@ -341,18 +386,11 @@ class PointObservation:
         bs = self.block_size
         buffer = np.zeros(self.num_points * bs, dtype=np.float64)
         local = np.asarray(values, dtype=np.float64)
-        if bs == 1:
-            buffer[self.local_indices] = local
-        else:
-            buffer.reshape(self.num_points, bs)[self.local_indices] = local.reshape(-1, bs)
+        buffer.reshape(self.num_points, bs)[self.local_indices] = local.reshape(-1, bs)
         total = np.empty_like(buffer)
         self.comm.Allreduce(buffer, total, op=MPI.SUM)
         if not np.all(self.found):
-            missing = ~self.found
-            if bs == 1:
-                total[missing] = fill
-            else:
-                total.reshape(self.num_points, bs)[missing] = fill
+            total.reshape(self.num_points, bs)[~self.found] = fill
         return total
 
 
