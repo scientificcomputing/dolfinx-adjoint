@@ -13,6 +13,12 @@ from ._vector import _vector
 
 
 class FunctionAssignBlock(Block):
+    """Block for assigning data directly to a `Function` on the tape.
+
+    This block handles the assignment of a linear combination of `Function`s
+    or constants to a target `Function`.
+    """
+
     def __init__(
         self,
         other: typing.Union[np.inexact, int, float],
@@ -59,12 +65,12 @@ class FunctionAssignBlock(Block):
         if isinstance(input, dolfinx.la.Vector):
             one = dolfinx.la.vector(input.index_map, input.block_size, input.array.dtype)
             one.array[:] = 1
-            return dolfinx.cpp.la.inner_product(input._cpp_object, one._cpp_object)
+            return dolfinx.cpp.la.inner_product(input._cpp_object, one._cpp_object)  # type: ignore[arg-type]
         else:
-            try:
+            if hasattr(input, "sum"):
                 return input.sum()
-            except AttributeError:
-                # Catch the case where input[0] is just a float
+            else:
+                # Catch the case where input is just a float
                 return input
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
