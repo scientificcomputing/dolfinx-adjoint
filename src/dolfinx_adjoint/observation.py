@@ -117,6 +117,27 @@ def _pad_points(points: npt.ArrayLike) -> np.ndarray:
     return padded
 
 
+def _pad_points_collective(comm: MPI.Comm, points: npt.ArrayLike) -> np.ndarray:
+    """``_pad_points``, but validated on every rank before any rank can raise.
+
+    A bad ``points`` array is exactly the kind of per-rank data bug the shape checks in
+    ``_pad_points`` exist to catch, and it need not affect every rank alike. Raising locally,
+    before the replication check below has run, would let one rank exit the constructor while
+    the others block forever on that check's collective reduction.
+    """
+    try:
+        padded = _pad_points(points)
+        message = ""
+    except ValueError as exc:
+        padded = np.zeros((0, 3), dtype=np.float64)
+        message = str(exc)
+
+    failures = [message for message in comm.allgather(message) if message]
+    if failures:
+        raise ValueError(failures[0])
+    return padded
+
+
 class PointObservation:
     """The operator :math:`B` evaluating a finite element function at a set of points.
 
@@ -176,7 +197,7 @@ class PointObservation:
 
         # Make sure all points are 3D. For dim < 3, pad with zeros so that the bounding-box
         # tree can be built once and used for all points.
-        padded_points = _pad_points(points)
+        padded_points = _pad_points_collective(comm, points)
         num_points = padded_points.shape[0]
         if comm.allreduce(num_points, op=MPI.MIN) != comm.allreduce(num_points, op=MPI.MAX):
             raise ValueError("`points` must be replicated on all processes (got differing lengths).")
