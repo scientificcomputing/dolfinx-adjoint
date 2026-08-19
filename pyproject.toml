@@ -12,6 +12,7 @@ readme = "README.md"
 dependencies = [
       "fenics-dolfinx>=0.10.0",
       "pyadjoint-ad>=2025.10.0",
+      "fenicsx-ii",
       "typing_extensions; python_version < '3.11'",
       "packaging>=24.2",
 ]
