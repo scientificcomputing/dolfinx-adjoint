@@ -199,7 +199,6 @@ except ImportError:
     print("Install pyvista to visualize the result")
 
 else:
-    # pyvista.set_jupyter_backend("html")
     cells, types, geometry = dolfinx.plot.vtk_mesh(V)
     sensor_cloud = pyvista.PolyData(np.column_stack([sensors, np.zeros(len(sensors))]))
 
