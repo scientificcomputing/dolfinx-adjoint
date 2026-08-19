@@ -131,10 +131,6 @@ class PointObservation:
 
     Attributes:
         num_points: Total (global) number of input points.
-        found: Boolean array of length ``num_points``, ``True`` where the point was located
-            in the mesh on some rank. Identical on every rank.
-        owner: Rank owning each point, ``-1`` where it was not found. Identical on every
-            rank.
         local_indices: Indices into the global point array of the points owned by this
             rank. This is the row ordering used by :meth:`apply`.
 
