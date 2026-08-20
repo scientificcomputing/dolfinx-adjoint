@@ -38,10 +38,12 @@ def assign(value: typing.Union[numpy.inexact, float, int], function: _Function, 
         if isinstance(value, (numpy.inexact, float, int)):
             function.x.array[:] = value
         elif isinstance(value, dolfinx.fem.Function):
-            assert value.function_space == function.function_space, (
-                "Function spaces of the value and function must match for assignment."
-            )
-            function.x.array[:] = value.x.array[:]
+            if value.function_space == function.function_space:
+                function.x.array[:] = value.x.array[:]
+            elif value.ufl_element().is_real and value.ufl_shape == ():
+                function.x.array[:] = value.x.array[0]
+            else:
+                raise ValueError("Function spaces of the value and function must match for assignment.")
         elif isinstance(value, ufl.core.expr.Expr):
             # Linear combination of functions, e.g., 2*u + 3*v
             assign_linear_combination(value, function)

@@ -13,6 +13,29 @@ from ..utils import assign_linear_combination, extract_linear_combination, funct
 from ._vector import _vector
 
 
+def is_real_scalar_func(func: dolfinx.fem.Function) -> bool:
+    """Check if a function is a real scalar function.
+
+    Args:
+        func: The function to check.
+    """
+    return func.ufl_element().is_real and func.ufl_shape == ()
+
+
+def create_function_with_special_vector(func: _Function, name: str | None = None) -> _Function:
+    """Create a new function with the same function space as `func` but with a special vector for adjoint computations.
+
+    Args:
+        func: The original function from which to derive the new function.
+
+    Returns:
+        A new function with the same function space as `func` but with a special vector for adjoint computations.
+    """
+    name = name or f"{func.name}_special_vector"
+    vec = _vector(func.x.index_map, func.x.block_size, func.function_space, dtype=func.x.array.dtype)
+    return _Function(func.function_space, x=vec, annotate=False, name=name)
+
+
 class FunctionAssignBlock(Block):
     """Block for assigning data directly to a :py:class:`dolfinx_adjoint.Function` on the tape.
 
@@ -42,10 +65,7 @@ class FunctionAssignBlock(Block):
         # Allocate working memory for adjoint computations
         self._working_memory = []
         for i in range(2):
-            vec = _vector(func.x.index_map, func.x.block_size, func.function_space, dtype=func.x.array.dtype)
-            self._working_memory.append(
-                _Function(func.function_space, x=vec, annotate=False, name=f"working_memory_{i}")
-            )
+            self._working_memory.append(create_function_with_special_vector(func, name=f"working_memory_{i}"))
 
         # Extract dependencies
         self.other = None
@@ -60,7 +80,13 @@ class FunctionAssignBlock(Block):
             if isinstance(other, AdjFloat):
                 self._one = _Function(func.function_space, name="one", annotate=False)
                 self._one.x.array[:] = 1.0
+            elif isinstance(other, _Function) and is_real_scalar_func(other):
+                self._working_memory.append(create_function_with_special_vector(other, name="working_memory_2"))
+                self._one = _Function(func.function_space, name="one", annotate=False)
+                self._one.x.array[:] = 1.0
         else:
+            self.expr = other
+
             # Extract linear combination
             assert isinstance(other, ufl.core.expr.Expr), f"Expected UFL expression, got {type(other)}"
             lin_comb = extract_linear_combination(other)
@@ -72,14 +98,9 @@ class FunctionAssignBlock(Block):
 
             # Allocate extra memory for adjoint computations if any of the operands are real functions
             for op in traverse_unique_terminals(other):
-                if isinstance(op, _Function) and op.function_space.ufl_element().is_real:
-                    vec_2 = _vector(op.x.index_map, op.x.block_size, op.function_space, dtype=op.x.array.dtype)
-                    self._working_memory.append(
-                        _Function(op.function_space, x=vec_2, annotate=False, name="working_memory_2")
-                    )
+                if isinstance(op, _Function) and is_real_scalar_func(op):
+                    self._working_memory.append(create_function_with_special_vector(op, name="working_memory_2"))
                     break
-
-            self.expr = other
 
     def _replace_with_saved_output(self):
         if self.expr is None:
@@ -123,7 +144,14 @@ class FunctionAssignBlock(Block):
             if isinstance(bo, AdjFloat):
                 return self._compute_adjoint_of_broadcast(adj_inputs[0], self._one)
             elif isinstance(bo, dolfinx.fem.Function):
-                assert bo.function_space == prepared.function_space
+                if is_real_scalar_func(bo):
+                    # Adjoint of a broadcast into a real function (constant stored as Function)
+                    self._working_memory[2].x.array[0] = self._compute_adjoint_of_broadcast(adj_inputs[0], self._one)
+                    return self._working_memory[2].x
+                if bo.function_space != prepared.function_space:
+                    raise ValueError(
+                        "Function spaces of the block variable and prepared function must match for adjoint evaluation."
+                    )
                 self._working_memory[0].x.array[:] = adj_inputs[0].array[:]
                 return self._working_memory[0].x
             elif isinstance(bo, dolfinx.fem.Constant):
@@ -142,7 +170,7 @@ class FunctionAssignBlock(Block):
                 )
                 assign_linear_combination(diff_expr, self._working_memory[0])
                 return self._working_memory[0].x
-            elif isinstance(bo, dolfinx.fem.Function) and bo.ufl_element().is_real:
+            elif isinstance(bo, dolfinx.fem.Function) and is_real_scalar_func(bo):
                 # Differentiate with respect to a real function (constant stored as Function)
                 # Create a perturbation direction in the Real space (value = 1.0)
                 assert len(self._working_memory) == 3, "Working memory not allocated for real function adjoint."

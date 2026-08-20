@@ -217,3 +217,90 @@ def test_assign_constant_derivative():
     dd = pyadjoint.AdjFloat(0.1)
     min_rate = pyadjoint.taylor_test(Jhat, d, dd)
     assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2)
+
+
+def test_assign_wrong_function_space(mesh_1D):
+    """Test that assigning a single function from a different space fails."""
+    # Create two different function spaces (different DoF counts)
+    V1 = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+    V2 = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 2))
+
+    f_wrong = Function(V2, name="f_wrong")
+    u = Function(V1, name="u")
+
+    # The assignment should fail due to mismatched array lengths/spaces
+    with pytest.raises(ValueError):
+        assign(f_wrong, u)
+
+
+def test_assign_linear_combination_wrong_function_space(mesh_1D):
+    """Test that assigning a linear combination with an incompatible term fails."""
+    V1 = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+    V2 = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 2))
+
+    f = Function(V1, name="f")
+    g_wrong = Function(V2, name="g_wrong")
+    u = Function(V1, name="u")
+
+    # 3 * f is valid for u, but subtracting g_wrong should trigger an error
+    with pytest.raises(ValueError):
+        assign(3 * f - g_wrong, u)
+
+
+@pytest.mark.xfail(strict=True, reason="Non-linear UFL expressions cannot be assigned directly via array operations.")
+def test_assign_non_linear_expression(mesh_1D):
+    """Test that assigning a non-linear expression fails."""
+    V = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+
+    f = Function(V, name="f")
+    u = Function(V, name="u")
+
+    # Create a non-linear expression (e.g., f squared)
+    non_linear_expr = f**2
+
+    # This should raise an error during the `extract_linear_combination` phase
+    # since `f**2` is a ufl.Power or ufl.Product, not a linear combination.
+    assign(non_linear_expr, u)
+
+
+def test_assign_real_function_equals_constant(mesh_1D):
+    """Test that assigning a Real space function behaves identically to a scalar constant,
+    both in the forward pass and the adjoint pass."""
+
+    # Standard spatial space and Real (global scalar) space
+    V = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+
+    # Note: Depending on your exact Basix/DOLFINx version, this might be ("R", 0)
+    R = dolfinx.fem.functionspace(mesh_1D, basix.ufl.real_element(mesh_1D.basix_cell(), value_shape=()))
+
+    target_real = Function(V, name="target_real")
+    target_const = Function(V, name="target_const")
+
+    val = 4.2
+    # Assign using a Function from a Real space
+    r_func = Function(R, name="r_func")
+    r_func.x.array[:] = val
+    assign(r_func, target_real)
+
+    # Assign using a raw float (which your block converts to AdjFloat)
+    assign(val, target_const)
+
+    # The resulting degrees of freedom should be exactly identical
+    np.testing.assert_allclose(
+        target_real.x.array,
+        target_const.x.array,
+        err_msg="Forward assignment of Real function and constant do not match.",
+    )
+
+    J = assemble_scalar(target_real**2 * ufl.dx)
+
+    # Test the sensitivity with respect to the Real function
+    rf = pyadjoint.ReducedFunctional(J, pyadjoint.Control(r_func))
+
+    # Create a perturbation direction in the Real space
+    h = Function(R, name="h")
+    h.x.array[:] = 0.75
+
+    # Verify the adjoint derivative is correct (should converge at rate ~ 2.0)
+    convergence_rate = pyadjoint.taylor_test(rf, r_func, h)
+    assert convergence_rate > 1.9, f"Taylor test failed with rate {convergence_rate}"
