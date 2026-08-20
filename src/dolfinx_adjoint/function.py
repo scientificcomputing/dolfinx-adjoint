@@ -30,7 +30,7 @@ def assign(value: typing.Union[numpy.inexact, float, int], function: _Function, 
     if annotate:
         if not isinstance(value, ufl.core.operator.Operator):
             value = create_overloaded_object(value)
-        block = FunctionAssignBlock(value, ad_block_tag=ad_block_tag)
+        block = FunctionAssignBlock(value, function, ad_block_tag=ad_block_tag)
         tape = get_working_tape()
         tape.add_block(block)
 

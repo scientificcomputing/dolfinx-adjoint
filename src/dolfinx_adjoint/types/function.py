@@ -61,6 +61,8 @@ class Function(dolfinx.fem.Function, FloatingType):
             annotate=kwargs.pop("annotate", True),
             **kwargs,
         )
+        if x is not None:
+            self._x = x  # Ensure that the input `x` is stored in case it is a _SpecialVector
 
     @classmethod
     def _ad_init_object(cls, obj):
@@ -201,6 +203,11 @@ class Function(dolfinx.fem.Function, FloatingType):
         offset += dst.x.index_map.size_local * dst.x.block_size
         dst.x.scatter_forward()
         return dst, offset
+
+    @property
+    def x(self) -> dolfinx.la.Vector:
+        """Return the underlying vector of the function."""
+        return self._x
 
 
 class Constant(Function):
