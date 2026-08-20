@@ -160,7 +160,7 @@ def extract_linear_combination(expr: ufl.core.expr.Expr) -> list[tuple[float, do
     return terms
 
 
-def assign_linear_combination(value: ufl.core.expr.Expr, function: dolfinx.fem.Function):
+def assign_linear_combination(value: ufl.core.expr.Expr, function: dolfinx.fem.Function) -> None:
     pairs = extract_linear_combination(value)
     function.x.array[:] = 0.0
     for weight, func in pairs:
