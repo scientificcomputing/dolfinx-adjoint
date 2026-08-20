@@ -44,7 +44,7 @@ class ad_kwargs(typing.TypedDict):
     """Whether to annotate the assignment in the adjoint tape."""
 
 
-def extract_scalar_value(scalar_expr):
+def extract_scalar_value(scalar_expr: ufl.core.expr.Expr) -> float:
     """Extract float from a scalar UFL expression."""
     if isinstance(scalar_expr, (ufl.classes.IntValue, ufl.classes.FloatValue)):
         return float(scalar_expr)
@@ -92,7 +92,7 @@ def extract_function(expr) -> tuple[bool, dolfinx.fem.Function | None]:
     return (False, None)
 
 
-def extract_term(term):
+def extract_term(term: ufl.core.expr.Expr) -> tuple[float, dolfinx.fem.Function] | None:
     """Extract (weight, function) from a single term."""
     if isinstance(term, dolfinx.fem.Function):
         is_real = term.function_space.ufl_element().is_real
