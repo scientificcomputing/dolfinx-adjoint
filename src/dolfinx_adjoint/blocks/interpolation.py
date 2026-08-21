@@ -4,24 +4,24 @@ import typing
 from typing import Callable
 
 import dolfinx
+import dolfinx.fem.petsc
 from pyadjoint import Block
-from pyadjoint.overloaded_type import create_overloaded_object
 
 if typing.TYPE_CHECKING:
     from petsc4py import PETSc
 
-# Global cache to prevent redundant matrix assembly across multiple blocks/iterations
-_INTERPOLATION_MATRIX_CACHE: dict[tuple[int, int], dolfinx.la.MatrixCSR] = {}
-
 
 def attach_working_array(mat: dolfinx.la.MatrixCSR):
     """Attach working arrays to a dolfinx.la.MatrixCSR for efficient matrix-vector multiplication."""
-    if not hasattr(mat, "_row_vec"):
-        mat._row_vec = dolfinx.la.vector(mat.index_map(0), mat.block_size[0], dtype=mat.data.dtype)
-    if not hasattr(mat, "_col_vec"):
-        mat._col_vec = dolfinx.la.vector(mat.index_map(1), mat.block_size[1], dtype=mat.data.dtype)
-    mat._row_vec.array[:] = 0.0
-    mat._col_vec.array[:] = 0.0
+    # mat._row_vec/_col_vec are monkey-patched on; cast to Any so mypy doesn't
+    # flag the dynamic attributes.
+    m = typing.cast(typing.Any, mat)
+    if not hasattr(m, "_row_vec"):
+        m._row_vec = dolfinx.la.vector(mat.index_map(0), mat.block_size[0], dtype=mat.data.dtype)
+    if not hasattr(m, "_col_vec"):
+        m._col_vec = dolfinx.la.vector(mat.index_map(1), mat.block_size[1], dtype=mat.data.dtype)
+    m._row_vec.array[:] = 0.0
+    m._col_vec.array[:] = 0.0
 
 
 def get_mult(
@@ -36,22 +36,23 @@ def get_mult(
             in_size_local = v_in.index_map.size_local * v_in.block_size
             out_size_local = v_out.index_map.size_local * v_out.block_size
             attach_working_array(mat)  # Ensure working arrays are attached
+            m = typing.cast(typing.Any, mat)
             if transpose:
                 # Prevent double-counting in parallel by zeroing ghosts of input vector
                 # Calculate the exact number of local degrees of freedom
-                mat._row_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                mat._row_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
-                mat._col_vec.array[:out_size_local] = 0.0
-                mat.mult(mat._row_vec, mat._col_vec, transpose=True)
-                v_out.array[:out_size_local] = mat._col_vec.array[:out_size_local]
+                m._row_vec.array[:in_size_local] = v_in.array[:in_size_local]
+                m._row_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
+                m._col_vec.array[:out_size_local] = 0.0
+                m.mult(m._row_vec, m._col_vec, transpose=True)
+                v_out.array[:out_size_local] = m._col_vec.array[:out_size_local]
             else:
                 # Prevent double-counting in parallel by zeroing ghosts of input vector
                 # Calculate the exact number of local degrees of freedom
-                mat._row_vec.array[:out_size_local] = 0
-                mat._col_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                mat._col_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
-                mat.mult(mat._col_vec, mat._row_vec)
-                v_out.array[:out_size_local] = mat._row_vec.array[:out_size_local]
+                m._row_vec.array[:out_size_local] = 0
+                m._col_vec.array[:in_size_local] = v_in.array[:in_size_local]
+                m._col_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
+                m.mult(m._col_vec, m._row_vec)
+                v_out.array[:out_size_local] = m._row_vec.array[:out_size_local]
             v_out.scatter_forward()
 
         return mult
@@ -74,25 +75,20 @@ def get_mult(
         raise TypeError("Matrix type not supported. Expected dolfinx.la.MatrixCSR or PETSc.Mat, got {type(mat)=}.")
 
 
-def _get_interpolation_matrix(
+def _build_interpolation_matrix(
     space_from: dolfinx.fem.FunctionSpace, space_to: dolfinx.fem.FunctionSpace, use_petsc: bool = False
 ) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
-    """Retrieve or compute the interpolation matrix for a pair of spaces."""
-    key = (id(space_from), id(space_to))
+    """Assemble the interpolation matrix for a pair of spaces."""
+    if use_petsc:
+        petsc_mat = dolfinx.fem.petsc.interpolation_matrix(space_from, space_to)
+        petsc_mat.assemble()
+        return petsc_mat
 
-    if key not in _INTERPOLATION_MATRIX_CACHE:
-        if use_petsc:
-            mat = dolfinx.fem.petsc.interpolation_matrix(space_from, space_to)
-            mat.assemble()
-        else:
-            mat = dolfinx.fem.interpolation_matrix(space_from, space_to)
-            mat.scatter_reverse()
-            # The built in interpolation matrix requires two working arrays
-            attach_working_array(mat)
-
-        _INTERPOLATION_MATRIX_CACHE[key] = mat
-
-    return _INTERPOLATION_MATRIX_CACHE[key]
+    mat = dolfinx.fem.interpolation_matrix(space_from, space_to)
+    mat.scatter_reverse()
+    # The built in interpolation matrix requires two working arrays
+    attach_working_array(mat)
+    return mat
 
 
 class InterpolationBlock(Block):
@@ -116,15 +112,27 @@ class InterpolationBlock(Block):
         self._adj_output: dolfinx.fem.Function | None = None
         self._tlm_output: dolfinx.fem.Function | None = None
         self._hessian_output: dolfinx.fem.Function | None = None
-        self._recompute_output: dolfinx.fem.Function | None = None
+
+        # Interpolation matrix is fixed for the lifetime of this block (tied to
+        # self.space_from/self.space_to), so cache it per-instance rather than
+        # in a module-level dict keyed by id() (which can collide once a
+        # FunctionSpace is garbage collected).
+        self._interpolation_matrix: dolfinx.la.MatrixCSR | "PETSc.Mat" | None = None
 
     def __str__(self):
         return "interpolate_function"
 
+    def _get_interpolation_matrix(self) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
+        if self._interpolation_matrix is None:
+            self._interpolation_matrix = _build_interpolation_matrix(
+                self.space_from, self.space_to, use_petsc=self._use_petsc
+            )
+        return self._interpolation_matrix
+
     # --- Adjoint ---
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
-        return _get_interpolation_matrix(self.space_from, self.space_to, use_petsc=self._use_petsc)
+        return self._get_interpolation_matrix()
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
         adj_input = adj_inputs[0]
@@ -143,7 +151,7 @@ class InterpolationBlock(Block):
     # --- Tangent Linear Model (TLM) ---
 
     def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs):
-        return _get_interpolation_matrix(self.space_from, self.space_to, use_petsc=self._use_petsc)
+        return self._get_interpolation_matrix()
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
         tlm_input = tlm_inputs[0]
@@ -165,7 +173,7 @@ class InterpolationBlock(Block):
     # --- Hessian ---
 
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
-        return _get_interpolation_matrix(self.space_from, self.space_to, use_petsc=self._use_petsc)
+        return self._get_interpolation_matrix()
 
     def evaluate_hessian_component(
         self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None
@@ -191,12 +199,17 @@ class InterpolationBlock(Block):
     def recompute_component(self, inputs, block_variable, idx, prepared):
         func_from = inputs[0]
 
-        if self._recompute_output is None:
-            self._recompute_output = dolfinx.fem.Function(self.space_to)
-
-        self._recompute_output.interpolate(func_from)
-        self._recompute_output.x.scatter_forward()
-
-        # Overload the object to ensure PyAdjoint tracks it properly
-        output = create_overloaded_object(self._recompute_output)
+        # Update the tape's actual output object in-place (rather than a
+        # separately cached Function) so that any Python reference the user
+        # is holding to the interpolated Function stays in sync after the
+        # tape is replayed, matching FunctionAssignBlock's convention. Note
+        # this only holds until the output is first used as a dependency of
+        # another block: pyadjoint then freezes a private checkpoint copy
+        # (see OverloadedType._ad_will_add_as_dependency), so the live
+        # Python object can still go stale after that point. This is an
+        # existing pyadjoint/dolfinx_adjoint-wide characteristic (identical
+        # behavior in FunctionAssignBlock), not specific to interpolation.
+        output = block_variable.saved_output
+        output.interpolate(func_from)
+        output.x.scatter_forward()
         return output
