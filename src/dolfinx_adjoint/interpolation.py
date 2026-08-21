@@ -1,8 +1,9 @@
 import dolfinx
+import ufl
 from pyadjoint.overloaded_type import create_overloaded_object
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
-import ufl
-from .blocks.interpolation import InterpolationBlock, ExprInterpolationBlock
+
+from .blocks.interpolation import ExprInterpolationBlock, InterpolationBlock
 from .compat import get_interpolation_points
 
 

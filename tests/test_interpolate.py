@@ -328,6 +328,7 @@ def test_expr_interpolation_taylor_test_constant(mesh_2D, use_petsc):
     min_rate = pyadjoint.taylor_test(Jh_c, c, dc)
     assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2)
 
+    Jh_c(c)
     dJdm_c = Jh_c.derivative()._ad_dot(dc)
     hessian_c = Jh_c.hessian(dc)
     dHddu_c = hessian_c._ad_dot(dc)

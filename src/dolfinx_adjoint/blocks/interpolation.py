@@ -9,7 +9,6 @@ import dolfinx.fem.petsc
 import scifem
 import ufl
 from pyadjoint import Block, OverloadedType
-from pyadjoint.overloaded_type import create_overloaded_object
 from pyadjoint.tape import stop_annotating
 from ufl.algorithms.analysis import traverse_unique_terminals
 
@@ -312,7 +311,6 @@ class ExprInterpolationBlock(Block):
         self._adj_output: dict[int, dolfinx.fem.Function] = {}
         self._tlm_output: dolfinx.fem.Function | None = None
         self._hessian_output: dict[int, dolfinx.fem.Function] = {}
-        self._recompute_output: dolfinx.fem.Function | None = None
 
     def __str__(self):
         return f"interpolate_expression_{str(self.expr)}_to_{str(self.space_to)}"
@@ -380,11 +378,16 @@ class ExprInterpolationBlock(Block):
         # Reset output vector to prepare for accumulation
         out_func.x.array[:] = 0.0
 
-        # The TLM is the sum of the Jacobians applied to each perturbation
-        for dep_idx, tlm_input in enumerate(tlm_inputs):
+        # The TLM is the sum of the Jacobians applied to each perturbation. tlm_inputs is
+        # aligned with self.get_dependencies(), not necessarily with self._deps, so the
+        # dependency index into `prepared` is re-derived explicitly rather than assumed
+        # positional, matching every other evaluate_*_component method in this class.
+        for i, dep_bv in enumerate(self.get_dependencies()):
+            tlm_input = tlm_inputs[i]
             if tlm_input is None:
                 continue
 
+            dep_idx = get_dependency_index(self._deps, dep_bv)
             mat = prepared[dep_idx]
             mult = get_mult(mat, transpose=False, accumulate=True)
             mult(tlm_input.x, out_func.x)
@@ -486,15 +489,15 @@ class ExprInterpolationBlock(Block):
         return None
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
-        if self._recompute_output is None:
-            self._recompute_output = dolfinx.fem.Function(self.space_to)
-
         replace_map = {self._deps[i]: inputs[i] for i in range(len(self._deps))}
         updated_expr = ufl.replace(self.expr, replace_map)
 
+        # Update the tape's actual output object in-place, matching
+        # InterpolationBlock.recompute_component and FunctionAssignBlock's convention.
+        output = block_variable.saved_output
         with stop_annotating():
             compiled_expr = dolfinx.fem.Expression(updated_expr, get_interpolation_points(self.space_to))
-            self._recompute_output.interpolate(compiled_expr)
-            self._recompute_output.x.scatter_forward()
+            output.interpolate(compiled_expr)
+            output.x.scatter_forward()
 
-        return create_overloaded_object(self._recompute_output)
+        return output
