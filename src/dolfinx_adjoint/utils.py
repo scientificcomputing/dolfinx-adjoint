@@ -1,12 +1,12 @@
-from multiprocessing import process
 import typing
+from functools import singledispatchmethod
 
 import dolfinx
 import numpy
 import numpy.typing as npt
 import ufl
+
 from .compat import extract_linear_combination
-from functools import singledispatchmethod
 
 
 def function_from_vector(
