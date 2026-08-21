@@ -40,7 +40,7 @@ def assign(value: typing.Union[numpy.inexact, float, int], function: _Function, 
         elif isinstance(value, dolfinx.fem.Function):
             if value.function_space == function.function_space:
                 function.x.array[:] = value.x.array[:]
-            elif value.ufl_element().is_real and value.ufl_shape == ():
+            elif ufl.checks.is_scalar_constant_expression(value):
                 function.x.array[:] = value.x.array[0]
             else:
                 raise ValueError("Function spaces of the value and function must match for assignment.")
