@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typing
+import weakref
 from typing import Callable
 
 import dolfinx
@@ -9,6 +10,33 @@ from pyadjoint import Block
 
 if typing.TYPE_CHECKING:
     from petsc4py import PETSc
+
+# Cache of assembled interpolation matrices, keyed by (id(space_from), id(space_to),
+# use_petsc), shared across all InterpolationBlocks to avoid redundant matrix assembly
+# (and, for PETSc matrices, MPI communicator exhaustion) when the same pair of spaces is
+# interpolated between many times (e.g. across optimization iterations).
+#
+# Keying on id() would normally risk a stale/wrong entry once a FunctionSpace is garbage
+# collected and its id is reused by an unrelated object (ids are only unique among
+# simultaneously-alive objects). We close that hole with weakref.finalize: each space
+# that contributes to a cache key gets a finalizer that purges every entry mentioning
+# its id. Finalizers run at the point the object is actually deallocated, which is
+# necessarily before CPython can hand that id out again, so a cache hit always
+# corresponds to spaces that are still alive.
+_INTERPOLATION_MATRIX_CACHE: dict[tuple[int, int, bool], "dolfinx.la.MatrixCSR | PETSc.Mat"] = {}
+_CACHE_KEYS_BY_SPACE_ID: dict[int, set[tuple[int, int, bool]]] = {}
+
+
+def _purge_cache_entries_for(space_id: int) -> None:
+    for key in _CACHE_KEYS_BY_SPACE_ID.pop(space_id, ()):
+        _INTERPOLATION_MATRIX_CACHE.pop(key, None)
+
+
+def _register_cache_key(space: dolfinx.fem.FunctionSpace, key: tuple[int, int, bool]) -> None:
+    space_id = id(space)
+    if space_id not in _CACHE_KEYS_BY_SPACE_ID:
+        weakref.finalize(space, _purge_cache_entries_for, space_id)
+    _CACHE_KEYS_BY_SPACE_ID.setdefault(space_id, set()).add(key)
 
 
 def attach_working_array(mat: dolfinx.la.MatrixCSR):
@@ -91,6 +119,18 @@ def _build_interpolation_matrix(
     return mat
 
 
+def _get_interpolation_matrix(
+    space_from: dolfinx.fem.FunctionSpace, space_to: dolfinx.fem.FunctionSpace, use_petsc: bool = False
+) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
+    """Retrieve or assemble the interpolation matrix for a pair of spaces, cached for reuse."""
+    key = (id(space_from), id(space_to), use_petsc)
+    if key not in _INTERPOLATION_MATRIX_CACHE:
+        _INTERPOLATION_MATRIX_CACHE[key] = _build_interpolation_matrix(space_from, space_to, use_petsc=use_petsc)
+        _register_cache_key(space_from, key)
+        _register_cache_key(space_to, key)
+    return _INTERPOLATION_MATRIX_CACHE[key]
+
+
 class InterpolationBlock(Block):
     """Block for interpolating a dolfinx.fem.Function into another space."""
 
@@ -113,21 +153,11 @@ class InterpolationBlock(Block):
         self._tlm_output: dolfinx.fem.Function | None = None
         self._hessian_output: dolfinx.fem.Function | None = None
 
-        # Interpolation matrix is fixed for the lifetime of this block (tied to
-        # self.space_from/self.space_to), so cache it per-instance rather than
-        # in a module-level dict keyed by id() (which can collide once a
-        # FunctionSpace is garbage collected).
-        self._interpolation_matrix: dolfinx.la.MatrixCSR | "PETSc.Mat" | None = None
-
     def __str__(self):
         return "interpolate_function"
 
     def _get_interpolation_matrix(self) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
-        if self._interpolation_matrix is None:
-            self._interpolation_matrix = _build_interpolation_matrix(
-                self.space_from, self.space_to, use_petsc=self._use_petsc
-            )
-        return self._interpolation_matrix
+        return _get_interpolation_matrix(self.space_from, self.space_to, use_petsc=self._use_petsc)
 
     # --- Adjoint ---
 
