@@ -192,7 +192,7 @@ except ImportError:
             weight, and the second element is the base UFL Coefficient (spatial function).
         """
         extractor = LinearCombinationExtractor()
-        final_result = extractor(expr)
+        final_result = extractor(expr)  # type: ignore
 
         if not isinstance(final_result, list):
             raise ValueError("Expression evaluated to a pure scalar, no spatial functions found.")

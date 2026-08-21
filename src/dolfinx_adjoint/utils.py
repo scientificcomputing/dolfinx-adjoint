@@ -5,6 +5,7 @@ import dolfinx
 import numpy
 import numpy.typing as npt
 import ufl
+from ufl.corealg.dag_traverser import DAGTraverser
 
 from .compat import extract_linear_combination
 
@@ -64,7 +65,7 @@ def assign_linear_combination(value: ufl.core.expr.Expr, function: dolfinx.fem.F
     function.x.scatter_forward()
 
 
-class Floatify(ufl.corealg.dag_traverser.DAGTraverser):
+class Floatify(DAGTraverser):
     """Traverser to convert a UFL expression into a float."""
 
     def __init__(self, **kwargs):
@@ -82,25 +83,25 @@ class Floatify(ufl.corealg.dag_traverser.DAGTraverser):
         raise NotImplementedError(f"Unsupported UFL node type for floatification: {type(o)}")
 
     @process.register(ufl.classes.Sum)
-    @ufl.corealg.dag_traverser.DAGTraverser.postorder
+    @DAGTraverser.postorder
     def _(self, o, *operands, **kwargs):
         # operands is a tuple of the already-floatified children
         return sum(operands)
 
     @process.register(ufl.classes.Division)
-    @ufl.corealg.dag_traverser.DAGTraverser.postorder
+    @DAGTraverser.postorder
     def _(self, o, *operands, **kwargs):
         # Division always has exactly two operands: numerator and denominator
         return operands[0] / operands[1]
 
     @process.register(ufl.classes.Power)
-    @ufl.corealg.dag_traverser.DAGTraverser.postorder
+    @DAGTraverser.postorder
     def _(self, o, *operands, **kwargs):
         # Power has exactly two operands: base and exponent
         return operands[0] ** operands[1]
 
     @process.register(ufl.classes.Product)
-    @ufl.corealg.dag_traverser.DAGTraverser.postorder
+    @DAGTraverser.postorder
     def _(self, o, *operands, **kwargs):
         # Product has exactly two operands: left and right
         return operands[0] * operands[1]
