@@ -13,15 +13,6 @@ from ..utils import assign_linear_combination, extract_linear_combination, funct
 from ._vector import _vector
 
 
-def is_real_scalar_func(func: dolfinx.fem.Function) -> bool:
-    """Check if a function is a real scalar function.
-
-    Args:
-        func: The function to check.
-    """
-    return func.ufl_element().is_real and func.ufl_shape == ()
-
-
 def create_function_with_special_vector(func: _Function, name: str | None = None) -> _Function:
     """Create a new function with the same function space as `func` but with a special vector for adjoint computations.
 
@@ -80,7 +71,7 @@ class FunctionAssignBlock(Block):
             if isinstance(other, AdjFloat):
                 self._one = _Function(func.function_space, name="one", annotate=False)
                 self._one.x.array[:] = 1.0
-            elif isinstance(other, _Function) and is_real_scalar_func(other):
+            elif isinstance(other, _Function) and ufl.checks.is_scalar_constant_expression(other):
                 self._working_memory.append(create_function_with_special_vector(other, name="working_memory_2"))
                 self._one = _Function(func.function_space, name="one", annotate=False)
                 self._one.x.array[:] = 1.0
@@ -98,7 +89,7 @@ class FunctionAssignBlock(Block):
 
             # Allocate extra memory for adjoint computations if any of the operands are real functions
             for op in traverse_unique_terminals(other):
-                if isinstance(op, _Function) and is_real_scalar_func(op):
+                if isinstance(op, _Function) and ufl.checks.is_scalar_constant_expression(op):
                     self._working_memory.append(create_function_with_special_vector(op, name="working_memory_2"))
                     break
 
@@ -144,7 +135,7 @@ class FunctionAssignBlock(Block):
             if isinstance(bo, AdjFloat):
                 return self._compute_adjoint_of_broadcast(adj_inputs[0], self._one)
             elif isinstance(bo, dolfinx.fem.Function):
-                if is_real_scalar_func(bo):
+                if ufl.checks.is_scalar_constant_expression(bo):
                     # Adjoint of a broadcast into a real function (constant stored as Function)
                     self._working_memory[2].x.array[0] = self._compute_adjoint_of_broadcast(adj_inputs[0], self._one)
                     return self._working_memory[2].x
@@ -170,7 +161,7 @@ class FunctionAssignBlock(Block):
                 )
                 assign_linear_combination(diff_expr, self._working_memory[0])
                 return self._working_memory[0].x
-            elif isinstance(bo, dolfinx.fem.Function) and is_real_scalar_func(bo):
+            elif isinstance(bo, dolfinx.fem.Function) and ufl.checks.is_scalar_constant_expression(bo):
                 # Differentiate with respect to a real function (constant stored as Function)
                 # Create a perturbation direction in the Real space (value = 1.0)
                 assert len(self._working_memory) == 3, "Working memory not allocated for real function adjoint."
