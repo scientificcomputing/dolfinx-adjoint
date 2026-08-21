@@ -10,7 +10,6 @@ import ufl
 from pyadjoint.overloaded_type import (
     FloatingType,
     create_overloaded_object,
-    get_overloaded_class,
     register_overloaded_type,
 )
 from pyadjoint.tape import annotate_tape, get_working_tape, no_annotations, stop_annotating
@@ -69,7 +68,12 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     @no_annotations
     def _ad_create_checkpoint(self):
-        checkpoint = create_overloaded_object(self.copy())
+        # Note: self.copy() (dolfinx.fem.Function.copy) always returns a plain
+        # dolfinx.fem.Function regardless of self's concrete type, so wrapping it with
+        # create_overloaded_object would silently downcast a Constant checkpoint to a
+        # plain Function. Use _ad_new_like() instead to preserve the concrete subclass.
+        checkpoint = self._ad_new_like()
+        checkpoint.x.array[:] = self.x.array[:]
         checkpoint.name = self.name + "_checkpoint"
         return checkpoint
 
@@ -109,16 +113,29 @@ class Function(dolfinx.fem.Function, FloatingType):
         else:
             raise NotImplementedError("Unknown Riesz representation %s" % riesz_representation)
 
+    def _ad_new_like(self) -> typing.Self:
+        """Create a new, zero-valued instance sharing this object's exact overloaded type and
+        function space.
+
+        Constructing via ``type(self)(...)`` directly does not work here because subclasses
+        such as ``Constant`` take a different constructor signature (mesh and value, not a
+        function space). Going through ``__new__`` and ``Function.__init__`` bypasses that
+        constructor while still producing an instance of the correct concrete subclass.
+        """
+        r = type(self).__new__(type(self), self.function_space)  # type: ignore[call-arg]
+        Function.__init__(r, self.function_space)
+        return r
+
     @no_annotations
     def _ad_mul(self, other: typing.Union[int, float]) -> typing.Self:
         """Multiplication of self with integer or floating value."""
-        r = get_overloaded_class(dolfinx.fem.Function)(self.function_space)
+        r = self._ad_new_like()
         r.x.array[:] = self.x.array * other
         return r
 
     @no_annotations
     def _ad_add(self, other: typing.Self) -> typing.Self:
-        r = get_overloaded_class(dolfinx.fem.Function)(self.function_space)
+        r = self._ad_new_like()
         r.x.array[:] = self.x.array[:] + other.x.array[:]
         return r
 
@@ -188,7 +205,7 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     def _ad_copy(self):
         """Create a (deep) copy of the function."""
-        r = get_overloaded_class(dolfinx.fem.Function)(self.function_space)
+        r = self._ad_new_like()
         assign(self, r)
         return r
 

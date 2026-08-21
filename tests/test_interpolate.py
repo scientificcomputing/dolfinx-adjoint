@@ -203,8 +203,10 @@ def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
     aligned_tlm_inputs[u_idx] = u
 
     # --- Test Tangent Linear Model and Adjoint ---
+    # relevant_dependencies mirrors pyadjoint's real contract (Block.evaluate_adj): a list of
+    # (idx, block_variable) tuples, where idx is the position in block.get_dependencies().
     mat_tlm = block.prepare_evaluate_tlm(aligned_inputs, aligned_tlm_inputs, None)
-    mat_adj = block.prepare_evaluate_adj(aligned_inputs, [v], [u_bv])
+    mat_adj = block.prepare_evaluate_adj(aligned_inputs, [v], [(u_idx, u_bv)])
 
     tlm_output = block.evaluate_tlm_component(
         inputs=aligned_inputs, tlm_inputs=aligned_tlm_inputs, block_variable=None, idx=0, prepared=mat_tlm

@@ -6,7 +6,6 @@ from typing import Callable
 
 import dolfinx
 import dolfinx.fem.petsc
-import scifem
 import ufl
 from pyadjoint import Block, OverloadedType
 from pyadjoint.tape import stop_annotating
@@ -16,6 +15,18 @@ from ..compat import get_interpolation_points
 
 if typing.TYPE_CHECKING:
     from petsc4py import PETSc
+
+
+def _import_scifem():
+    """Import scifem lazily: only ExprInterpolationBlock needs it, so importing
+    dolfinx_adjoint (or using InterpolationBlock) must not require it to be installed.
+    """
+    try:
+        import scifem
+    except ImportError as e:
+        raise ImportError("scifem is required to interpolate a UFL expression: pip install scifem") from e
+    return scifem
+
 
 # Cache of assembled interpolation matrices, keyed by (id(space_from), id(space_to),
 # use_petsc), shared across all InterpolationBlocks to avoid redundant matrix assembly
@@ -302,6 +313,11 @@ class ExprInterpolationBlock(Block):
         self.space_to = func_to.function_space
         self._use_petsc = petsc_mat
 
+        # self._deps and self.get_dependencies() are always populated in lockstep by this
+        # loop, so position i means the same dependency in both: get_dependency_index is
+        # only needed for identity lookups from outside this alignment (e.g. tests locating
+        # a specific control), not for indices pyadjoint already hands back via idx or
+        # relevant_dependencies in the evaluate_*/prepare_evaluate_* methods below.
         self._deps = []
         for op in traverse_unique_terminals(self.expr):
             if isinstance(op, OverloadedType):
@@ -330,6 +346,7 @@ class ExprInterpolationBlock(Block):
         du = ufl.TrialFunction(V_in)
         dE = ufl.derivative(current_expr, target_dep, du)
         dE = ufl.algorithms.apply_derivatives.apply_derivatives(dE)
+        scifem = _import_scifem()
         if self._use_petsc:
             mat = scifem.petsc_interpolation_matrix(dE, self.space_to)
         else:
@@ -341,19 +358,17 @@ class ExprInterpolationBlock(Block):
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
         matrices = {}
-        for dep in relevant_dependencies:
-            idx = get_dependency_index(self._deps, dep)
+        for idx, _dep in relevant_dependencies:
             matrices[idx] = self._assemble_jacobian(idx, inputs)
         return matrices
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
         adj_input = adj_inputs[0]
-        dep_idx = get_dependency_index(self._deps, block_variable) if block_variable is not None else idx
-        mat = prepared[dep_idx]
+        mat = prepared[idx]
 
-        if dep_idx not in self._adj_output:
-            self._adj_output[dep_idx] = dolfinx.fem.Function(self._deps[dep_idx].function_space)
-        out_func = self._adj_output[dep_idx]
+        if idx not in self._adj_output:
+            self._adj_output[idx] = dolfinx.fem.Function(self._deps[idx].function_space)
+        out_func = self._adj_output[idx]
 
         out_func.x.array[:] = 0.0
         mult = get_mult(mat, transpose=True, accumulate=False)
@@ -365,8 +380,7 @@ class ExprInterpolationBlock(Block):
 
     def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs):
         matrices = {}
-        for dep in self.get_dependencies():
-            idx = get_dependency_index(self._deps, dep)
+        for idx in range(len(self._deps)):
             matrices[idx] = self._assemble_jacobian(idx, inputs)
         return matrices
 
@@ -379,15 +393,12 @@ class ExprInterpolationBlock(Block):
         out_func.x.array[:] = 0.0
 
         # The TLM is the sum of the Jacobians applied to each perturbation. tlm_inputs is
-        # aligned with self.get_dependencies(), not necessarily with self._deps, so the
-        # dependency index into `prepared` is re-derived explicitly rather than assumed
-        # positional, matching every other evaluate_*_component method in this class.
-        for i, dep_bv in enumerate(self.get_dependencies()):
-            tlm_input = tlm_inputs[i]
+        # aligned with self.get_dependencies(), which is aligned 1:1 with self._deps (see
+        # the comment in __init__), so its position doubles as the index into `prepared`.
+        for dep_idx, tlm_input in enumerate(tlm_inputs):
             if tlm_input is None:
                 continue
 
-            dep_idx = get_dependency_index(self._deps, dep_bv)
             mat = prepared[dep_idx]
             mult = get_mult(mat, transpose=False, accumulate=True)
             mult(tlm_input.x, out_func.x)
@@ -424,9 +435,7 @@ class ExprInterpolationBlock(Block):
                 dE_total = term if dE_total is None else dE_total + term
 
         # 3. Assemble both the Jacobian and the Hessian matrix for each dependency
-        for dep in relevant_dependencies:
-            idx = get_dependency_index(self._deps, dep)
-
+        for idx, _dep in relevant_dependencies:
             # Matrix 1: The standard Jacobian (J)
             J_mat = self._assemble_jacobian(idx, inputs)
 
@@ -447,6 +456,7 @@ class ExprInterpolationBlock(Block):
                     if not isinstance(d2E, (int, float)):
                         args = ufl.algorithms.extract_arguments(d2E)
                         if len(args) > 0:
+                            scifem = _import_scifem()
                             if self._use_petsc:
                                 H_mat = scifem.petsc_interpolation_matrix(d2E, self.space_to)
                             else:
@@ -462,12 +472,11 @@ class ExprInterpolationBlock(Block):
         hessian_input = hessian_inputs[0]
         adj_input = adj_inputs[0]  # The incoming adjoint sensitivity (y*)
 
-        dep_idx = get_dependency_index(self._deps, block_variable) if block_variable is not None else idx
-        J_mat, H_mat = prepared[dep_idx]
+        J_mat, H_mat = prepared[idx]
 
-        if dep_idx not in self._hessian_output:
-            self._hessian_output[dep_idx] = dolfinx.fem.Function(self._deps[dep_idx].function_space)
-        out_func = self._hessian_output[dep_idx]
+        if idx not in self._hessian_output:
+            self._hessian_output[idx] = dolfinx.fem.Function(self._deps[idx].function_space)
+        out_func = self._hessian_output[idx]
 
         # Reset output vector to 0.0 before accumulation
         out_func.x.array[:] = 0.0
