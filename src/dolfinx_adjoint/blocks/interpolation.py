@@ -23,7 +23,7 @@ if typing.TYPE_CHECKING:
 # its id. Finalizers run at the point the object is actually deallocated, which is
 # necessarily before CPython can hand that id out again, so a cache hit always
 # corresponds to spaces that are still alive.
-_INTERPOLATION_MATRIX_CACHE: dict[tuple[int, int, bool], "dolfinx.la.MatrixCSR | PETSc.Mat"] = {}
+_INTERPOLATION_MATRIX_CACHE: dict[tuple[int, int, bool], "_MatrixCSRWorkspace | PETSc.Mat"] = {}
 _CACHE_KEYS_BY_SPACE_ID: dict[int, set[tuple[int, int, bool]]] = {}
 
 
@@ -39,48 +39,51 @@ def _register_cache_key(space: dolfinx.fem.FunctionSpace, key: tuple[int, int, b
     _CACHE_KEYS_BY_SPACE_ID.setdefault(space_id, set()).add(key)
 
 
-def attach_working_array(mat: dolfinx.la.MatrixCSR):
-    """Attach working arrays to a dolfinx.la.MatrixCSR for efficient matrix-vector multiplication."""
-    # mat._row_vec/_col_vec are monkey-patched on; cast to Any so mypy doesn't
-    # flag the dynamic attributes.
-    m = typing.cast(typing.Any, mat)
-    if not hasattr(m, "_row_vec"):
-        m._row_vec = dolfinx.la.vector(mat.index_map(0), mat.block_size[0], dtype=mat.data.dtype)
-    if not hasattr(m, "_col_vec"):
-        m._col_vec = dolfinx.la.vector(mat.index_map(1), mat.block_size[1], dtype=mat.data.dtype)
-    m._row_vec.array[:] = 0.0
-    m._col_vec.array[:] = 0.0
+class _MatrixCSRWorkspace:
+    """A dolfinx.la.MatrixCSR paired with pre-allocated working vectors.
+
+    dolfinx.la.MatrixCSR.mult requires vectors built from its own index maps
+    as scratch space. Wrapping them here (built once, alongside the matrix)
+    means they can be reused across repeated matrix-vector multiplications
+    without allocating on every adjoint/TLM/Hessian evaluation, and without
+    monkey-patching dynamic attributes onto the matrix object itself.
+    """
+
+    def __init__(self, mat: dolfinx.la.MatrixCSR):
+        self.mat = mat
+        self.row_vec = dolfinx.la.vector(mat.index_map(0), mat.block_size[0], dtype=mat.data.dtype)
+        self.col_vec = dolfinx.la.vector(mat.index_map(1), mat.block_size[1], dtype=mat.data.dtype)
 
 
 def get_mult(
-    mat: "PETSc.Mat" | dolfinx.la.MatrixCSR,
-    transpose: bool = False,  # type: ignore
+    mat: "PETSc.Mat" | _MatrixCSRWorkspace,
+    transpose: bool = False,
 ) -> Callable[[dolfinx.la.Vector, dolfinx.la.Vector], None]:
     """Return a function that performs matrix-vector multiplication with the given matrix."""
-    if isinstance(mat, dolfinx.la.MatrixCSR):
+    if isinstance(mat, _MatrixCSRWorkspace):
+        workspace = mat
 
         def mult(v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector):
-            # Need to use vectors from
             in_size_local = v_in.index_map.size_local * v_in.block_size
             out_size_local = v_out.index_map.size_local * v_out.block_size
-            attach_working_array(mat)  # Ensure working arrays are attached
-            m = typing.cast(typing.Any, mat)
+            # Zero the full working arrays (including ghosts) before each use
+            # to prevent double-counting in parallel.
+            workspace.row_vec.array[:] = 0.0
+            workspace.col_vec.array[:] = 0.0
             if transpose:
-                # Prevent double-counting in parallel by zeroing ghosts of input vector
                 # Calculate the exact number of local degrees of freedom
-                m._row_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                m._row_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
-                m._col_vec.array[:out_size_local] = 0.0
-                m.mult(m._row_vec, m._col_vec, transpose=True)
-                v_out.array[:out_size_local] = m._col_vec.array[:out_size_local]
+                workspace.row_vec.array[:in_size_local] = v_in.array[:in_size_local]
+                workspace.row_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
+                workspace.col_vec.array[:out_size_local] = 0.0
+                workspace.mat.mult(workspace.row_vec, workspace.col_vec, transpose=True)
+                v_out.array[:out_size_local] = workspace.col_vec.array[:out_size_local]
             else:
-                # Prevent double-counting in parallel by zeroing ghosts of input vector
                 # Calculate the exact number of local degrees of freedom
-                m._row_vec.array[:out_size_local] = 0
-                m._col_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                m._col_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
-                m.mult(m._col_vec, m._row_vec)
-                v_out.array[:out_size_local] = m._row_vec.array[:out_size_local]
+                workspace.row_vec.array[:out_size_local] = 0
+                workspace.col_vec.array[:in_size_local] = v_in.array[:in_size_local]
+                workspace.col_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
+                workspace.mat.mult(workspace.col_vec, workspace.row_vec)
+                v_out.array[:out_size_local] = workspace.row_vec.array[:out_size_local]
             v_out.scatter_forward()
 
         return mult
@@ -105,7 +108,7 @@ def get_mult(
 
 def _build_interpolation_matrix(
     space_from: dolfinx.fem.FunctionSpace, space_to: dolfinx.fem.FunctionSpace, use_petsc: bool = False
-) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
+) -> _MatrixCSRWorkspace | "PETSc.Mat":
     """Assemble the interpolation matrix for a pair of spaces."""
     if use_petsc:
         petsc_mat = dolfinx.fem.petsc.interpolation_matrix(space_from, space_to)
@@ -114,14 +117,12 @@ def _build_interpolation_matrix(
 
     mat = dolfinx.fem.interpolation_matrix(space_from, space_to)
     mat.scatter_reverse()
-    # The built in interpolation matrix requires two working arrays
-    attach_working_array(mat)
-    return mat
+    return _MatrixCSRWorkspace(mat)
 
 
 def _get_interpolation_matrix(
     space_from: dolfinx.fem.FunctionSpace, space_to: dolfinx.fem.FunctionSpace, use_petsc: bool = False
-) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
+) -> _MatrixCSRWorkspace | "PETSc.Mat":
     """Retrieve or assemble the interpolation matrix for a pair of spaces, cached for reuse."""
     key = (id(space_from), id(space_to), use_petsc)
     if key not in _INTERPOLATION_MATRIX_CACHE:
@@ -156,7 +157,7 @@ class InterpolationBlock(Block):
     def __str__(self):
         return "interpolate_function"
 
-    def _get_interpolation_matrix(self) -> dolfinx.la.MatrixCSR | "PETSc.Mat":
+    def _get_interpolation_matrix(self) -> _MatrixCSRWorkspace | "PETSc.Mat":
         return _get_interpolation_matrix(self.space_from, self.space_to, use_petsc=self._use_petsc)
 
     # --- Adjoint ---
