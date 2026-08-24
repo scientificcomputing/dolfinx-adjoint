@@ -40,9 +40,9 @@ def _register_cache_key(space: dolfinx.fem.FunctionSpace, key: tuple[int, int, b
 
 
 class _MatrixCSRWorkspace:
-    """A dolfinx.la.MatrixCSR paired with pre-allocated working vectors.
+    """A {py:class}`dolfinx.la.MatrixCSR` paired with pre-allocated working vectors.
 
-    dolfinx.la.MatrixCSR.mult requires vectors built from its own index maps
+    {py:meth}`dolfinx.la.MatrixCSR.mult` requires vectors built from its own index maps
     as scratch space. Wrapping them here (built once, alongside the matrix)
     means they can be reused across repeated matrix-vector multiplications
     without allocating on every adjoint/TLM/Hessian evaluation, and without
