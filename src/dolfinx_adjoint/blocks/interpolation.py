@@ -3,6 +3,7 @@ from __future__ import annotations
 import typing
 import weakref
 from typing import Callable
+import numpy as np
 
 import dolfinx
 import dolfinx.fem.petsc
@@ -12,6 +13,7 @@ from pyadjoint.tape import stop_annotating
 from ufl.algorithms.analysis import traverse_unique_terminals
 
 from ..compat import get_interpolation_points
+from ..utils import unroll_dofmap
 
 if typing.TYPE_CHECKING:
     from petsc4py import PETSc
@@ -304,7 +306,10 @@ class ExprInterpolationBlock(Block):
     def __str__(self):
         return f"interpolate_expression_{str(self.expr)}_to_{str(self.space_to)}"
 
-    def _assemble_jacobian(self, idx: int, inputs: list | None = None):
+    def _assemble_operator(self, idx: int, inputs: list | None = None):
+        """
+        Assemble the interpolation operator (but not into a sparse matrix).
+        """
         dep_func = self._deps[idx]
         V_in = dep_func.function_space
 
@@ -318,68 +323,73 @@ class ExprInterpolationBlock(Block):
 
         du = ufl.TrialFunction(V_in)
         dE = ufl.derivative(current_expr, target_dep, du)
-        scifem = _import_scifem()
-        if self._use_petsc:
-            mat = scifem.petsc_interpolation_matrix(dE, self.space_to)
-        else:
-            mat = _MatrixCSRWorkspace(scifem.interpolation_matrix(dE, self.space_to))
-
-        return mat
+        return MatrixFreeInterpolationOperator(dE, self.space_to)
 
     # --- Adjoint ---
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
-        matrices = {}
+        operators = {}
         for idx, _dep in relevant_dependencies:
-            matrices[idx] = self._assemble_jacobian(idx, inputs)
-        return matrices
+            operators[idx] = self._assemble_operator(idx, inputs)
+        return operators
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
         adj_input = adj_inputs[0]
-        mat = prepared[idx]
+        operator = prepared[idx]
 
         if idx not in self._adj_output:
             self._adj_output[idx] = dolfinx.fem.Function(self._deps[idx].function_space)
         out_func = self._adj_output[idx]
 
         out_func.x.array[:] = 0.0
-        mult = get_mult(mat, transpose=True, accumulate=False)
-        mult(adj_input.x, out_func.x)
-
+        operator.mult_transpose(adj_input.x, out_func.x)
+        out_func.x.scatter_reverse(dolfinx.la.InsertMode.add)
+        out_func.x.scatter_forward()
         return out_func
 
     # --- Tangent Linear Model (TLM) ---
 
     def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs):
-        matrices = {}
-        for idx in range(len(self._deps)):
-            matrices[idx] = self._assemble_jacobian(idx, inputs)
-        return matrices
+        # 1. Substitute current optimization step's inputs into the expression
+        if inputs is not None:
+            replace_map = {self._deps[i]: inputs[i] for i in range(len(self._deps))}
+            current_expr = ufl.replace(self.expr, replace_map)
+        else:
+            inputs = self._deps
+            current_expr = self.expr
+
+        # 2. Build the total directional derivative matrix-free: dE_total = sum( dE/dx_j * \delta x_j )
+        dE_total = None
+        for i, tlm_val in enumerate(tlm_inputs):
+            if tlm_val is not None:
+                target_dep = inputs[i]
+                term = ufl.derivative(current_expr, target_dep, tlm_val)
+                dE_total = term if dE_total is None else dE_total + term
+
+        # 3. Force UFL to evaluate the calculus before compiling the Expression
+        if dE_total is None:
+            return None
+        else:
+            return dolfinx.fem.Expression(dE_total, get_interpolation_points(self.space_to))
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
         if self._tlm_output is None:
             self._tlm_output = dolfinx.fem.Function(self.space_to)
+
         out_func = self._tlm_output
-
-        # Reset output vector to prepare for accumulation
         out_func.x.array[:] = 0.0
+        if prepared is None:
+            return out_func  # No TLM contribution if the directional derivative is zero
 
-        # The TLM is the sum of the Jacobians applied to each perturbation. tlm_inputs is
-        # aligned with self.get_dependencies(), which is aligned 1:1 with self._deps (see
-        # the comment in __init__), so its position doubles as the index into `prepared`.
-        for dep_idx, tlm_input in enumerate(tlm_inputs):
-            if tlm_input is None:
-                continue
-
-            mat = prepared[dep_idx]
-            mult = get_mult(mat, transpose=False, accumulate=True)
-            mult(tlm_input.x, out_func.x)
-
+        # Matrix-free evaluation of the TLM
+        with stop_annotating():
+            out_func.interpolate(prepared)
+        out_func.x.scatter_forward()
         return out_func
 
     # --- Hessian ---
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
-        matrices = {}
+        operators = {}
 
         # 1. Substitute current optimization step's inputs into the expression
         if inputs is not None:
@@ -408,59 +418,53 @@ class ExprInterpolationBlock(Block):
 
         # 3. Assemble both the Jacobian and the Hessian matrix for each dependency
         for idx, _dep in relevant_dependencies:
-            # Matrix 1: The standard Jacobian (J)
-            J_mat = self._assemble_jacobian(idx, inputs)
+            # The standard Jacobian (J)
+            J_op = self._assemble_operator(idx, inputs)
 
-            # Matrix 2: The non-linear Curvature Matrix (H)
-            H_mat = None
+            # Matrix-free Curvature (H)
+            H_op = None
             if dE_total is not None:
                 target_dep_i = inputs[idx]
-
-                # Check if it exposes a function space (Constants do not need TrialFunctions)
                 if hasattr(target_dep_i, "function_space"):
                     V_in = target_dep_i.function_space
                     du = ufl.TrialFunction(V_in)
-
-                    # Differentiate the directional derivative again to get the 2nd derivative
                     d2E = ufl.derivative(dE_total, target_dep_i, du)
-                    # Scifem will crash if the expression is purely linear (d2E == 0)
+
                     if not isinstance(d2E, (int, float)):
                         args = ufl.algorithms.extract_arguments(d2E)
-                        if len(args) > 0:
-                            scifem = _import_scifem()
-                            if self._use_petsc:
-                                H_mat = scifem.petsc_interpolation_matrix(d2E, self.space_to)
-                            else:
-                                H_mat = _MatrixCSRWorkspace(scifem.interpolation_matrix(d2E, self.space_to))
+                        if len(args) == 1:
+                            H_op = MatrixFreeInterpolationOperator(d2E, self.space_to)
+                        elif len(args) > 1:
+                            raise ValueError(
+                                f"Second derivative of expression with respect to {target_dep_i} has more than one argument: {args}"
+                            )
 
-            matrices[idx] = (J_mat, H_mat)
+            operators[idx] = (J_op, H_op)
 
-        return matrices
+        return operators
 
     def evaluate_hessian_component(
         self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None
     ):
         hessian_input = hessian_inputs[0]
-        adj_input = adj_inputs[0]  # The incoming adjoint sensitivity (y*)
+        adj_input = adj_inputs[0]
 
-        J_mat, H_mat = prepared[idx]
+        J_op, H_op = prepared[idx]
 
         if idx not in self._hessian_output:
             self._hessian_output[idx] = dolfinx.fem.Function(self._deps[idx].function_space)
         out_func = self._hessian_output[idx]
-
-        # Reset output vector to 0.0 before accumulation
         out_func.x.array[:] = 0.0
 
         # Term 1: J^T * \delta y^*
-        mult_J = get_mult(J_mat, transpose=True, accumulate=True)
-        mult_J(hessian_input.x, out_func.x)
+        if J_op is not None:
+            J_op.mult_transpose(hessian_input.x, out_func.x, accumulate=True)
 
-        # Term 2: H^T * y^* (Only applied if the expression was non-linear)
-        if H_mat is not None:
-            mult_H = get_mult(H_mat, transpose=True, accumulate=True)
-            mult_H(adj_input.x, out_func.x)
-
+        # Term 2: H^T * y^*
+        if H_op is not None:
+            H_op.mult_transpose(adj_input.x, out_func.x, accumulate=True)
+        out_func.x.scatter_reverse(dolfinx.la.InsertMode.add)
+        out_func.x.scatter_forward()
         return out_func
 
     # --- Recompute (Forward Pass) ---
@@ -481,3 +485,78 @@ class ExprInterpolationBlock(Block):
             output.x.scatter_forward()
 
         return output
+
+
+class MatrixFreeInterpolationOperator:
+    """A matrix-free operator that applies cell-local UFL expression interpolations."""
+
+    def __init__(self, expr: ufl.core.expr.Expr, space_to: dolfinx.fem.FunctionSpace):
+
+        args = ufl.algorithms.extract_arguments(expr)
+        if len(args) != 1:
+            raise ValueError("MatrixFreeInterpolationOperator only supports expressions with a single argument.")
+        space_from = args[0].ufl_function_space()
+
+        # Unroll DOF maps using your optimized function
+        Q_dofmap = unroll_dofmap(space_to.dofmap.list, space_to.dofmap.bs)
+        V_dofmap = unroll_dofmap(space_from.dofmap.list, space_from.dofmap.bs)
+
+        # Get raw cell-local interpolation data from scifem
+        scifem = _import_scifem()
+        raw_data = scifem.prepare_interpolation_data(expr, space_to)
+
+        num_cells = space_to.mesh.topology.index_map(space_to.mesh.topology.dim).size_local
+        self.num_rows_local = space_to.dofmap.index_map.size_local * space_to.dofmap.bs
+
+        # Reshape the 1D permuted matrix from scifem back into the cell-wise tensor
+        A_local = np.copy(raw_data).reshape(num_cells, Q_dofmap.shape[1], V_dofmap.shape[1])
+
+        # 1. Identify the unique, first appearance of each local Q DOF
+        flat_Q = Q_dofmap.ravel()
+        unique_Q, first_indices = np.unique(flat_Q, return_index=True)
+
+        # 2. Keep only the locally owned DOFs (which are guaranteed to be 0 ... num_rows_local - 1)
+        owned_mask = unique_Q < self.num_rows_local
+        owned_first_indices = first_indices[owned_mask]
+
+        # Convert flat indices back to (cell, local_q) coordinates
+        valid_cells = owned_first_indices // Q_dofmap.shape[1]
+        valid_q_local = owned_first_indices % Q_dofmap.shape[1]
+
+        # 3. Store the PRUNED data: Shape is now exactly (num_local_Q, num_v_per_cell)
+        # Because unique_Q is sorted 0 to num_rows_local-1, row `i` matches owned DOF `i` exactly!
+        self.V_indices = V_dofmap[valid_cells, :]
+        self.A_reduced = A_local[valid_cells, valid_q_local, :]
+
+    def mult(self, v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector, accumulate: bool = False):
+        """Forward action (TLM): A * v_in -> v_out"""
+        v_in.scatter_forward()
+
+        # x_local shape: (num_local_Q, num_v_per_cell)
+        x_local = v_in.array[self.V_indices]
+
+        # Row-wise dot product
+        y_local = np.sum(self.A_reduced * x_local, axis=1)
+
+        if not accumulate:
+            v_out.array[:] = 0.0
+
+        # Direct slice assignment! No advanced indexing array needed.
+        v_out.array[: self.num_rows_local] += y_local
+
+    def mult_transpose(self, v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector, accumulate: bool = False):
+        """Adjoint action: A^T * v_in -> v_out (Pullback)"""
+        v_in.scatter_forward()
+
+        # Extract corresponding target DOFs. Direct slice!
+        y_in = v_in.array[: self.num_rows_local]
+
+        # Scale every coefficient row by the target DOF value
+        # scaled_A shape: (num_local_Q, num_v_per_cell)
+        scaled_A = self.A_reduced * y_in[:, None]
+
+        if not accumulate:
+            v_out.array[:] = 0.0
+
+        # V_indices has overlapping/shared DOFs across cells, so np.add.at is required
+        np.add.at(v_out.array, self.V_indices, scaled_A)

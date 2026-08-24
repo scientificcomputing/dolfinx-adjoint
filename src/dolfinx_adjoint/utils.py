@@ -41,3 +41,15 @@ class ad_kwargs(typing.TypedDict):
     """Tag for the block in the adjoint tape."""
     annotate: typing.NotRequired[bool]
     """Whether to annotate the assignment in the adjoint tape."""
+
+
+def unroll_dofmap(dofs: npt.NDArray[numpy.int32], bs: int) -> npt.NDArray[numpy.int32]:
+    """
+    Given a two-dimensional dofmap of size `(num_cells, num_dofs_per_cell)`
+    Expand the dofmap by its block size such that the resulting array
+    is of size `(num_cells, bs*num_dofs_per_cell)`
+    """
+    num_cells, num_dofs_per_cell = dofs.shape
+    unrolled_dofmap = numpy.repeat(dofs, bs).reshape(num_cells, num_dofs_per_cell * bs) * bs
+    unrolled_dofmap += numpy.tile(numpy.arange(bs), num_dofs_per_cell)
+    return unrolled_dofmap

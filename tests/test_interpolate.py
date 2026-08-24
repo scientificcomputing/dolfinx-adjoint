@@ -30,7 +30,7 @@ def mesh_1D():
 
 @pytest.fixture(scope="module")
 def mesh_2D():
-    return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 7, 7)
+    return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 12, 14)
 
 
 @pytest.fixture(scope="module")
@@ -64,9 +64,11 @@ def test_interpolation_block_adjoint_property(mesh_3D, family, degree_from, degr
 
     u = Function(V_from)
     u.x.array[:] = rng.random(len(u.x.array))
+    u.x.scatter_forward()
 
     v = Function(V_to)
     v.x.array[:] = rng.random(len(v.x.array))
+    v.x.scatter_forward()
 
     # Initialize the block directly, passing the PETSc backend flag
     block = InterpolationBlock(u, v, petsc_mat=use_petsc)
@@ -175,6 +177,7 @@ def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
 
     u = Function(V_from, name="u_control")
     u.x.array[:] = rng.random(len(u.x.array))
+    u.x.scatter_forward()
 
     c = Constant(mesh, 2.5)
     c.name = "c_constant"
@@ -185,7 +188,7 @@ def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
 
     v = Function(V_to, name="v_output")
     v.x.array[:] = rng.random(len(v.x.array))
-
+    v.x.scatter_forward()
     block = ExprInterpolationBlock(expr, v, petsc_mat=use_petsc)
 
     # 1. Safely find where UFL placed 'u' in the dependency list
@@ -248,6 +251,7 @@ def test_expr_interpolation_taylor_test_function(mesh_2D, use_petsc):
     u = Function(V_from)
     u.name = "u_control"
     u.x.array[:] = 0.5
+    u.x.scatter_forward()
 
     c = Constant(mesh, 1.5)
     c.name = "c_constant"
