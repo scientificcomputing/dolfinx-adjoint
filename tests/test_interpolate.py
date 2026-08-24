@@ -181,39 +181,37 @@ def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
 
     # Expression containing both a Function and a Constant dependency
     x_coords = ufl.SpatialCoordinate(mesh)
-    expr = c * u * ufl.sin(x_coords[0])
+    expr = c * u**2 * ufl.sin(x_coords[0])
 
     v = Function(V_to, name="v_output")
     v.x.array[:] = rng.random(len(v.x.array))
-
-    from dolfinx_adjoint.blocks.interpolation import get_dependency_index
 
     block = ExprInterpolationBlock(expr, v, petsc_mat=use_petsc)
 
     # 1. Safely find where UFL placed 'u' in the dependency list
     deps = block.get_dependencies()
-    u_idx = get_dependency_index(block._deps, u)
-    u_bv = deps[u_idx]
+    dep_idx = np.flatnonzero([dep.output == u for dep in deps])
+    u_bv = deps[dep_idx[0]]  # The block variable corresponding to 'u'
 
     # 2. Build the exact input arrays PyAdjoint would pass during a tape evaluation
     aligned_inputs = [d.saved_output for d in deps]
 
     # TLM inputs must match dependency length. We only perturb 'u', so the rest are None
     aligned_tlm_inputs = [None] * len(deps)
-    aligned_tlm_inputs[u_idx] = u
+    aligned_tlm_inputs[dep_idx[0]] = u  # Perturbation for 'u'
 
     # --- Test Tangent Linear Model and Adjoint ---
     # relevant_dependencies mirrors pyadjoint's real contract (Block.evaluate_adj): a list of
     # (idx, block_variable) tuples, where idx is the position in block.get_dependencies().
     mat_tlm = block.prepare_evaluate_tlm(aligned_inputs, aligned_tlm_inputs, None)
-    mat_adj = block.prepare_evaluate_adj(aligned_inputs, [v], [(u_idx, u_bv)])
+    mat_adj = block.prepare_evaluate_adj(aligned_inputs, [v], [(dep_idx[0], u_bv)])
 
     tlm_output = block.evaluate_tlm_component(
-        inputs=aligned_inputs, tlm_inputs=aligned_tlm_inputs, block_variable=None, idx=0, prepared=mat_tlm
+        inputs=aligned_inputs, tlm_inputs=aligned_tlm_inputs, block_variable=None, idx=dep_idx[0], prepared=mat_tlm
     )
 
     adj_output = block.evaluate_adj_component(
-        inputs=aligned_inputs, adj_inputs=[v], block_variable=u_bv, idx=u_idx, prepared=mat_adj
+        inputs=aligned_inputs, adj_inputs=[v], block_variable=u_bv, idx=dep_idx[0], prepared=mat_adj
     )
 
     # Verify linear adjoint identity <Au, v> == <u, A*v>
@@ -256,7 +254,7 @@ def test_expr_interpolation_taylor_test_function(mesh_2D, use_petsc):
 
     # Define nonlinear expression using both Function and Constant
     x_coords = ufl.SpatialCoordinate(mesh)
-    expr = (u**2) * c + ufl.cos(x_coords[1])
+    expr = (u**2) * c + ufl.cos(c * x_coords[1])
 
     # Dynamic Expression Interpolation
     v = interpolate(expr, V_to, petsc_mat=use_petsc)

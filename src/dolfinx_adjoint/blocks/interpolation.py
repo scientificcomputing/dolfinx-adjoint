@@ -58,30 +58,6 @@ def _register_cache_key(space: dolfinx.fem.FunctionSpace, key: tuple[int, int, b
     _CACHE_KEYS_BY_SPACE_ID.setdefault(space_id, set()).add(key)
 
 
-def get_dependency_index(dependencies, dep_or_bv) -> int:
-    """Safely finds the index of a dependency using object identity instead of UFL equality."""
-
-    # Unpack PyAdjoint's (input_index, BlockVariable) tuple if present
-    if isinstance(dep_or_bv, tuple) and len(dep_or_bv) == 2 and isinstance(dep_or_bv[0], int):
-        dep_or_bv = dep_or_bv[1]
-
-    target = getattr(dep_or_bv, "output", dep_or_bv)
-    target_bv = getattr(dep_or_bv, "block_variable", None) or getattr(target, "block_variable", None)
-
-    for i, d in enumerate(dependencies):
-        if d is target or id(d) == id(target):
-            return i
-        d_bv = getattr(d, "block_variable", None)
-        if d_bv is not None and target_bv is not None and d_bv is target_bv:
-            return i
-        if getattr(d, "_cpp_object", None) is not None and getattr(d, "_cpp_object") is getattr(
-            target, "_cpp_object", None
-        ):
-            return i
-
-    raise ValueError(f"Could not locate dependency index for {dep_or_bv}")
-
-
 class _MatrixCSRWorkspace:
     """A dolfinx.la.MatrixCSR paired with pre-allocated working vectors.
 
@@ -315,11 +291,6 @@ class ExprInterpolationBlock(Block):
         self.space_to = func_to.function_space
         self._use_petsc = petsc_mat
 
-        # self._deps and self.get_dependencies() are always populated in lockstep by this
-        # loop, so position i means the same dependency in both: get_dependency_index is
-        # only needed for identity lookups from outside this alignment (e.g. tests locating
-        # a specific control), not for indices pyadjoint already hands back via idx or
-        # relevant_dependencies in the evaluate_*/prepare_evaluate_* methods below.
         self._deps = []
         for op in traverse_unique_terminals(self.expr):
             if isinstance(op, OverloadedType):
@@ -347,7 +318,6 @@ class ExprInterpolationBlock(Block):
 
         du = ufl.TrialFunction(V_in)
         dE = ufl.derivative(current_expr, target_dep, du)
-        dE = ufl.algorithms.apply_derivatives.apply_derivatives(dE)
         scifem = _import_scifem()
         if self._use_petsc:
             mat = scifem.petsc_interpolation_matrix(dE, self.space_to)
@@ -453,7 +423,6 @@ class ExprInterpolationBlock(Block):
 
                     # Differentiate the directional derivative again to get the 2nd derivative
                     d2E = ufl.derivative(dE_total, target_dep_i, du)
-                    d2E = ufl.algorithms.apply_derivatives.apply_derivatives(d2E)
                     # Scifem will crash if the expression is purely linear (d2E == 0)
                     if not isinstance(d2E, (int, float)):
                         args = ufl.algorithms.extract_arguments(d2E)
