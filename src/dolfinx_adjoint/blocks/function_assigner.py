@@ -2,38 +2,96 @@ import typing
 
 import dolfinx
 import numpy as np
+import numpy.typing as npt
 import ufl
 from pyadjoint import AdjFloat, Block, OverloadedType
+from ufl.corealg.traversal import traverse_unique_terminals
 from ufl.formatting.ufl2unicode import ufl2unicode
 
-from ..utils import function_from_vector
+from ..types.function import Function as _Function
+from ..utils import assign_linear_combination, extract_linear_combination, function_from_vector
 from ._vector import _vector
 
 
+def create_function_with_special_vector(func: _Function, name: str | None = None) -> _Function:
+    """Create a new function with the same function space as `func` but with a special vector for adjoint computations.
+
+    Args:
+        func: The original function from which to derive the new function.
+
+    Returns:
+        A new function with the same function space as `func` but with a special vector for adjoint computations.
+    """
+    name = name or f"{func.name}_special_vector"
+    vec = _vector(func.x.index_map, func.x.block_size, func.function_space, dtype=func.x.array.dtype)
+    return _Function(func.function_space, x=vec, annotate=False, name=name)
+
+
 class FunctionAssignBlock(Block):
+    """Block for assigning data directly to a :py:class:`dolfinx_adjoint.Function` on the tape.
+
+    This block handles the assignment of a linear combination of ":py:class:`dolfinx_adjoint.Function` objects
+    or constants to a target :py:class:`dolfinx_adjoint.Function`.
+
+    Args:
+        other: The right-hand side of the assignment, which can be a :py:class:`dolfinx_adjoint.Function`,
+            a :py:class:`dolfinx_adjoint.Constant`, or a linear combination of :py:class:`dolfinx_adjoint.Function`
+            objects.
+        func: The target :py:class:`dolfinx_adjoint.Function` to which the assignment is made.
+        ad_block_tag: Optional tag for identifying the block in the adjoint tape.
+            If not provided, a default tag will be generated.
+    """
+
+    _working_memory: list[_Function]
+    _one: _Function  # Array for storing the value 1.0 for adjoint of broadcast operations
+
     def __init__(
         self,
-        other: typing.Union[np.inexact, int, float],
-        func: dolfinx.fem.Function,
+        other: np.inexact | int | float | _Function | ufl.core.expr.Expr,
+        func: _Function,
         ad_block_tag: typing.Optional[str] = None,
     ):
         super().__init__(ad_block_tag=ad_block_tag)
+
+        # Allocate working memory for adjoint computations
+        self._working_memory = []
+        for i in range(2):
+            self._working_memory.append(create_function_with_special_vector(func, name=f"working_memory_{i}"))
+
+        # Extract dependencies
         self.other = None
         self.expr = None
+
+        if isinstance(other, (float, int)) and not isinstance(other, OverloadedType):
+            other = AdjFloat(other)
+
         if isinstance(other, OverloadedType):
             self.add_dependency(other, no_duplicates=True)
-        elif isinstance(other, float) or isinstance(other, int):
-            other = AdjFloat(other)
-            self.add_dependency(other, no_duplicates=True)
-        elif not (isinstance(other, float) or isinstance(other, int)):
-            raise NotImplementedError("This should eventually be supported")
-            # # Assume that this is a point-wise evaluated UFL expression (firedrake only)
-            # for op in traverse_unique_terminals(other):
-            #     if isinstance(op, OverloadedType):
-            #         self.add_dependency(op, no_duplicates=True)
-            # self.expr = other
+            # If the dependency is a scalar broadcast, allocate the ones vector
+            if isinstance(other, AdjFloat):
+                self._one = _Function(func.function_space, name="one", annotate=False)
+                self._one.x.array[:] = 1.0
+            elif isinstance(other, _Function) and ufl.checks.is_scalar_constant_expression(other):
+                self._working_memory.append(create_function_with_special_vector(other, name="working_memory_2"))
+                self._one = _Function(func.function_space, name="one", annotate=False)
+                self._one.x.array[:] = 1.0
         else:
-            raise NotImplementedError("We should not get here!")
+            self.expr = other
+
+            # Extract linear combination
+            assert isinstance(other, ufl.core.expr.Expr), f"Expected UFL expression, got {type(other)}"
+            lin_comb = extract_linear_combination(other)
+            if len(lin_comb) == 0:
+                raise ValueError("No linear combination found in the expression.")
+            for op in traverse_unique_terminals(other):
+                if isinstance(op, OverloadedType):
+                    self.add_dependency(op, no_duplicates=True)
+
+            # Allocate extra memory for adjoint computations if any of the operands are real functions
+            for op in traverse_unique_terminals(other):
+                if isinstance(op, _Function) and ufl.checks.is_scalar_constant_expression(op):
+                    self._working_memory.append(create_function_with_special_vector(op, name="working_memory_2"))
+                    break
 
     def _replace_with_saved_output(self):
         if self.expr is None:
@@ -53,85 +111,79 @@ class FunctionAssignBlock(Block):
         expr = self._replace_with_saved_output()
         return expr, adj_input_func
 
-    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
-        if self.expr is None:
-            if isinstance(block_variable.output, AdjFloat):
-                # Adjoint of a broadcast is just a sum
-                if isinstance(adj_inputs[0], dolfinx.la.Vector):
-                    vec = adj_inputs[0]
-                    one = dolfinx.la.vector(
-                        adj_inputs[0].index_map, adj_inputs[0].block_size, adj_inputs[0].array.dtype
-                    )
-                    one.array[:] = 1
-                    return dolfinx.cpp.la.inner_product(vec._cpp_object, one._cpp_object)
-                else:
-                    try:
-                        return adj_inputs[0].sum()
-                    except AttributeError:
-                        # Catch the case where adj_inputs[0] is just a float
-                        return adj_inputs[0]
-            elif isinstance(func := block_variable.output, dolfinx.fem.Function):
-                assert func.function_space == prepared.function_space
-                vec = _vector(
-                    prepared.x.index_map, prepared.x.block_size, func.function_space, dtype=prepared.x.array.dtype
-                )
-                vec.array[:] = prepared.x.array[:]
-                return vec
+    @classmethod
+    def _compute_adjoint_of_broadcast(
+        cls, input: dolfinx.la.Vector | npt.NDArray | float | int, one: _Function
+    ) -> float | int:
+        """
+        Computes the adjoint of a broadcast operation into an R^N vector, which is simply the sum of the input values.
+        """
+        # Adjoint of a broadcast is just a sum
+        if isinstance(input, dolfinx.la.Vector):
+            return dolfinx.cpp.la.inner_product(input._cpp_object, one.x._cpp_object)  # type: ignore[arg-type]
+        else:
+            if hasattr(input, "sum"):
+                return input.sum()
+            else:
+                # Catch the case where input is just a float
+                return input
 
+    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
+        bo = block_variable.output
+        if self.expr is None:
+            assert len(adj_inputs) == 1
+            if isinstance(bo, AdjFloat):
+                return self._compute_adjoint_of_broadcast(adj_inputs[0], self._one)
+            elif isinstance(bo, dolfinx.fem.Function):
+                if ufl.checks.is_scalar_constant_expression(bo):
+                    # Adjoint of a broadcast into a real function (constant stored as Function)
+                    self._working_memory[2].x.array[0] = self._compute_adjoint_of_broadcast(adj_inputs[0], self._one)
+                    return self._working_memory[2].x
+                if bo.function_space != prepared.function_space:
+                    raise ValueError(
+                        "Function spaces of the block variable and prepared function must match for adjoint evaluation."
+                    )
+                self._working_memory[0].x.array[:] = adj_inputs[0].array[:]
+                return self._working_memory[0].x
+            elif isinstance(bo, dolfinx.fem.Constant):
+                raise NotImplementedError(
+                    "Adjoint for Constant assignment not implemented, use dolfinx_adjoint.Constant instead."
+                )
             else:
                 raise NotImplementedError(f"Adjoint for {block_variable=} not implemented.")
-            # elif isinstance(block_variable.output, dolfinx.fem.Constant):
-        #         R = block_variable.output._ad_function_space(prepared.function_space.mesh)
-        #         return self._adj_assign_constant(prepared, R)
-        #     else:
-        #         adj_output = dolfinx.fem.Function(
-        #             block_variable.output.function_space())
-        #         adj_output.assign(prepared)
-        #         return adj_output.vector()
-        # else:
-        #     # Linear combination
-        #     expr, adj_input_func = prepared
-        #     adj_output = dolfinx.fem.Function(adj_input_func.function_space)
-        #     if not isinstance(block_variable.output, dolfinx.fem.Constant):
-        #         diff_expr = ufl.algorithms.expand_derivatives(
-        #             ufl.derivative(expr, block_variable.saved_output, adj_input_func)
-        #         )
-        #         adj_output.assign(diff_expr)
-        #     else:
-        #         mesh = adj_output.function_space().mesh()
-        #         diff_expr = ufl.algorithms.expand_derivatives(
-        #             ufl.derivative(
-        #                 expr,
-        #                 block_variable.saved_output,
-        #                 create_constant(1., domain=mesh)
-        #             )
-        #         )
-        #         adj_output.assign(diff_expr)
-        #         return adj_output.vector().inner(adj_input_func.vector())
+        else:
+            # Linear combination
+            expr, adj_input_func = prepared
+            if isinstance(bo, dolfinx.fem.Function) and bo.function_space == adj_input_func.function_space:
+                # Differentiate with respect to one of the input functions
+                diff_expr = ufl.algorithms.expand_derivatives(
+                    ufl.derivative(expr, block_variable.saved_output, adj_input_func)
+                )
+                assign_linear_combination(diff_expr, self._working_memory[0])
+                return self._working_memory[0].x
+            elif isinstance(bo, dolfinx.fem.Function) and ufl.checks.is_scalar_constant_expression(bo):
+                # Differentiate with respect to a real function (constant stored as Function)
+                # Create a perturbation direction in the Real space (value = 1.0)
+                assert len(self._working_memory) == 3, "Working memory not allocated for real function adjoint."
+                direction = self._working_memory[2]
+                direction.x.array[0] = 1.0
 
-        #     if isinstance(block_variable.output, dolfin.Constant):
-        #         R = block_variable.output._ad_function_space(adj_output.function_space().mesh())
-        #         return self._adj_assign_constant(adj_output, R)
-        #     else:
-        #         return adj_output.vector()
+                # Differentiate expr w.r.t 'bo' in that direction
+                diff_expr = ufl.algorithms.expand_derivatives(
+                    ufl.derivative(expr, block_variable.saved_output, direction)
+                )
 
-    def _adj_assign_constant(self, adj_output, constant_fs):
-        r = dolfinx.fem.Function(constant_fs)
-        shape = r.ufl_shape
-        raise NotImplementedError("Not implemented for constants.")
+                # Evaluate the derivative at the DOFs of the target space V
+                diff_eval = self._working_memory[1]
+                assign_linear_combination(diff_expr, diff_eval)
 
-        if shape == () or shape[0] == 1:
-            # Scalar Constant
-            raise NotImplementedError("Not implemented for scalar constants yet.")
-            # r.vector()[:] = adj_output.vector().sum()
-        # else:
-        #     # We assume the shape of the constant == shape of the output function if not scalar.
-        #     # This assumption is due to FEniCS not supporting products with non-scalar constants in assign.
-        #     values = []
-        #     for i in range(shape[0]):
-        #         values.append(adj_output.sub(i, deepcopy=True).vector().sum())
-        #     r.assign(dolfin.Constant(values))
-        return r.vector()
+                # Chain rule: dot product of (dz/dr) and adjoint inputs (bar_u)
+                self._working_memory[2].x.array[0] = dolfinx.cpp.la.inner_product(
+                    diff_eval.x._cpp_object, adj_input_func.x._cpp_object
+                )
+                return self._working_memory[2].x
+            else:
+                raise NotImplementedError(f"Adjoint for {block_variable=} not implemented.")
 
     def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs):
         if self.expr is None:
@@ -143,12 +195,14 @@ class FunctionAssignBlock(Block):
         if self.expr is None:
             return tlm_inputs[0]
         expr = prepared
-        dudm = dolfinx.fem.Function(block_variable.output.function_space)
-        dudmi = dolfinx.fem.Function(block_variable.output.function_space)
+        dudm = self._working_memory[0]
+        dudm.x.array[:] = 0.0
+        dudmi = self._working_memory[1]
         for dep in self.get_dependencies():
             if dep.tlm_value:
-                dudmi.assign(ufl.algorithms.expand_derivatives(ufl.derivative(expr, dep.saved_output, dep.tlm_value)))
-                dudm.vector().axpy(1.0, dudmi.vector())
+                diff_expr = ufl.algorithms.expand_derivatives(ufl.derivative(expr, dep.saved_output, dep.tlm_value))
+                assign_linear_combination(diff_expr, dudmi)
+                dudm.x.array[:] += dudmi.x.array[:]
 
         return dudm
 
@@ -181,14 +235,12 @@ class FunctionAssignBlock(Block):
         # We should return the exact object instance to maintain C++ memory bindings
         # (especially for DirichletBCs), updating it in-place.
         output = block_variable.saved_output
-
-        try:
-            if output.function_space == prepared.function_space:
-                output.x.array[:] = prepared.x.array[:]
-        except AttributeError:
-            # Handling float value
+        if isinstance(prepared, dolfinx.fem.Function):
+            output.x.array[:] = prepared.x.array[:]
+        elif isinstance(prepared, (float, int)):
             output.x.array[:] = prepared
-
+        else:
+            assign_linear_combination(prepared, output)
         return output
 
     def __str__(self):
