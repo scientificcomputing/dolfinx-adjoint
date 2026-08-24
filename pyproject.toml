@@ -18,7 +18,8 @@ dependencies = [
 
 
 [project.optional-dependencies]
-test = ["pytest"]
+scifem = ["scifem"]
+test = ["pytest", "dolfinx-adjoint[scifem]"]
 dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",
@@ -29,7 +30,7 @@ docs = [
       "networkx",
       "pygraphviz"
 ]
-all = ["dolfinx-adjoint[test]", "dolfinx-adjoint[dev]", "dolfinx-adjoint[docs]"]
+all = ["dolfinx-adjoint[test]", "dolfinx-adjoint[dev]", "dolfinx-adjoint[docs]", "dolfinx-adjoint[scifem]"]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]

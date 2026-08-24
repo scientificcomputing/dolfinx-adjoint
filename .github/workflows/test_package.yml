@@ -16,12 +16,15 @@ jobs:
   test-code:
     runs-on: ubuntu-latest
     container: ghcr.io/fenics/dolfinx/dolfinx:nightly
-
+    env:
+      OMPI_ALLOW_RUN_AS_ROOT: 1
+      OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1
+      PRTE_MCA_rmaps_default_mapping_policy: :oversubscribe
     steps:
       - uses: actions/checkout@v7
 
       - name: Install package
-        run: python3 -m pip install .[test]
+        run: python3 -m pip install .[test] --no-build-isolation
 
       - name: Run tests
         run: python3 -m pytest -vs .

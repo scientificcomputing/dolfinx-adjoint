@@ -6,6 +6,7 @@ from importlib.metadata import metadata
 import pyadjoint as _pyad
 
 from .assembly import assemble_scalar, error_norm
+from .interpolation import interpolate
 from .solvers import LinearProblem, NonlinearProblem
 from .types import Constant, Function, dirichletbc
 from .types.function import assign
@@ -35,4 +36,5 @@ __all__ = [
     "__license__",
     "__email__",
     "__program_name__",
+    "interpolate",
 ]
