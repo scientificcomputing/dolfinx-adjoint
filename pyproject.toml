@@ -14,14 +14,13 @@ dependencies = [
       "pyadjoint-ad>=2025.10.0",
       "typing_extensions; python_version < '3.11'",
       "packaging>=24.2",
-      "fenicsx_ii",
 ]
 
 
 [project.optional-dependencies]
 scifem = ["scifem"]
 fenicsx_ii = ["fenicsx_ii"]
-test = ["pytest", "dolfinx-adjoint[scifem]"]
+test = ["pytest", "dolfinx-adjoint[scifem,fenicsx_ii]"]
 dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",

@@ -1,5 +1,6 @@
 from mpi4py import MPI
 
+import dolfinx
 import numpy as np
 import pyadjoint
 import pytest
@@ -31,38 +32,31 @@ def _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc):
     # TEST 1: Exact Algebraic Adjoint Property
     # ==========================================
     # Extract the automatically created block from the tape
-    # tape = pyadjoint.get_working_tape()
-    # block = tape.get_blocks()[-1]
+    tape = pyadjoint.get_working_tape()
+    block = tape.get_blocks()[-1]
 
-    # deps = block.get_dependencies()
-    # u_bv = deps[0]
+    # Forward Tangent pass (J * u)
+    mat_tlm = block.prepare_evaluate_tlm([u], [u], None)
+    tlm_output = block.evaluate_tlm_component(inputs=[u], tlm_inputs=[u], block_variable=None, idx=0, prepared=mat_tlm)
 
-    # aligned_inputs = [u]
-    # aligned_tlm_inputs = [u]  # Perturb by itself for the test
+    # Reverse Adjoint pass (J^T * v). A real upstream block passes adj_inputs as raw
+    # vectors during tape.evaluate_adj(), not Functions, so mirror that with v.x here.
+    mat_adj = block.prepare_evaluate_adj([u], [v.x], None)
+    adj_output = block.evaluate_adj_component(
+        inputs=[u], adj_inputs=[v.x], block_variable=None, idx=0, prepared=mat_adj
+    )
 
-    # # Forward Tangent pass (J * u)
-    # mat_tlm = block.prepare_evaluate_tlm(aligned_inputs, aligned_tlm_inputs, None)
-    # tlm_output = block.evaluate_tlm_component(
-    #     inputs=aligned_inputs, tlm_inputs=aligned_tlm_inputs, block_variable=None, idx=0, prepared=mat_tlm
-    # )
+    # inner(Ju, v) == inner(u, J^T v)
+    inner_forward = dolfinx.cpp.la.inner_product(tlm_output.x._cpp_object, v.x._cpp_object)
+    inner_adjoint = dolfinx.cpp.la.inner_product(u.x._cpp_object, adj_output._cpp_object)
 
-    # # Reverse Adjoint pass (J^T * v)
-    # mat_adj = block.prepare_evaluate_adj(aligned_inputs, [v], [(0, u_bv)])
-    # adj_output = block.evaluate_adj_component(
-    #     inputs=aligned_inputs, adj_inputs=[v], block_variable=u_bv, idx=0, prepared=mat_adj
-    # )
-
-    # # inner(Ju, v) == inner(u, J^T v)
-    # inner_forward = dolfinx.cpp.la.inner_product(tlm_output.x._cpp_object, v.x._cpp_object)
-    # inner_adjoint = dolfinx.cpp.la.inner_product(u.x._cpp_object, adj_output.x._cpp_object)
-
-    # np.testing.assert_allclose(
-    #     inner_forward,
-    #     inner_adjoint,
-    #     rtol=1e-12,
-    #     atol=1e-12,
-    #     err_msg=f"Adjoint property failed for Nonmatching Interpolation (PETSc={use_petsc})",
-    # )
+    np.testing.assert_allclose(
+        inner_forward,
+        inner_adjoint,
+        rtol=1e-10,
+        atol=1e-10,
+        err_msg=f"Adjoint property failed for Nonmatching Interpolation (PETSc={use_petsc})",
+    )
 
     # ==========================================
     # TEST 2: PyAdjoint Taylor Test

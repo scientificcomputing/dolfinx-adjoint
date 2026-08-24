@@ -1,3 +1,5 @@
+import warnings
+
 import dolfinx
 import numpy as np
 import ufl
@@ -60,6 +62,16 @@ def interpolate_nonmatching(
     ad_block_tag = kwargs.pop("ad_block_tag", None)
     petsc_mat = kwargs.pop("petsc_mat", False)
     red_op = kwargs.pop("red_op", None)
+
+    if red_op is not None and (cells is not None or interpolation_data is not None):
+        warnings.warn(
+            "A custom `red_op` was supplied together with explicit `cells`/`interpolation_data`. "
+            "The transfer matrix used for the adjoint, TLM, Hessian, and all recomputes with a "
+            "custom `red_op` is built by `fenicsx_ii.create_interpolation_matrix`, which does not "
+            "accept `cells`/`interpolation_data` — those are only honored by the initial, "
+            "tape-external forward evaluation done here.",
+            stacklevel=2,
+        )
 
     annotate = annotate_tape(kwargs)
 

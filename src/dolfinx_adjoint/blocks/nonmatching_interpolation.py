@@ -1,6 +1,7 @@
 import dolfinx
 from pyadjoint import Block
 from pyadjoint.tape import stop_annotating
+
 from ..types.function import _create_function
 from .interpolation import _MatrixCSRWorkspace, get_mult
 
@@ -96,11 +97,11 @@ class NonmatchingInterpolationBlock(Block):
         output = block_variable.saved_output
 
         # We use the built-in FEniCSx C++ nonmatching interpolation for the forward evaluation
-        # because it doesn't need the matrix and is highly optimized.
+        # when no custom reduction operator is supplied, because it doesn't need the matrix
+        # and is highly optimized. fenicsx_ii is only imported (and required) once a custom
+        # red_op is used, since that's the only case that needs the explicit transfer matrix.
         with stop_annotating():
-            fenicsx_ii = _import_fenicsx_ii()
-            if self._red_op is fenicsx_ii.PointwiseTrace:
-                # If using the default PointwiseTrace, we can use the built-in method
+            if self._red_op is None:
                 output.interpolate_nonmatching(
                     func_from, self.cells, self.interpolation_data, tol=self.tol, maxit=self.maxit
                 )
