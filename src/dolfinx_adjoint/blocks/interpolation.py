@@ -3,10 +3,10 @@ from __future__ import annotations
 import typing
 import weakref
 from typing import Callable
-import numpy as np
 
 import dolfinx
 import dolfinx.fem.petsc
+import numpy as np
 import ufl
 from pyadjoint import Block, OverloadedType
 from pyadjoint.tape import stop_annotating
@@ -436,7 +436,8 @@ class ExprInterpolationBlock(Block):
                             H_op = MatrixFreeInterpolationOperator(d2E, self.space_to)
                         elif len(args) > 1:
                             raise ValueError(
-                                f"Second derivative of expression with respect to {target_dep_i} has more than one argument: {args}"
+                                f"Second derivative of expression with respect to {target_dep_i}"
+                                + f" has more than one argument: {args}"
                             )
 
             operators[idx] = (J_op, H_op)

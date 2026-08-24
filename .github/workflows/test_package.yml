@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install package
-        run: python3 -m pip install .[test]
+        run: python3 -m pip install .[test] --no-build-isolation
 
       - name: Run tests
         run: python3 -m pytest -vs .
