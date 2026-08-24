@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 scifem = ["scifem"]
+fenicsx_ii = ["fenicsx_ii"]
 test = ["pytest", "dolfinx-adjoint[scifem]"]
 dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [

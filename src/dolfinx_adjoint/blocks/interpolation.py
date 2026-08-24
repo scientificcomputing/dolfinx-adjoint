@@ -14,6 +14,7 @@ from ufl.algorithms.analysis import traverse_unique_terminals
 
 from ..compat import get_interpolation_points
 from ..utils import unroll_dofmap
+from ..types.function import _create_function, Function
 
 if typing.TYPE_CHECKING:
     from petsc4py import PETSc
@@ -82,43 +83,48 @@ def get_mult(
     accumulate: bool = False,
 ) -> Callable[[dolfinx.la.Vector, dolfinx.la.Vector], None]:
     """Return a function that performs matrix-vector multiplication, optionally accumulating results."""
+
     if isinstance(mat, _MatrixCSRWorkspace):
         workspace = mat
 
         def mult(v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector):
             in_size_local = v_in.index_map.size_local * v_in.block_size
             out_size_local = v_out.index_map.size_local * v_out.block_size
-            # Zero the full working arrays (including ghosts) before each use
-            # to prevent double-counting in parallel.
+
             workspace.row_vec.array[:] = 0.0
             workspace.col_vec.array[:] = 0.0
+
             if transpose:
                 workspace.row_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                workspace.row_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
-                workspace.col_vec.array[:out_size_local] = 0.0
+                workspace.row_vec.scatter_forward()
+
                 workspace.mat.mult(workspace.row_vec, workspace.col_vec, transpose=True)
                 if accumulate:
                     v_out.array[:out_size_local] += workspace.col_vec.array[:out_size_local]
                 else:
                     v_out.array[:out_size_local] = workspace.col_vec.array[:out_size_local]
             else:
-                workspace.row_vec.array[:out_size_local] = 0.0
                 workspace.col_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                workspace.col_vec.scatter_forward()  # Ensure ghost values are updated before multiplication
+                workspace.col_vec.scatter_forward()
+
                 workspace.mat.mult(workspace.col_vec, workspace.row_vec)
+
                 if accumulate:
                     v_out.array[:out_size_local] += workspace.row_vec.array[:out_size_local]
                 else:
                     v_out.array[:out_size_local] = workspace.row_vec.array[:out_size_local]
+
             v_out.scatter_forward()
 
         return mult
+
     elif dolfinx.has_petsc4py and dolfinx.has_petsc:
         from petsc4py import PETSc
 
         if isinstance(mat, PETSc.Mat):
 
             def mult(v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector):
+                # PETSc handles parallel MPI ghost fetching entirely internally.
                 if transpose:
                     if accumulate:
                         mat.multTransposeAdd(v_in.petsc_vec, v_out.petsc_vec, v_out.petsc_vec)
@@ -129,6 +135,7 @@ def get_mult(
                         mat.multAdd(v_in.petsc_vec, v_out.petsc_vec, v_out.petsc_vec)
                     else:
                         mat.mult(v_in.petsc_vec, v_out.petsc_vec)
+
                 v_out.scatter_forward()
 
             return mult
@@ -182,9 +189,9 @@ class InterpolationBlock(Block):
         self.add_dependency(func_from)
 
         # Initialize internal caches for outputs to avoid MPI communicator exhaustion
-        self._adj_output: dolfinx.fem.Function | None = None
-        self._tlm_output: dolfinx.fem.Function | None = None
-        self._hessian_output: dolfinx.fem.Function | None = None
+        self._adj_output: Function | None = None
+        self._tlm_output: Function | None = None
+        self._hessian_output: Function | None = None
 
     def __str__(self):
         return "interpolate_function"
@@ -202,14 +209,14 @@ class InterpolationBlock(Block):
         mat = prepared
 
         if self._adj_output is None:
-            self._adj_output = dolfinx.fem.Function(self.space_from)
+            self._adj_output = _create_function(self.space_from)
 
         # Action of the adjoint: A^T * adj_input
         self._adj_output.x.array[:] = 0.0  # Reset the output vector before accumulation
         adj_input.x.scatter_forward()
         mult = get_mult(mat, transpose=True)
         mult(adj_input.x, self._adj_output.x)
-        return self._adj_output
+        return self._adj_output.x
 
     # --- Tangent Linear Model (TLM) ---
 
@@ -224,7 +231,7 @@ class InterpolationBlock(Block):
         mat = prepared
 
         if self._tlm_output is None:
-            self._tlm_output = dolfinx.fem.Function(self.space_to)
+            self._tlm_output = _create_function(self.space_to)
 
         # Forward Jacobian action: A * tlm_input
         tlm_input.x.scatter_forward()
@@ -245,14 +252,14 @@ class InterpolationBlock(Block):
         mat = prepared
 
         if self._hessian_output is None:
-            self._hessian_output = dolfinx.fem.Function(self.space_from)
+            self._hessian_output = _create_function(self.space_from)
 
         # Action of the adjoint on the incoming Hessian sensitivity
         hessian_input.x.scatter_forward()
         self._hessian_output.x.array[:] = 0.0  # Reset the output vector before accumulation
         mult = get_mult(mat, transpose=True)
         mult(hessian_input.x, self._hessian_output.x)
-        return self._hessian_output
+        return self._hessian_output.x
 
     # --- Recompute (Forward Pass) ---
 
@@ -338,14 +345,14 @@ class ExprInterpolationBlock(Block):
         operator = prepared[idx]
 
         if idx not in self._adj_output:
-            self._adj_output[idx] = dolfinx.fem.Function(self._deps[idx].function_space)
+            self._adj_output[idx] = _create_function(self._deps[idx].function_space)
         out_func = self._adj_output[idx]
 
         out_func.x.array[:] = 0.0
         operator.mult_transpose(adj_input.x, out_func.x)
         out_func.x.scatter_reverse(dolfinx.la.InsertMode.add)
         out_func.x.scatter_forward()
-        return out_func
+        return out_func.x
 
     # --- Tangent Linear Model (TLM) ---
 
@@ -374,7 +381,7 @@ class ExprInterpolationBlock(Block):
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
         if self._tlm_output is None:
-            self._tlm_output = dolfinx.fem.Function(self.space_to)
+            self._tlm_output = _create_function(self.space_to)
 
         out_func = self._tlm_output
         out_func.x.array[:] = 0.0
@@ -453,7 +460,7 @@ class ExprInterpolationBlock(Block):
         J_op, H_op = prepared[idx]
 
         if idx not in self._hessian_output:
-            self._hessian_output[idx] = dolfinx.fem.Function(self._deps[idx].function_space)
+            self._hessian_output[idx] = _create_function(self._deps[idx].function_space)
         out_func = self._hessian_output[idx]
         out_func.x.array[:] = 0.0
 
@@ -466,7 +473,7 @@ class ExprInterpolationBlock(Block):
             H_op.mult_transpose(adj_input.x, out_func.x, accumulate=True)
         out_func.x.scatter_reverse(dolfinx.la.InsertMode.add)
         out_func.x.scatter_forward()
-        return out_func
+        return out_func.x
 
     # --- Recompute (Forward Pass) ---
 
