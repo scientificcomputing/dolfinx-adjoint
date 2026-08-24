@@ -1,3 +1,5 @@
+import dolfinx
+
 try:
     from ufl.algorithms.extract_linear_combination import extract_linear_combination
 
@@ -198,3 +200,11 @@ except ImportError:
             raise ValueError("Expression evaluated to a pure scalar, no spatial functions found.")
 
         return final_result
+
+
+def get_interpolation_points(V: dolfinx.fem.FunctionSpace):
+    """Get the interpolation points for a given function space V."""
+    try:
+        return V.element.interpolation_points()  # type: ignore[operator]
+    except TypeError:
+        return V.element.interpolation_points

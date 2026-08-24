@@ -7,6 +7,7 @@ import pyadjoint as _pyad
 
 from .assembly import assemble_scalar, error_norm
 from .function import assign
+from .interpolation import interpolate
 from .solvers import LinearProblem, NonlinearProblem
 from .types import Constant, Function, dirichletbc
 
@@ -35,4 +36,5 @@ __all__ = [
     "__license__",
     "__email__",
     "__program_name__",
+    "interpolate",
 ]

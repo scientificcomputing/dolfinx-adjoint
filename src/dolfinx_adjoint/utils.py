@@ -105,3 +105,15 @@ class Floatify(DAGTraverser):
     def _(self, o, *operands, **kwargs):
         # Product has exactly two operands: left and right
         return operands[0] * operands[1]
+
+
+def unroll_dofmap(dofs: npt.NDArray[numpy.int32], bs: int) -> npt.NDArray[numpy.int32]:
+    """
+    Given a two-dimensional dofmap of size `(num_cells, num_dofs_per_cell)`
+    Expand the dofmap by its block size such that the resulting array
+    is of size `(num_cells, bs*num_dofs_per_cell)`
+    """
+    num_cells, num_dofs_per_cell = dofs.shape
+    unrolled_dofmap = numpy.repeat(dofs, bs).reshape(num_cells, num_dofs_per_cell * bs) * bs
+    unrolled_dofmap += numpy.tile(numpy.arange(bs), num_dofs_per_cell)
+    return unrolled_dofmap
