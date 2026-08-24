@@ -20,6 +20,8 @@ if typing.TYPE_CHECKING:
 def _import_scifem():
     """Import scifem lazily: only ExprInterpolationBlock needs it, so importing
     dolfinx_adjoint (or using InterpolationBlock) must not require it to be installed.
+    Replace with lazy import once we are at 3.15:
+    https://peps.python.org/pep-0810/
     """
     try:
         import scifem
