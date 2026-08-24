@@ -159,7 +159,7 @@ def test_interpolation_taylor_test(mesh_var_name: str, request, use_petsc):
 
 
 # ==============================================================================
-# Test 3: Expression Interpolation Adjoint Property (<Au, v> == <u, A*v>)
+# Test 1: Expression Interpolation Adjoint Property (<Au, v> == <u, A*v>)
 # ==============================================================================
 
 
@@ -280,6 +280,7 @@ def test_expr_interpolation_taylor_test_function(mesh_2D, use_petsc):
 
     min_rate = pyadjoint.taylor_test(Jh_u, u, du, dJdm=0)
     assert np.isclose(min_rate, 1.0, rtol=1e-2, atol=1e-2)
+    Jh_u(u)
 
     min_rate = pyadjoint.taylor_test(Jh_u, u, du)
     assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2)
