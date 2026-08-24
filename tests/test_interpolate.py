@@ -1,3 +1,5 @@
+import gc
+
 from mpi4py import MPI
 
 import dolfinx
@@ -7,7 +9,12 @@ import pytest
 import ufl
 
 from dolfinx_adjoint import Function, assemble_scalar, interpolate
-from dolfinx_adjoint.blocks.interpolation import InterpolationBlock
+from dolfinx_adjoint.blocks.interpolation import (
+    _CACHE_KEYS_BY_SPACE_ID,
+    _INTERPOLATION_MATRIX_CACHE,
+    InterpolationBlock,
+    _get_interpolation_matrix,
+)
 
 # Dynamically determine available matrix backends
 petsc_options = [False]
@@ -148,3 +155,61 @@ def test_interpolation_taylor_test(mesh_var_name: str, request, use_petsc):
     assert np.isclose(min_rate, 3.0, rtol=1e-3, atol=1e-3)
 
     pyadjoint.get_working_tape().clear_tape()
+
+
+# ==============================================================================
+# Test 3: Interpolation Matrix Cache
+# ==============================================================================
+
+
+def test_interpolation_matrix_cache_reused_for_same_spaces(mesh_1D):
+    """The same (space_from, space_to) pair should reuse one assembled matrix."""
+    V_from = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+    V_to = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 2))
+
+    mat1 = _get_interpolation_matrix(V_from, V_to)
+    mat2 = _get_interpolation_matrix(V_from, V_to)
+    assert mat1 is mat2
+
+    # A different space pair must not share the cached matrix.
+    V_other = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 3))
+    mat3 = _get_interpolation_matrix(V_from, V_other)
+    assert mat3 is not mat1
+
+
+def test_interpolation_matrix_cache_purged_when_space_is_garbage_collected(mesh_1D):
+    """Regression test for the id()-collision bug: a cache entry keyed on
+    id(space) must be dropped once that space is garbage collected, otherwise
+    a later, unrelated FunctionSpace object that happens to reuse the same id
+    could silently be served a stale matrix built for a completely different
+    pair of spaces.
+    """
+    V_to = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 2))
+
+    def build_and_return_id():
+        # V_from only lives inside this function, so it is eligible for
+        # collection as soon as it returns.
+        v_from = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+        _get_interpolation_matrix(v_from, V_to)
+        return id(v_from)
+
+    space_id = build_and_return_id()
+    gc.collect()
+
+    assert space_id not in _CACHE_KEYS_BY_SPACE_ID
+    assert all(key[0] != space_id for key in _INTERPOLATION_MATRIX_CACHE)
+
+
+def test_interpolation_matrix_cache_does_not_leak_across_transient_spaces(mesh_1D):
+    """The cache must not grow without bound as short-lived FunctionSpaces
+    (e.g. created once per optimization iteration) are used and discarded.
+    """
+    baseline = len(_INTERPOLATION_MATRIX_CACHE)
+
+    for _ in range(20):
+        v_from = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+        v_to = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 2))
+        _get_interpolation_matrix(v_from, v_to)
+
+    gc.collect()
+    assert len(_INTERPOLATION_MATRIX_CACHE) <= baseline + 1
