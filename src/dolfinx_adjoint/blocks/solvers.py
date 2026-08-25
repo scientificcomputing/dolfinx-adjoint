@@ -105,17 +105,25 @@ class LinearProblemBlock(pyadjoint.Block):
             self._u = [pyadjoint.create_overloaded_object(ui) for ui in u]
 
         # NOTE: Add mesh and constants as dependencies later on
-        try:
-            u_list = self._u if isinstance(self._u, list) else [self._u]
-            if self._lhs is not None:
-                for c in self._lhs.coefficients():  # type: ignore
-                    if c not in u_list:  # Exclude the unknown
-                        self.add_dependency(c, no_duplicates=True)
-
-            for c in self._rhs.coefficients():  # type: ignore
-                if c not in u_list:  # Exclude the unknown
+        if isinstance(self._u, dolfinx.fem.Function):
+            for c in self._lhs.coefficients():  # type: ignore
+                if c != self._u:  # Exclude the unknown
                     self.add_dependency(c, no_duplicates=True)
-        except AttributeError:
+            for c in self._rhs.coefficients():  # type: ignore
+                if c != self._u:  # Exclude the unknown
+                    self.add_dependency(c, no_duplicates=True)
+        elif isinstance(self._u, typing.Iterable):
+            for Ai in self._lhs:  # type: ignore
+                for Aij in Ai:
+                    if Aij is not None:
+                        for c in Aij.coefficients():
+                            if c not in self._u:
+                                self.add_dependency(c, no_duplicates=True)
+            for i, part in enumerate(self._rhs):  # type: ignore
+                for c in part.coefficients():
+                    if c not in self._u:
+                        self.add_dependency(c, no_duplicates=True)
+        else:
             raise NotImplementedError("Blocked systems not implemented yet.")
         self._compiled_lhs = dolfinx.fem.form(
             self._lhs,
@@ -193,23 +201,42 @@ class LinearProblemBlock(pyadjoint.Block):
                 bcs.append(c_rep)
         return bcs
 
-    def _create_replace_map(self, form: ufl.Form) -> dict[Function, Function]:
+    def _create_replace_map(self, form: ufl.Form | typing.Iterable[ufl.Form] | None) -> dict[Function, Function]:
         """Replace dependencies with latest checkpoint."""
         replace_map = {}
         for block_variable in self.get_dependencies():
             coeff = block_variable.output
-            if coeff in form.coefficients():
-                replace_map[coeff] = block_variable.saved_output
+            if isinstance(form, ufl.Form):
+                if coeff in form.coefficients():
+                    replace_map[coeff] = block_variable.saved_output
+            elif form is None:
+                return {}
+            else:
+                for f in form:
+                    replace_map.update(self._create_replace_map(f))
         return replace_map
 
-    def _replace_coefficients_in_form(self, form: ufl.Form) -> ufl.Form:
+    def _replace_coefficients_in_form(
+        self, form: ufl.Form | typing.Iterable[ufl.Form]
+    ) -> ufl.Form | typing.Iterable[ufl.Form]:
         """Replace coefficients in the form with saved outputs.
 
         Args:
             form: The UFL form to replace coefficients in.
         """
         replace_map = self._create_replace_map(form)
-        return ufl.replace(form, replace_map)
+        if isinstance(form, ufl.Form):
+            return ufl.replace(form, replace_map)
+        elif isinstance(form, typing.Iterable):
+            replaced_forms = []
+            for f in form:
+                if f is None:
+                    replaced_forms.append(None)
+                elif isinstance(f, typing.Iterable):
+                    replaced_forms.append(self._replace_coefficients_in_form(f))
+                else:
+                    replaced_forms.append(ufl.replace(f, replace_map))
+            return replaced_forms
 
     def prepare_recompute_component(self, inputs, relevant_outputs):
         """Prepare for recomputing the block with different control inputs."""
@@ -257,13 +284,19 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver._P = compiled_preconditioner
         self._forward_solver.bcs = self._bcs
         self._forward_solver._u = initial_guess
+        with pyadjoint.stop_annotating():
+            solution = self._forward_solver.solve()
+        return solution
 
     def recompute_component(
         self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
     ) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
         """Recompute the block with the prepared linear problem."""
-        solution = self._forward_solver.solve()
-        return solution
+        if isinstance(prepared, dolfinx.fem.Function):
+            assert idx == 0
+            return prepared
+        else:
+            return prepared[idx]
 
     def _should_compute_boundary_adjoint(
         self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
@@ -303,8 +336,12 @@ class LinearProblemBlock(pyadjoint.Block):
                 tmp_form.append([])
                 adj_form.append([])
                 for j, form_ij in enumerate(f_i):
-                    tmp_form[i].append(ufl.adjoint(form_ij))
-                    adj_form[i].append(ufl.adjoint(form_ij))
+                    if form_ij is None:
+                        tmp_form[i].append(None)
+                        adj_form[i].append(None)
+                    else:
+                        tmp_form[i].append(ufl.adjoint(form_ij))
+                        adj_form[i].append(ufl.adjoint(form_ij))
             for i, f_i in enumerate(tmp_form):
                 for j, form_ij in enumerate(f_i):
                     adj_form[j][i] = form_ij
