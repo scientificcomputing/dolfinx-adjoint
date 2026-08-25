@@ -59,6 +59,10 @@ def assign_linear_combination(value: ufl.core.expr.Expr, function: dolfinx.fem.F
     function.x.array[:] = 0.0
     floatifier = Floatify()
     for weight, func in pairs:
+        # extract_linear_combination is typed against UFL, which knows nothing of degrees of
+        # freedom; assigning a linear combination needs the DOLFINx Function that carries them.
+        if not isinstance(func, dolfinx.fem.Function):
+            raise TypeError(f"Expected the linear combination to be over dolfinx Functions, got {type(func)}.")
         if not func.function_space == function.function_space:
             raise ValueError("Function spaces of all functions in the linear combination must match for assignment.")
         function.x.array[:] += floatifier.process(weight) * func.x.array[:]

@@ -9,6 +9,7 @@ authors = [{ name = "Jørgen S. Dokken", email = "dokken@simula.no" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
       "fenics-dolfinx>=0.10.0",
       "pyadjoint-ad>=2025.10.0",
