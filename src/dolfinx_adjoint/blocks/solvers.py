@@ -17,14 +17,19 @@ from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
 def _initial_guess_for(
     u: _Function | typing.Sequence[_Function],
-) -> _Function | typing.Sequence[_Function]:
+) -> Function | typing.Sequence[Function]:
     """Build the solution vector a block solves into when its forward is replayed.
 
     Overloaded rather than plain, because whatever the block returns from
     `recompute_component` becomes its output on the tape: under a checkpoint schedule a stored
     output is asked to checkpoint itself again on a later pass, which a plain
-    {py:class}`dolfinx.fem.Function` cannot do. Outside checkpointing nothing asks, which is why a plain
-    one survived for so long.
+    {py:class}`dolfinx.fem.Function` cannot do. Outside checkpointing nothing asks, which is
+    why a plain one survived for so long.
+
+    The two types are deliberately not the same. What comes in is only known to be a
+    {py:class}`dolfinx.fem.Function`, since the overloaded type is a subclass and either may be
+    passed, so that is what the check is against. What goes out is always the overloaded type,
+    because it ends up on the tape.
     """
     with stop_annotating():
         if isinstance(u, _Function):
