@@ -8,7 +8,7 @@ import pyadjoint as _pyad
 from .assembly import assemble_scalar, error_norm
 from .checkpointing import enable_disk_checkpointing
 from .function import assign
-from .interpolation import interpolate
+from .interpolation import interpolate, interpolate_nonmatching
 from .solvers import LinearProblem, NonlinearProblem
 from .types import Constant, Function, dirichletbc
 
@@ -39,4 +39,5 @@ __all__ = [
     "__email__",
     "__program_name__",
     "interpolate",
+    "interpolate_nonmatching",
 ]

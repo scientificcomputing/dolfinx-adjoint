@@ -14,9 +14,26 @@ from pyadjoint.overloaded_type import (
 )
 from pyadjoint.tape import no_annotations
 
+from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
 from ..checkpointing import SnapshotCheckpoint, maybe_disk_checkpoint
 from ..utils import function_from_vector, gather
+
+
+def _create_function(
+    V: dolfinx.fem.FunctionSpace,
+    dtype: npt.DTypeLike = dolfinx.default_scalar_type,
+) -> Function:
+    """Create a Function that is compatible with a given function space.
+
+    Args:
+        V: A function space.
+
+    Returns:
+        A function that is compatible with the function space.
+    """
+    x = _vector(V.dofmap.index_map, V.dofmap.index_map_bs, dtype=dtype, function_space=V)
+    return Function(V, x=x, annotate=False)
 
 
 class Function(dolfinx.fem.Function, FloatingType):
@@ -63,10 +80,17 @@ class Function(dolfinx.fem.Function, FloatingType):
         )
         if x is not None:
             self._x = x  # Ensure that the input `x` is stored in case it is a _SpecialVector
+        if not isinstance(self.x, _SpecialVector):
+            self._x = _SpecialVector(self.x, V)  # Wrap the vector in a _SpecialVector for adjoint operations
 
     @classmethod
     def _ad_init_object(cls, obj):
         return cls(obj.function_space, obj.x, obj.name)
+
+    @property
+    def index_map(self) -> dolfinx.common.IndexMap:
+        """Return the index map of the function's vector."""
+        return self.x.index_map
 
     @no_annotations
     def _ad_create_checkpoint(self):

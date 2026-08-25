@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install git+https://github.com/funsim/moola.git
-          python3 -m pip install ".[docs]"
+          python3 -m pip install ".[docs]" --no-build-isolation
 
       - name: Build docs
         run: jupyter book build -W .

@@ -23,7 +23,8 @@ dependencies = [
 
 [project.optional-dependencies]
 scifem = ["scifem"]
-test = ["pytest", "dolfinx-adjoint[scifem]"]
+fenicsx_ii = ["fenicsx_ii"]
+test = ["pytest", "dolfinx-adjoint[scifem,fenicsx_ii]"]
 dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",
@@ -32,7 +33,8 @@ docs = [
       "pandas",
       "pyvista[all]>0.45",
       "networkx",
-      "pygraphviz"
+      "pygraphviz",
+      "dolfinx-adjoint[scifem,fenicsx_ii]",
 ]
 all = ["dolfinx-adjoint[test]", "dolfinx-adjoint[dev]", "dolfinx-adjoint[docs]", "dolfinx-adjoint[scifem]"]
 
