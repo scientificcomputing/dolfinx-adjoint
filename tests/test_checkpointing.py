@@ -145,7 +145,7 @@ def test_gradient_matches_uncheckpointed(n_steps, snapshots):
     actual = _gradient(rf_ckpt, controls_ckpt)
 
     assert len(actual) == len(expected)
-    for i, (a, e) in enumerate(zip(actual, expected)):
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
         np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
 
 
@@ -272,7 +272,7 @@ def test_disk_gradient_matches_uncheckpointed(use_mpio):
     actual = _gradient(rf_disk, controls_disk)
     dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
 
-    for i, (a, e) in enumerate(zip(actual, expected)):
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
         np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
 
 

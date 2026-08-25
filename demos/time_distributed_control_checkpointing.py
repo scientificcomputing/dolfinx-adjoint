@@ -94,9 +94,8 @@ def solve_heat(schedule=None, disk=False):
 
     j = 0.5 * float(dt) * dolfinx_adjoint.assemble_scalar((u_0 - d) ** 2 * ufl.dx)
 
-    # Tape.timestepper marks the tape timesteps the schedule reasons about. Note the
-    # `iter(...)`: it calls next() on whatever it is given, so passing a bare range raises
-    # TypeError. Do not "simplify" it away.
+    # `iter(...)` because timestepper calls next() on what it is given, and the default
+    # progress bar passes it straight through. Setting tape.progress_bar works too.
     for i in tape.timestepper(iter(range(num_steps))):
         t_val = float(dt) * (i + 1)
         dolfinx_adjoint.assign(t_val, t)
@@ -126,8 +125,8 @@ J_ckpt = rf_ckpt(controls_ckpt)
 grad_ckpt = [np.copy(g.x.array) for g in rf_ckpt.derivative()]
 
 assert np.isclose(J_plain, J_ckpt)
-for a, e in zip(grad_ckpt, grad_plain):
-    assert np.allclose(a, e)
+for a, e in zip(grad_ckpt, grad_plain, strict=True):
+    np.testing.assert_allclose(a, e)
 
 if mesh.comm.rank == 0:
     print(f"J without checkpointing: {J_plain:.12g}")
@@ -135,8 +134,9 @@ if mesh.comm.rank == 0:
 
 # ## A Taylor test through the schedule
 #
-# Reproducing the un-checkpointed gradient shows the two agree, but not that either is right.
-# A Taylor test does: the first-order remainder should converge at second order.
+# The check above shows the two gradients agree with each other. It does not show that either
+# is correct, since both could be wrong in the same way. A Taylor test checks that directly: the
+# first-order remainder must converge at second order.
 
 directions = []
 for k in range(num_steps):
@@ -173,8 +173,8 @@ J_disk = rf_disk(controls_disk)
 grad_disk = [np.copy(g.x.array) for g in rf_disk.derivative()]
 
 assert np.isclose(J_plain, J_disk)
-for a, e in zip(grad_disk, grad_plain):
-    assert np.allclose(a, e)
+for a, e in zip(grad_disk, grad_plain, strict=True):
+    np.testing.assert_allclose(a, e)
 
 if mesh.comm.rank == 0:
     print(f"J with checkpoints on disk:   {J_disk:.12g}")
