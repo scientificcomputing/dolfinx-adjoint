@@ -7,7 +7,7 @@ class _SpecialVector(dolfinx.la.Vector):
     """Workaround adding __iadd__ to `dolfinx.la.Vector`."""
 
     def __init__(self, x, function_space: dolfinx.fem.FunctionSpace):
-        super().__init__(x)
+        super().__init__(x._cpp_object)
         self._function_space = function_space
 
     def __iadd__(self, other):
@@ -67,7 +67,7 @@ def _vector(
     else:
         raise NotImplementedError(f"Type {dtype} not supported.")
 
-    return _SpecialVector(vtype(map, bs), function_space)
+    return _SpecialVector(dolfinx.la.Vector(vtype(map, bs)), function_space)
 
 
 def _create_vector(L: dolfinx.fem.Form, space: dolfinx.fem.FunctionSpace) -> _SpecialVector:

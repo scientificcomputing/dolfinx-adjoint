@@ -219,15 +219,10 @@ def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
 
     # Verify linear adjoint identity <Au, v> == <u, A*v>
     inner_forward = dolfinx.cpp.la.inner_product(tlm_output.x._cpp_object, v.x._cpp_object)
-    inner_adjoint = dolfinx.cpp.la.inner_product(u.x._cpp_object, adj_output.x._cpp_object)
-
-    comm = mesh.comm
-    global_inner_forward = comm.allreduce(inner_forward, op=MPI.SUM)
-    global_inner_adjoint = comm.allreduce(inner_adjoint, op=MPI.SUM)
-
+    inner_adjoint = dolfinx.cpp.la.inner_product(u.x._cpp_object, adj_output._cpp_object)
     np.testing.assert_allclose(
-        global_inner_forward,
-        global_inner_adjoint,
+        inner_forward,
+        inner_adjoint,
         rtol=1e-12,
         atol=1e-12,
         err_msg=f"Adjoint property failed for Expression (PETSc={use_petsc})",
