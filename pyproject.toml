@@ -14,6 +14,9 @@ dependencies = [
       "pyadjoint-ad>=2025.10.0",
       "typing_extensions; python_version < '3.11'",
       "packaging>=24.2",
+      # Storage for checkpoint schedules that keep state on disk. Build it against MPI to get
+      # one shared checkpoint file; without that each process writes its own.
+      "h5py",
 ]
 
 

@@ -8,8 +8,8 @@
 # exhausts memory first. Checkpointing trades that memory for repeated work: only some states
 # are kept, and the rest are recomputed from the nearest stored one when the adjoint asks for
 # them. A schedule decides which to keep and when to recompute. The schedules come from
-# `checkpoint_schedules` {cite}`Dolci2024`; for how step-based checkpointing combines with
-# high-level algorithmic differentiation, see {cite}`Maddison2024`.
+# `checkpoint_schedules` {cite}`tdcc-Dolci2024`; for how step-based checkpointing combines
+# with high-level algorithmic differentiation, see {cite}`tdcc-Maddison2024`.
 #
 # Everything here comes from `pyadjoint` and `checkpoint_schedules` directly. The only thing
 # `dolfinx_adjoint` adds is `enable_disk_checkpointing`, used at the end.
@@ -29,8 +29,8 @@ import dolfinx_adjoint
 # ## Enabling a schedule
 #
 # A schedule has to be enabled on an empty tape, before anything is recorded, so that every
-# timestep is treated the same way. `Revolve(num_steps, snapshots)` keeps at most `snapshots`
-# states in memory and recomputes whatever else the adjoint needs.
+# timestep is treated the same way. {py:class}`Revolve <checkpoint_schedules.hrevolve.Revolve>`
+# keeps at most `snapshots` states in memory and recomputes whatever else the adjoint needs.
 
 num_steps = 10
 mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
@@ -94,9 +94,9 @@ def solve_heat(schedule=None, disk=False):
 
     j = 0.5 * float(dt) * dolfinx_adjoint.assemble_scalar((u_0 - d) ** 2 * ufl.dx)
 
-    # `tape.timestepper` marks the tape timesteps the schedule reasons about. Note the
-    # `iter(...)`: `Tape.timestepper` calls `next()` on whatever it is given, so passing a bare
-    # `range` raises TypeError. Do not "simplify" it away.
+    # Tape.timestepper marks the tape timesteps the schedule reasons about. Note the
+    # `iter(...)`: it calls next() on whatever it is given, so passing a bare range raises
+    # TypeError. Do not "simplify" it away.
     for i in tape.timestepper(iter(range(num_steps))):
         t_val = float(dt) * (i + 1)
         dolfinx_adjoint.assign(t_val, t)
@@ -152,14 +152,17 @@ assert rate > 1.9
 
 # ## Storing checkpoints on disk
 #
-# `Revolve` keeps its checkpoints in memory. When even those do not fit, a schedule can put
-# them on disk instead, and `dolfinx_adjoint.enable_disk_checkpointing()` provides the storage.
+# {py:class}`Revolve <checkpoint_schedules.hrevolve.Revolve>` keeps its checkpoints in memory.
+# When even those do not fit, a schedule such as
+# {py:class}`SingleDiskStorageSchedule <checkpoint_schedules.basic_schedules.SingleDiskStorageSchedule>`
+# can put them on disk instead, and {py:func}`dolfinx_adjoint.enable_disk_checkpointing`
+# provides the storage.
 #
 # These are *snapshot* checkpoints: they hold just this process's values for the function, and
 # assume the mesh and its partition are unchanged, so they are valid only within the run that
 # wrote them. They are deleted automatically. For a checkpoint that outlives the run, or that
 # can be read back on a different number of processes, use
-# [adios4dolfinx](https://github.com/jorgensd/adios4dolfinx) instead.
+# [io4dolfinx](https://github.com/scientificcomputing/io4dolfinx) instead.
 #
 # Like the schedule, it must be enabled before anything is recorded on the tape.
 
@@ -177,7 +180,14 @@ if mesh.comm.rank == 0:
     print(f"J with checkpoints on disk:   {J_disk:.12g}")
     print("Gradients agree to machine precision in all three cases.")
 
+# Turning it off again deletes the checkpoint files. Every process must call it, because
+# closing a shared checkpoint file is collective.
+
+dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
 # ## References
 # ```{bibliography}
-# :filter: cited and ({"demos/time_distributed_control_checkpointing"} >= docnames)
+# :filter: cited
+# :labelprefix:
+# :keyprefix: tdcc-
 # ```

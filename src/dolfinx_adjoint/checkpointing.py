@@ -8,7 +8,7 @@ permutation data is stored and the file is a flat array per stored value. Ghost 
 stored alongside the owned ones, which keeps restoring free of communication -- see `_layout`.
 
 Snapshot checkpoints are therefore not portable. They cannot be reopened by a later run, or on a
-different number of processes. For a checkpoint that outlives the run, use ``adios4dolfinx``.
+different number of processes. For a checkpoint that outlives the run, use ``io4dolfinx``.
 """
 
 from __future__ import annotations

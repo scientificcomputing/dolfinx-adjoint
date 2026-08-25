@@ -41,9 +41,19 @@ sphinx:
       .py:
         - jupytext.reads
         - fmt: py
+    intersphinx_mapping:
+      checkpoint_schedules: ["https://www.firedrakeproject.org/checkpoint_schedules/", null]
+      pyadjoint: ["https://www.dolfin-adjoint.org/en/latest/", null]
+      dolfinx: ["https://docs.fenicsproject.org/dolfinx/main/python", null]
+      ufl: ["https://docs.fenicsproject.org/ufl/main/", null]
+      h5py: ["https://docs.h5py.org/en/stable/", null]
+      numpy: ["https://numpy.org/doc/stable/", null]
+      mpi4py: ["https://mpi4py.readthedocs.io/en/stable", null]
+      petsc4py: ["https://petsc.org/release/petsc4py", null]
 
   extra_extensions:
   - 'sphinx.ext.autodoc'
   - 'sphinx.ext.napoleon'
   - 'sphinx.ext.viewcode'
+  - 'sphinx.ext.intersphinx'
 exclude_patterns: [".pytest_cache/*"]
