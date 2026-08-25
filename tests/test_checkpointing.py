@@ -6,6 +6,8 @@ checkpointing disabled: a checkpoint schedule only changes *when* forward state 
 and recomputed, never the value of the derivative.
 """
 
+import gc
+
 from mpi4py import MPI
 from petsc4py import PETSc
 
@@ -40,14 +42,29 @@ def isolated_tape():
     """
     previous_tape = pyadjoint.get_working_tape()
     previous_options = dict(PETSc.Options().getAll())
+    _collect()
     try:
         yield
     finally:
+        _collect()
         dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
         pyadjoint.set_working_tape(previous_tape)
         options = PETSc.Options()
         for key in set(options.getAll()) - set(previous_options):
             options.delValue(key)
+
+
+def _collect():
+    """Collect garbage now, so that it happens at the same moment on every process.
+
+    Discarded tapes hold blocks, and each block owns a dolfinx LinearProblem whose __del__
+    destroys PETSc objects -- which is collective. Blocks sit in reference cycles, so they are
+    freed by the cyclic collector rather than by refcounting, and that runs when each process
+    happens to cross an allocation threshold, not in step. Whichever process collects first
+    then enters a collective the others are not in, and the run deadlocks. Collecting
+    deliberately, at points every process reaches together, keeps those destructors in step.
+    """
+    gc.collect()
 
 
 def _perturbation_directions(V, n):
@@ -56,11 +73,13 @@ def _perturbation_directions(V, n):
     Built by interpolating analytic expressions rather than from random numbers: the
     directions must agree across processes, and per-rank random values do not.
     """
+    # Not part of the model, so keep them off the tape.
     directions = []
-    for k in range(n):
-        h = dolfinx_adjoint.Function(V, name=f"direction_{k}")
-        h.interpolate(lambda x, k=k: np.sin((k + 1) * np.pi * x[0]) * np.cos(np.pi * x[1]))
-        directions.append(h)
+    with pyadjoint.stop_annotating():
+        for k in range(n):
+            h = dolfinx_adjoint.Function(V, name=f"direction_{k}")
+            h.interpolate(lambda x, k=k: np.sin((k + 1) * np.pi * x[0]) * np.cos(np.pi * x[1]))
+            directions.append(h)
     return directions
 
 
@@ -76,6 +95,7 @@ def _tape_heat_equation(n_steps, schedule=None, disk=False, use_mpio=None):
     Returns:
         A tuple of the reduced functional, the controls, and perturbation directions.
     """
+    _collect()
     tape = pyadjoint.Tape()
     pyadjoint.set_working_tape(tape)
     # Both of these must happen before anything is recorded on this tape.
@@ -170,6 +190,7 @@ def _tape_snes_heat_equation(n_steps, schedule=None, solution_dependent_diffusiv
             unknown, which puts the unknown into the Jacobian and hence into the block's own
             dependencies. See ``test_solution_dependent_jacobian_is_unsupported``.
     """
+    _collect()
     tape = pyadjoint.Tape()
     pyadjoint.set_working_tape(tape)
     if schedule is not None:

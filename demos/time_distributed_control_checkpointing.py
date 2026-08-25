@@ -139,12 +139,15 @@ if mesh.comm.rank == 0:
 # first-order remainder must converge at second order.
 
 directions = []
-for k in range(num_steps):
-    h = dolfinx_adjoint.Function(V, name=f"direction_{k}")
-    # Interpolated rather than random: the direction has to be the same on every process, and
-    # per-process random numbers are not.
-    h.interpolate(lambda x, k=k: np.sin((k + 1) * np.pi * x[0]) * np.cos(np.pi * x[1]))
-    directions.append(h)
+# The directions are inputs to the test, not part of the model, so building them should not be
+# recorded on the tape.
+with pyadjoint.stop_annotating():
+    for k in range(num_steps):
+        h = dolfinx_adjoint.Function(V, name=f"direction_{k}")
+        # Interpolated rather than random: the direction has to be the same on every process,
+        # and per-process random numbers are not.
+        h.interpolate(lambda x, k=k: np.sin((k + 1) * np.pi * x[0]) * np.cos(np.pi * x[1]))
+        directions.append(h)
 
 rf_ckpt, controls_ckpt = solve_heat(Revolve(num_steps, 3))
 rate = pyadjoint.taylor_test(rf_ckpt, controls_ckpt, directions)

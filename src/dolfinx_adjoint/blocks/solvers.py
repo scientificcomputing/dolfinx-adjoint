@@ -23,11 +23,11 @@ def _initial_guess_for(
     Overloaded rather than plain, because whatever the block returns from
     `recompute_component` becomes its output on the tape: under a checkpoint schedule a stored
     output is asked to checkpoint itself again on a later pass, which a plain
-    `dolfinx.fem.Function` cannot do. Outside checkpointing nothing asks, which is why a plain
+    {py:class}`dolfinx.fem.Function` cannot do. Outside checkpointing nothing asks, which is why a plain
     one survived for so long.
     """
     with stop_annotating():
-        if isinstance(u, dolfinx.fem.Function):
+        if isinstance(u, _Function):
             return Function(u.function_space, name=u.name + "_initial_guess")
         return [Function(ui.function_space, name=ui.name + "_initial_guess") for ui in u]
 
@@ -475,6 +475,21 @@ class LinearProblemBlock(pyadjoint.Block):
 
         return dudm
 
+    def _reusable_vector(self, attribute: str, template: dolfinx.la.Vector) -> dolfinx.la.Vector:
+        """Return a cached vector shaped like ``template``, allocating it on first use.
+
+        Allocating a distributed vector is collective, and so is destroying the PETSc vector it
+        can hand out. Doing either per call leaves both at the mercy of the garbage collector,
+        which does not run at the same moment on every process: one process then enters a
+        collective the others have already left, and the adjoint deadlocks. Allocating once, at
+        a point every process reaches together, and reusing it keeps the collectives in step.
+        """
+        cached = getattr(self, attribute, None)
+        if cached is None or cached.array.size != template.array.size:
+            cached = dolfinx.la.vector(template.index_map, template.block_size)
+            setattr(self, attribute, cached)
+        return cached
+
     def prepare_evaluate_adj(
         self,
         inputs: typing.Sequence[Function],
@@ -491,8 +506,8 @@ class LinearProblemBlock(pyadjoint.Block):
         # Extract dJ/du[v] from the adjoint inputs.
         assert len(adj_inputs) == 1
         adj_rhs = adj_inputs[0]
-        dJdu = dolfinx.la.vector(adj_rhs.index_map, adj_rhs.block_size)
-        dJdu.array[:] = adj_rhs.array[:].copy()
+        dJdu = self._reusable_vector("_adjoint_rhs", adj_rhs)
+        dJdu.array[:] = adj_rhs.array[:]
 
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(
@@ -1093,6 +1108,21 @@ class NonlinearProblemBlock(pyadjoint.Block):
         solve_linear_problem(A_tlm, dudm.x, b_tlm, petsc_options=self._tlm_petsc_options)
         return dudm
 
+    def _reusable_vector(self, attribute: str, template: dolfinx.la.Vector) -> dolfinx.la.Vector:
+        """Return a cached vector shaped like ``template``, allocating it on first use.
+
+        Allocating a distributed vector is collective, and so is destroying the PETSc vector it
+        can hand out. Doing either per call leaves both at the mercy of the garbage collector,
+        which does not run at the same moment on every process: one process then enters a
+        collective the others have already left, and the adjoint deadlocks. Allocating once, at
+        a point every process reaches together, and reusing it keeps the collectives in step.
+        """
+        cached = getattr(self, attribute, None)
+        if cached is None or cached.array.size != template.array.size:
+            cached = dolfinx.la.vector(template.index_map, template.block_size)
+            setattr(self, attribute, cached)
+        return cached
+
     def prepare_evaluate_adj(
         self,
         inputs: typing.Sequence[Function],
@@ -1108,8 +1138,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # Extract dJ/du[v] from the adjoint inputs.
         assert len(adj_inputs) == 1
         adj_rhs = adj_inputs[0]
-        dJdu = dolfinx.la.vector(adj_rhs.index_map, adj_rhs.block_size)
-        dJdu.array[:] = adj_rhs.array[:].copy()
+        dJdu = self._reusable_vector("_adjoint_rhs", adj_rhs)
+        dJdu.array[:] = adj_rhs.array[:]
 
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(

@@ -15,6 +15,7 @@ from pyadjoint.overloaded_type import (
 from pyadjoint.tape import no_annotations
 
 from ..blocks.assembly import assemble_compiled_form
+from ..checkpointing import SnapshotCheckpoint, maybe_disk_checkpoint
 from ..utils import function_from_vector, gather
 
 
@@ -69,8 +70,6 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     @no_annotations
     def _ad_create_checkpoint(self):
-        from ..checkpointing import maybe_disk_checkpoint
-
         # While a schedule is storing to disk, hand back a reference to the stored values
         # rather than the values themselves. This is the only seam pyadjoint offers for
         # choosing where checkpoint data lives.
@@ -88,8 +87,6 @@ class Function(dolfinx.fem.Function, FloatingType):
         return checkpoint
 
     def _ad_restore_at_checkpoint(self, checkpoint):
-        from ..checkpointing import SnapshotCheckpoint
-
         if isinstance(checkpoint, SnapshotCheckpoint):
             return checkpoint.restore()
         return checkpoint

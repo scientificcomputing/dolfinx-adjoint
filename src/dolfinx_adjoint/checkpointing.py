@@ -1,6 +1,6 @@
 """Snapshot checkpointing of DOLFINx functions to disk.
 
-A checkpoint schedule that uses :class:`checkpoint_schedules.StorageType.DISK` needs somewhere
+A checkpoint schedule that uses {py:class}`checkpoint_schedules.schedule.StorageType` ``DISK`` needs somewhere
 to put a function's values. This module provides that as a *snapshot* checkpoint: it is written
 and read within a single run, by the same processes, against an unchanged mesh and partition.
 Under those assumptions the whole payload is a process's local values, so no mesh, geometry or
@@ -8,22 +8,28 @@ permutation data is stored and the file is a flat array per stored value. Ghost 
 stored alongside the owned ones, which keeps restoring free of communication -- see `_layout`.
 
 Snapshot checkpoints are therefore not portable. They cannot be reopened by a later run, or on a
-different number of processes. For a checkpoint that outlives the run, use ``io4dolfinx``.
+different number of processes. For a checkpoint that outlives the run, use {py:mod}`io4dolfinx`.
 """
 
 from __future__ import annotations
 
 import os
+import pathlib
 import tempfile
 import typing
 import weakref
 
 from mpi4py import MPI
 
-import dolfinx
+import h5py
 import numpy as np
 import pyadjoint.checkpointing
 from pyadjoint.tape import TapePackageData, get_working_tape
+
+if typing.TYPE_CHECKING:
+    # Annotations only. Importing at runtime would be circular: dolfinx_adjoint.types imports
+    # this module to decide where a checkpoint goes.
+    from .types.function import Function
 
 __all__ = ["enable_disk_checkpointing", "disable_disk_checkpointing", "SnapshotCheckpoint"]
 
@@ -31,7 +37,7 @@ __all__ = ["enable_disk_checkpointing", "disable_disk_checkpointing", "SnapshotC
 _PACKAGE_KEY = "dolfinx_adjoint"
 
 #: The active checkpointer, or None when disk checkpointing is not enabled.
-_checkpointer: typing.Optional["_DiskCheckpointer"] = None
+_checkpointer: "_DiskCheckpointer | None" = None
 
 # Message pyadjoint shows when a schedule wants disk storage but none is configured.
 pyadjoint.checkpointing.disk_checkpointing_callback[_PACKAGE_KEY] = (
@@ -39,15 +45,7 @@ pyadjoint.checkpointing.disk_checkpointing_callback[_PACKAGE_KEY] = (
 )
 
 
-def _import_h5py():
-    try:
-        import h5py
-    except ImportError as e:  # pragma: no cover - exercised only without h5py
-        raise ImportError("Disk checkpointing requires h5py. Install it with 'pip install h5py'.") from e
-    return h5py
-
-
-def _layout(function: dolfinx.fem.Function, shared_file: bool, comm: MPI.Comm) -> tuple[int, int, int]:
+def _layout(function: Function, shared_file: bool, comm: MPI.Intracomm) -> tuple[int, int, int]:
     """Describe where this process's values sit in a stored dataset.
 
     The whole local array is stored, ghost values included, not just the locally owned values.
@@ -58,6 +56,12 @@ def _layout(function: dolfinx.fem.Function, shared_file: bool, comm: MPI.Comm) -
     call on that path deadlocks as soon as one process takes a cached value while another
     reads. Storing the ghosts makes restoring purely local, so it cannot deadlock.
 
+    Args:
+        function: The function whose values are about to be stored.
+        shared_file: Whether the dataset spans every process's values (one shared file) or
+            only this process's (one file per process).
+        comm: The communicator the checkpoint files are shared over.
+
     Returns:
         A tuple of the number of values this process stores, the length of the whole dataset,
         and this process's offset into it.
@@ -65,9 +69,13 @@ def _layout(function: dolfinx.fem.Function, shared_file: bool, comm: MPI.Comm) -
     n_local = function.x.array.size
     if not shared_file:
         return n_local, n_local, 0
-    # Collective, but called only from the write path, which every process reaches together.
-    sizes = comm.allgather(n_local)
-    return n_local, sum(sizes), sum(sizes[: comm.rank])
+    # Collective, but reached only from the write path, which every process reaches together.
+    # An exclusive scan rather than gathering every size and summing a prefix: it is the
+    # operation this actually is, and its cost does not grow with the number of processes.
+    offset = comm.exscan(n_local, op=MPI.SUM)
+    if comm.rank == 0:
+        offset = 0
+    return n_local, comm.allreduce(n_local, op=MPI.SUM), offset
 
 
 class _CheckpointFile:
@@ -80,21 +88,42 @@ class _CheckpointFile:
     rolling to a new one when the tape resets, and tearing down.
     """
 
-    def __init__(self, path: str, comm: MPI.Comm, use_mpio: bool, cleanup: bool):
-        h5py = _import_h5py()
-        self.path = path
-        self.comm = comm
-        # A shared file is a single file that every process writes its own slice of. Without
-        # MPI-IO each process gets a file to itself instead.
+    def __init__(self, path: pathlib.Path, comm: MPI.Intracomm, use_mpio: bool, cleanup: bool):
+        """
+        Args:
+            path: Where to create the file.
+            comm: The communicator the file is shared over.
+            use_mpio: Whether to open one shared file with MPI-IO, so that every process writes
+                its own slice of each dataset. Without it each process gets its own file.
+            cleanup: Whether to delete the file when it is closed. False keeps it on disk for
+                inspection, which is only useful for debugging.
+        """
+        self._path = path
+        self._comm = comm
         # One shared file that every process writes a slice of, or one file per process.
-        self.shared_file = use_mpio or comm.size == 1
+        self._shared_file = use_mpio or comm.size == 1
         # Only a shared file is written by more than one process, so only then does deleting it
         # belong to a single one of them.
-        self._deleted_by_this_process = cleanup and (comm.rank == 0 or not self.shared_file)
+        self._deleted_by_this_process = cleanup and (comm.rank == 0 or not self._shared_file)
         kwargs = {"driver": "mpio", "comm": comm} if use_mpio else {}
         self._handle = h5py.File(path, "w", **kwargs)
         self._next_index = 0
         self._closed = False
+
+    @property
+    def path(self) -> pathlib.Path:
+        """Where this file lives."""
+        return self._path
+
+    @property
+    def comm(self) -> MPI.Intracomm:
+        """The communicator this file is shared over."""
+        return self._comm
+
+    @property
+    def shared_file(self) -> bool:
+        """Whether one file holds every process's values, rather than one file per process."""
+        return self._shared_file
 
     def next_key(self) -> str:
         """Return a dataset name that every process agrees on.
@@ -108,10 +137,28 @@ class _CheckpointFile:
         return key
 
     def write(self, key: str, values: np.ndarray, n_global: int, offset: int) -> None:
+        """Store one process's values in a new dataset.
+
+        Args:
+            key: Dataset name, from {py:meth}`next_key`.
+            values: The values this process contributes, ghost values included.
+            n_global: Length of the whole dataset, across every process.
+            offset: Where this process's values start in it.
+        """
         dataset = self._handle.create_dataset(key, (n_global,), dtype=values.dtype)
         dataset[offset : offset + values.size] = values
 
     def read(self, key: str, n_local: int, offset: int) -> np.ndarray:
+        """Read this process's values back out of a dataset.
+
+        Args:
+            key: Dataset name, as passed to {py:meth}`write`.
+            n_local: How many values this process stored.
+            offset: Where this process's values start in the dataset.
+
+        Returns:
+            The stored values, ghost values included.
+        """
         return self._handle[key][offset : offset + n_local]
 
     def close(self) -> None:
@@ -125,7 +172,7 @@ class _CheckpointFile:
         self._handle.close()
         if self._deleted_by_this_process:
             try:
-                os.remove(self.path)
+                os.remove(self._path)
             except OSError:  # pragma: no cover - another process may have removed it first
                 pass
 
@@ -139,7 +186,7 @@ class SnapshotCheckpoint:
 
     __slots__ = ("_file", "_key", "_space", "_cls", "_n_local", "_offset", "_name", "_cache", "__weakref__")
 
-    def __init__(self, file: _CheckpointFile, key: str, function: dolfinx.fem.Function, n_local: int, offset: int):
+    def __init__(self, file: _CheckpointFile, key: str, function: Function, n_local: int, offset: int):
         # Holding the file keeps it alive for exactly as long as some checkpoint needs it.
         self._file = file
         self._key = key
@@ -153,9 +200,9 @@ class SnapshotCheckpoint:
         # and a fresh object each time makes those maps miss. Weak rather than strong so the
         # values are released again once the block is done with them, which is the point of
         # storing them on disk in the first place.
-        self._cache: typing.Optional[weakref.ReferenceType] = None
+        self._cache: weakref.ReferenceType | None = None
 
-    def restore(self):
+    def restore(self) -> Function:
         """Read the stored values back into a function of the original type."""
         from .types.function import Function
 
@@ -166,7 +213,7 @@ class SnapshotCheckpoint:
 
         # Mirrors Function._ad_new_like: going through __new__ preserves the concrete subclass
         # (Constant takes a different constructor signature).
-        restored = self._cls.__new__(self._cls, self._space)
+        restored = self._cls.__new__(self._cls, self._space)  # type: ignore[call-arg]
         Function.__init__(restored, self._space)
         restored.name = self._name
         # Purely local: the stored array already includes the ghost values, so no scatter.
@@ -178,7 +225,23 @@ class SnapshotCheckpoint:
 class _DiskCheckpointer(TapePackageData):
     """Tape-attached state owning the checkpoint files for one tape."""
 
-    def __init__(self, directory: str, comm: MPI.Comm, use_mpio: bool, cleanup: bool, owns_directory: bool):
+    def __init__(
+        self,
+        directory: pathlib.Path,
+        comm: MPI.Intracomm,
+        use_mpio: bool,
+        cleanup: bool,
+        owns_directory: bool,
+    ):
+        """
+        Args:
+            directory: Where the checkpoint files are written.
+            comm: The communicator the files are shared over.
+            use_mpio: Whether to write one shared file with MPI-IO.
+            cleanup: Whether to delete the files, and the directory, on teardown.
+            owns_directory: Whether this object created the directory and so should remove it.
+                Must agree across processes, or teardown deadlocks.
+        """
         self._directory = directory
         self._comm = comm
         self._use_mpio = use_mpio
@@ -195,7 +258,7 @@ class _DiskCheckpointer(TapePackageData):
         if previous is not None:
             previous.close()
         rank_suffix = "" if (self._use_mpio or self._comm.size == 1) else f"_rank{self._comm.rank}"
-        path = os.path.join(self._directory, f"checkpoint_{self._generation}{rank_suffix}.h5")
+        path = self._directory / f"checkpoint_{self._generation}{rank_suffix}.h5"
         self._generation += 1
         return _CheckpointFile(path, self._comm, self._use_mpio, self._cleanup)
 
@@ -204,7 +267,15 @@ class _DiskCheckpointer(TapePackageData):
         """Whether values should currently be written to disk rather than kept in memory."""
         return self._storing
 
-    def store(self, function: dolfinx.fem.Function) -> SnapshotCheckpoint:
+    def store(self, function: Function) -> SnapshotCheckpoint:
+        """Write a function's values to the current checkpoint file.
+
+        Args:
+            function: The function to store.
+
+        Returns:
+            A handle that reads the values back.
+        """
         n_local, n_global, offset = _layout(function, self._file.shared_file, self._comm)
         key = self._file.next_key()
         self._file.write(key, function.x.array, n_global, offset)
@@ -254,12 +325,18 @@ class _DiskCheckpointer(TapePackageData):
         self._storing = False
 
 
-def maybe_disk_checkpoint(function: dolfinx.fem.Function) -> typing.Optional[SnapshotCheckpoint]:
+def maybe_disk_checkpoint(function: Function) -> SnapshotCheckpoint | None:
     """Store ``function`` on disk if disk checkpointing is active, otherwise return None.
 
     Returning None tells the caller to fall back to an in-memory copy. Disk storage is only
     active inside the windows pyadjoint opens around writing checkpoint data, so most calls
     return None even when disk checkpointing is enabled.
+
+    Args:
+        function: The function pyadjoint is asking to checkpoint.
+
+    Returns:
+        A handle to the stored values, or None to keep them in memory.
     """
     if _checkpointer is None or not _checkpointer.storing:
         return None
@@ -267,10 +344,10 @@ def maybe_disk_checkpoint(function: dolfinx.fem.Function) -> typing.Optional[Sna
 
 
 def enable_disk_checkpointing(
-    dirname: typing.Optional[str] = None,
-    comm: typing.Optional[MPI.Comm] = None,
+    dirname: str | os.PathLike | None = None,
+    comm: MPI.Intracomm | None = None,
     cleanup: bool = True,
-    use_mpio: typing.Optional[bool] = None,
+    use_mpio: bool | None = None,
 ) -> None:
     """Store checkpoints on disk rather than in memory.
 
@@ -281,8 +358,9 @@ def enable_disk_checkpointing(
         dirname: Directory to hold the checkpoint files. A temporary directory is created if
             this is not given.
         comm: MPI communicator. Defaults to ``MPI.COMM_WORLD``.
-        cleanup: Whether to delete checkpoint files once nothing refers to them. Pass False to
-            keep them for inspection.
+        cleanup: Whether to delete the checkpoint files, and the temporary directory, on
+            teardown. Pass False to keep them for inspection; they are unreadable by any later
+            run either way.
         use_mpio: Whether to write one shared file with MPI-IO. The default chooses it when
             running on more than one process with an MPI-enabled h5py, and falls back to one
             file per process otherwise. Pass False to force the per-process layout.
@@ -301,7 +379,6 @@ def enable_disk_checkpointing(
         )
 
     comm = MPI.COMM_WORLD if comm is None else comm
-    h5py = _import_h5py()
     if use_mpio is None:
         use_mpio = comm.size > 1 and h5py.get_config().mpi
     elif use_mpio and not h5py.get_config().mpi:
@@ -309,15 +386,25 @@ def enable_disk_checkpointing(
             "use_mpio=True requires an MPI-enabled build of h5py. Use use_mpio=False to write "
             "one checkpoint file per process instead."
         )
-    owns_directory = dirname is None
-    if dirname is None:
+    # Whether we created the directory decides whether teardown removes it, and teardown
+    # synchronises the processes before doing so. Every process must therefore agree: if some
+    # were given a `dirname` and others were not, teardown would deadlock.
+    without_dirname = comm.allreduce(int(dirname is None), op=MPI.SUM)
+    if without_dirname not in (0, comm.size):
+        raise ValueError(
+            "dirname must be given on every process or on none of them, "
+            f"but it was omitted on {without_dirname} of {comm.size}."
+        )
+
+    owns_directory = without_dirname == comm.size
+    if owns_directory:
         # Every process must agree on the directory, even in the per-process layout.
         created = tempfile.mkdtemp(prefix="dolfinx_adjoint_checkpoints_") if comm.rank == 0 else None
-        directory = typing.cast(str, comm.bcast(created, root=0))
+        directory = pathlib.Path(comm.bcast(created, root=0))
     else:
-        directory = dirname
+        directory = pathlib.Path(typing.cast("str | os.PathLike", dirname))
         if comm.rank == 0:
-            os.makedirs(directory, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
         comm.Barrier()
 
     _checkpointer = _DiskCheckpointer(directory, comm, use_mpio, cleanup, owns_directory)
