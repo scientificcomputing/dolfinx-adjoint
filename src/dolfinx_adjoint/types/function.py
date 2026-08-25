@@ -69,6 +69,15 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     @no_annotations
     def _ad_create_checkpoint(self):
+        from ..checkpointing import maybe_disk_checkpoint
+
+        # While a schedule is storing to disk, hand back a reference to the stored values
+        # rather than the values themselves. This is the only seam pyadjoint offers for
+        # choosing where checkpoint data lives.
+        stored = maybe_disk_checkpoint(self)
+        if stored is not None:
+            return stored
+
         # Note: self.copy() (dolfinx.fem.Function.copy) always returns a plain
         # dolfinx.fem.Function regardless of self's concrete type, so wrapping it with
         # create_overloaded_object would silently downcast a Constant checkpoint to a
@@ -79,6 +88,10 @@ class Function(dolfinx.fem.Function, FloatingType):
         return checkpoint
 
     def _ad_restore_at_checkpoint(self, checkpoint):
+        from ..checkpointing import SnapshotCheckpoint
+
+        if isinstance(checkpoint, SnapshotCheckpoint):
+            return checkpoint.restore()
         return checkpoint
 
     def _ad_dot(self, other: typing.Self, options: typing.Optional[dict] = None):

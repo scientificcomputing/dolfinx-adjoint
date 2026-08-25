@@ -6,6 +6,7 @@ parts:
     chapters:
     - file: "demos/poisson_mother.py"
     - file: "demos/time_distributed_control.py"
+    - file: "demos/time_distributed_control_checkpointing.py"
   - caption: Python API
     chapters:
     - file: "docs/api"

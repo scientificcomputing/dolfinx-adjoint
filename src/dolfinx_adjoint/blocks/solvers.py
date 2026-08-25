@@ -8,10 +8,28 @@ import dolfinx.fem.petsc
 import pyadjoint
 import ufl
 from dolfinx.fem.function import Function as _Function
+from pyadjoint.tape import stop_annotating
 
 from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
 from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
+
+
+def _initial_guess_for(
+    u: _Function | typing.Sequence[_Function],
+) -> _Function | typing.Sequence[_Function]:
+    """Build the solution vector a block solves into when its forward is replayed.
+
+    Overloaded rather than plain, because whatever the block returns from
+    `recompute_component` becomes its output on the tape: under a checkpoint schedule a stored
+    output is asked to checkpoint itself again on a later pass, which a plain
+    `dolfinx.fem.Function` cannot do. Outside checkpointing nothing asks, which is why a plain
+    one survived for so long.
+    """
+    with stop_annotating():
+        if isinstance(u, dolfinx.fem.Function):
+            return Function(u.function_space, name=u.name + "_initial_guess")
+        return [Function(ui.function_space, name=ui.name + "_initial_guess") for ui in u]
 
 
 class LinearProblemBlock(pyadjoint.Block):
@@ -210,12 +228,8 @@ class LinearProblemBlock(pyadjoint.Block):
     def prepare_recompute_component(self, inputs, relevant_outputs):
         """Prepare for recomputing the block with different control inputs."""
 
-        # Create initial guess for the KSP solver
         # Form independnet compilation would make it possible to use the same KSP for all re-evaluations.
-        if isinstance(self._u, Function):
-            initial_guess = dolfinx.fem.Function(self._u.function_space, name=self._u.name + "_initial_guess")
-        else:
-            initial_guess = [dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u]
+        initial_guess = _initial_guess_for(self._u)
 
         # Replace form coefficients with checkpointed values.
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
@@ -868,12 +882,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
     def prepare_recompute_component(self, inputs, relevant_outputs):
         """Prepare for recomputing the block with different control inputs."""
 
-        # Create initial guess for the KSP solver
         # Form independnet compilation would make it possible to use the same KSP for all re-evaluations.
-        if isinstance(self._u, Function):
-            initial_guess = dolfinx.fem.Function(self._u.function_space, name=self._u.name + "_initial_guess")
-        else:
-            initial_guess = [dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u]
+        initial_guess = _initial_guess_for(self._u)
 
         # Replace values in the DirichletBC if it is dependent on a control
         # NOTE: Currently assume that BCS are control independent.
