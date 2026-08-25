@@ -29,7 +29,8 @@ docs = [
       "pandas",
       "pyvista[all]>0.45",
       "networkx",
-      "pygraphviz"
+      "pygraphviz",
+      "dolfinx-adjoint[scifem,fenicsx_ii]",
 ]
 all = ["dolfinx-adjoint[test]", "dolfinx-adjoint[dev]", "dolfinx-adjoint[docs]", "dolfinx-adjoint[scifem]"]
 
