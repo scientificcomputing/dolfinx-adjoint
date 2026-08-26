@@ -13,8 +13,8 @@ from pyadjoint.tape import stop_annotating
 from ufl.algorithms.analysis import traverse_unique_terminals
 
 from ..compat import get_interpolation_points
+from ..types.function import Function, _create_function
 from ..utils import unroll_dofmap
-from ..types.function import _create_function, Function
 
 if typing.TYPE_CHECKING:
     from petsc4py import PETSc

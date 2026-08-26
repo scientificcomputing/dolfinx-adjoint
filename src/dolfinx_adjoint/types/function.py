@@ -14,9 +14,9 @@ from pyadjoint.overloaded_type import (
 )
 from pyadjoint.tape import no_annotations
 
+from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
 from ..utils import function_from_vector, gather
-from ..blocks._vector import _vector, _SpecialVector
 
 
 def _create_function(

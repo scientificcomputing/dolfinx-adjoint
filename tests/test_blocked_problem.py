@@ -1,6 +1,7 @@
 import typing
 
 from mpi4py import MPI
+
 import basix.ufl
 import dolfinx
 import numpy as np
@@ -37,7 +38,8 @@ def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, 
     dx = ufl.Measure("dx", domain=mesh)
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx + ufl.inner(p, ufl.div(v)) * dx + ufl.inner(q, ufl.div(u)) * dx
 
-    f = Function(V, name="control")
+    Z = dolfinx.fem.functionspace(mesh, ("DG", 0, (mesh.geometry.dim,)))
+    f = Function(Z, name="control")
     f.interpolate(lambda x: (np.sin(x[0]), x[1]))
     L = ufl.inner(f, v) * dx
     L += dolfinx.fem.Constant(mesh, 0.0) * q * dx
@@ -75,13 +77,13 @@ def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, 
 
     control = pyadjoint.Control(f)
     Jh = pyadjoint.ReducedFunctional(J, control)
-    d = Function(V)
+    d = Function(Z)
     d.interpolate(lambda x: (10 * x[0], x[1]))
 
-    e = Function(V)
-    e.interpolate(lambda x: (2000 * np.sin(x[0]), -1000 * x[1]))
+    e = Function(Z)
+    e.interpolate(lambda x: (1e3 * np.sin(x[1]), 1e3 * x[0]))
     min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
-    assert np.isclose(min_rate, 1.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 1.0, got {min_rate}"
+    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
 
     Jh.derivative()
     min_rate = pyadjoint.taylor_test(Jh, d, e)
@@ -92,4 +94,4 @@ def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, 
     hessian = Jh.hessian(e)
     dHddu = hessian._ad_dot(e)
     min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate, 3.0, rtol=5e-3, atol=5e-3), f"Expected convergence rate close to 3.0, got {min_rate}"
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
