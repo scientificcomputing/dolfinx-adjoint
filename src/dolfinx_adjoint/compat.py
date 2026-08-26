@@ -1,4 +1,10 @@
 import dolfinx
+from ufl.algebra import Conj
+from ufl.algorithms.formsplitter import extract_blocks
+from ufl.algorithms.map_integrands import map_integrands
+from ufl.algorithms.replace import replace
+from ufl.argument import Argument
+
 
 try:
     from ufl.algorithms.extract_linear_combination import extract_linear_combination
@@ -208,3 +214,89 @@ def get_interpolation_points(V: dolfinx.fem.FunctionSpace):
         return V.element.interpolation_points()  # type: ignore[operator]
     except TypeError:
         return V.element.interpolation_points
+
+
+# Workaround until https://github.com/FEniCS/ufl/pull/508 is in all stable releases we support
+def compute_form_adjoint(
+    form,
+    reordered_arguments: tuple[Argument, Argument] | tuple[tuple[Argument, Argument], ...] | None = None,
+):
+    """Compute the adjoint of a bilinear form.
+
+    This works simply by swapping the number of the two arguments,
+    but keeping their elements and places in the integrand expressions.
+
+    Args:
+        form: A UFL bilinear form.
+        reordered_arguments: Optional explicit arguments to use for the adjoint form.
+            - For standard finite element spaces: A single tuple `(new_u, new_v)`
+              representing the replacement trial and test functions.
+            - For mixed function spaces: A sequence of tuples, with one `(new_u, new_v)`
+              pair for each *subspace*. For example, `((new_u0, new_v0), (new_u1, new_v1))`.
+              The test function mappings are extracted using the block row index `i`,
+              and the trial function mappings using the block column index `j`.
+
+    Returns:
+        The adjoint of the bilinear form.
+    """
+    if form.empty():
+        return form
+
+    arguments = form.arguments()
+
+    # Check if mixed space
+    is_mixed = any(arg.part() is not None for arg in arguments)
+
+    def validate_mapping(old_v: Argument, old_u: Argument, new_v: Argument, new_u: Argument, check_parts=False):
+        """Validate the mapping of old arguments to new arguments."""
+        if new_u.number() >= new_v.number():
+            raise ValueError("Ordering of new arguments is the same as the old arguments!")
+        if new_u.ufl_function_space() != old_u.ufl_function_space():
+            raise ValueError("Element mismatch between new and old arguments (trial functions).")
+        if new_v.ufl_function_space() != old_v.ufl_function_space():
+            raise ValueError("Element mismatch between new and old arguments (test functions).")
+
+        if check_parts and (new_u.part() != old_v.part() or new_v.part() != old_u.part()):
+            raise ValueError("Ordering of new arguments is the same as the old arguments!")
+
+    if not is_mixed:
+        if len(arguments) != 2:
+            raise ValueError("Expecting bilinear form.")
+
+        v, u = arguments
+        if v.number() >= u.number():
+            raise ValueError("Mistaken assumption in code!")
+        if reordered_arguments is None:
+            assert u.part() is None and v.part() is None
+            new_u = Argument(u.ufl_function_space(), number=v.number())
+            new_v = Argument(v.ufl_function_space(), number=u.number())
+        else:
+            assert isinstance(reordered_arguments, tuple) and len(reordered_arguments) == 2
+            u_arg, v_arg = reordered_arguments[0], reordered_arguments[1]
+            assert isinstance(u_arg, Argument) and isinstance(v_arg, Argument)
+            new_u, new_v = u_arg, v_arg
+
+        validate_mapping(v, u, new_v, new_u, check_parts=True)
+
+        return map_integrands(Conj, replace(form, {v: new_v, u: new_u}))
+    else:
+        form_blocked = extract_blocks(form, arity=2)
+        # Apply mapping block-by-block and sum
+        form_adj = 0
+        assert isinstance(form_blocked, tuple)
+        for i, row in enumerate(form_blocked):
+            assert isinstance(row, tuple)
+            for j, block in enumerate(row):
+                if block is not None:
+                    v, u = block.arguments()
+                    if reordered_arguments is not None:
+                        new_v = reordered_arguments[i][1]
+                        new_u = reordered_arguments[j][0]
+                    else:
+                        new_v = Argument(v.ufl_function_space(), number=u.number(), part=v.part())
+                        new_u = Argument(u.ufl_function_space(), number=v.number(), part=u.part())
+                    local_map = {v: new_v, u: new_u}
+                    validate_mapping(v, u, new_v, new_u)
+                    form_adj += map_integrands(Conj, replace(block, local_map))
+
+        return form_adj

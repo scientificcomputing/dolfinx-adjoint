@@ -12,6 +12,15 @@ from dolfinx.fem.function import Function as _Function
 from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
 from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
+from ..compat import compute_form_adjoint
+
+
+def sum_form(form: typing.Sequence[typing.Sequence[ufl.Form] | ufl.Form] | ufl.Form) -> ufl.Form:
+    """Sum a blocked form into a single form."""
+    if isinstance(form, ufl.Form):
+        return form
+    if isinstance(form, typing.Iterable):
+        return sum(sum_form(fi) for fi in form if fi is not None)
 
 
 class LinearProblemBlock(pyadjoint.Block):
@@ -86,6 +95,37 @@ class LinearProblemBlock(pyadjoint.Block):
         self._adjoint_petsc_options = adjoint_petsc_options
         self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
+
+        # Collect all arguments in variational forms and replace them with similar once that is based on a mixed functionspace.
+        if not isinstance(a, ufl.Form):
+            # Get all arguments from the RHS and LHS forms
+            trial_functions = len(a) * [None]
+            test_functions = len(a) * [None]
+            for i, ai in enumerate(a):
+                for j, aij in enumerate(ai):
+                    if aij is not None:
+                        test_functions[i] = aij.arguments()[0]
+                        trial_functions[j] = aij.arguments()[1]
+            assert all(tf is not None for tf in trial_functions), "Not all trial functions were found."
+            assert all(tf is not None for tf in test_functions), "Not all test functions were found."
+            trial_parts = [tf.part() for tf in trial_functions]
+            test_parts = [tf.part() for tf in test_functions]
+            if any(tp is None for tp in trial_parts) or any(tp is None for tp in test_parts):
+                replace_map = {}
+                for i, tf in enumerate(trial_functions):
+                    new_tf = ufl.TrialFunction(tf.ufl_function_space(), i)
+                    replace_map[tf] = new_tf
+                for i, tf in enumerate(test_functions):
+                    new_tf = ufl.TestFunction(tf.ufl_function_space(), i)
+                    replace_map[tf] = new_tf
+                for i, ai in enumerate(a):
+                    for j, aij in enumerate(ai):
+                        if aij is not None:
+                            a[i][j] = ufl.replace(aij, replace_map)
+                for i, Li in enumerate(L):
+                    if Li is not None:
+                        L[i] = ufl.replace(Li, replace_map)
+
         self._lhs = a
         self._rhs = L
         self._preconditioner = P
@@ -350,22 +390,8 @@ class LinearProblemBlock(pyadjoint.Block):
             return ufl.adjoint(form)
         else:
             assert isinstance(form, typing.Iterable)
-            adj_form: list[list[ufl.Form]] = []
-            tmp_form: list[list[ufl.Form]] = []
-            for i, f_i in enumerate(form):
-                tmp_form.append([])
-                adj_form.append([])
-                for j, form_ij in enumerate(f_i):
-                    if form_ij is None or form_ij.empty():
-                        tmp_form[i].append(None)
-                        adj_form[i].append(None)
-                    else:
-                        tmp_form[i].append(ufl.adjoint(form_ij))
-                        adj_form[i].append(ufl.adjoint(form_ij))
-            for i, f_i in enumerate(tmp_form):
-                for j, form_ij in enumerate(f_i):
-                    adj_form[j][i] = form_ij
-            return adj_form
+            sum_form = sum([fij for fi in form for fij in fi if fij is not None])
+            return ufl.extract_blocks(compute_form_adjoint(sum_form))
 
     def _compute_residual(self) -> typing.Union[ufl.Form, list[ufl.Form]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where
@@ -373,33 +399,21 @@ class LinearProblemBlock(pyadjoint.Block):
         """
         # NOTE: Should probably be possible to compile this form once.
         replacement_functions = self.get_outputs()
-        F_form: typing.Union[ufl.Form, list[ufl.Form]] = []
+        r_funcs = [r.saved_output for r in replacement_functions]
         if isinstance(self._u, Function):
             assert len(replacement_functions) == 1, (
                 f"Expected a single output function, got {len(replacement_functions)}"
             )
-            F_form = ufl.action(self._lhs, replacement_functions[0].saved_output) - self._rhs
+            F_form = ufl.action(self._lhs, r_funcs[0]) - self._rhs
         else:
             # Blocked formulation (assuming no mixed function-space)
             assert len(self._u) == len(replacement_functions), (
                 f"Expected {len(self._u)} output functions, got {len(replacement_functions)}"
             )
-            r_funcs = [r.saved_output for r in replacement_functions]
-            for i in range(len(self._u)):
-                assert isinstance(F_form, list)
-                res_i = ufl.ZeroBaseForm((self._u[i],))
-                for j in range(len(self._u)):
-                    if self._lhs[i][j] is not None:
-                        res_i += ufl.action(self._lhs[i][j], r_funcs)  # type: ignore[index]
-                res_i -= self._rhs[i]  # type: ignore[index]
-                F_form.append(res_i)
+            summed_form = sum_form(self._lhs)
+            F_form = ufl.action(summed_form, r_funcs) - sum_form(self._rhs)
         replacement_map = self._create_replace_map(F_form)
-        if isinstance(self._u, Function):
-            F_form = ufl.replace(F_form, replacement_map)
-        else:
-            assert isinstance(F_form, list)
-            for j in range(len(F_form)):
-                F_form[j] = ufl.replace(F_form[j], replacement_map)
+        F_form = ufl.replace(F_form, replacement_map)
         return F_form
 
     def _compute_residual_derivative(self) -> typing.Union[ufl.Form, list[list[ufl.Form]]]:
@@ -414,24 +428,11 @@ class LinearProblemBlock(pyadjoint.Block):
             # Replacement trial function needs to be in mixed space if initial form is created
             # with a mixed function space.
             # This means re-using the trialfunctions from the lhs
-            trial_functions = [None for _ in range(len(outputs))]
-            for i in range(len(outputs)):
-                for j in range(len(outputs)):
-                    if self._lhs[i][j] is not None:
-                        trial_functions[j] = self._lhs[i][j].arguments()[1]
-            assert isinstance(F_form, list)
-            dFdu = []
-            for i in range(len(outputs)):
-                dFdu.append([])
-                for j in range(len(outputs)):
-                    dFdu_ij = ufl.derivative(F_form[i], outputs[j], trial_functions[j])
-                    # Apply derivatives to avoid getting empty forms later on
-                    dFdu_ij = ufl.algorithms.apply_derivatives.apply_derivatives(
-                        ufl.algorithms.expand_derivatives(dFdu_ij)
-                    )
-                    dFdu_ij = None if dFdu_ij.empty() else dFdu_ij
-                    dFdu[-1].append(dFdu_ij)
-        return dFdu
+            trial_functions = sorted(
+                filter(lambda a: a.number() == 1, sum_form(self._lhs).arguments()), key=lambda a: a.part()
+            )
+            dFdu = ufl.derivative(F_form, outputs, trial_functions)
+        return ufl.extract_blocks(dFdu)
 
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
@@ -442,8 +443,10 @@ class LinearProblemBlock(pyadjoint.Block):
             self._tlm_solver = self.construct_tlm_solver()
         #  Build RHS (dFdm) for the monolithic system
         if isinstance(self._u, list):
-            test_funcs = [self._rhs[i].arguments()[0] for i in range(len(self._u))]
-            dFdm = [ufl.ZeroBaseForm((test,)) for test in test_funcs]
+            test_funcs = sorted(
+                filter(lambda x: x.number() == 0, sum_form(self._rhs).arguments()), key=lambda a: a.part()
+            )
+            dFdm = sum([ufl.ZeroBaseForm((test,)) for test in test_funcs])
         else:
             test_funcs = [self._rhs.arguments()[0]]
             dFdm = ufl.ZeroBaseForm((test_funcs[0],))
@@ -455,22 +458,21 @@ class LinearProblemBlock(pyadjoint.Block):
                 continue
 
             # Accumulate sensitivities across all block components
-            if isinstance(self._u, list):
-                for i in range(len(self._u)):
-                    term = ufl.derivative(-F_form[i], c_rep, tlm_value)
-                    dFdm[i] += term
-            else:
-                term = ufl.derivative(-F_form, c_rep, tlm_value)
-                dFdm += term
+            dFdm += ufl.derivative(-F_form, c_rep, tlm_value)
 
         # Safely wrap zero forms to prevent compilation crashes
+        dFdm = ufl.algorithms.expand_derivatives(dFdm)
         if isinstance(self._u, list):
-            for i in range(len(self._u)):
-                dFdm[i] = ufl.algorithms.expand_derivatives(dFdm[i])
-                if dFdm[i] == 0 or dFdm[i].empty():
-                    dFdm[i] = ufl.ZeroBaseForm((test_funcs[i],))
+            blocks = ufl.extract_blocks(dFdm)
+            if len(blocks) != len(self._u):
+                # Some zero blocks, manually pad with zero forms
+                _dFdm = [ufl.ZeroBaseForm((test,)) for test in test_funcs]
+                for block in blocks:
+                    args = block.arguments()
+                    assert len(args) == 1, "Expected a single test function in the block."
+                    _dFdm[args[0].part()] = block
+                dFdm = _dFdm
         else:
-            dFdm = ufl.algorithms.expand_derivatives(dFdm)
             if dFdm == 0 or dFdm.empty():
                 dFdm = ufl.ZeroBaseForm((test_funcs[0],))
 
@@ -527,14 +529,14 @@ class LinearProblemBlock(pyadjoint.Block):
         # Compute (dF/du[v])* for the linear problem.
         F_form = self._compute_residual()
         dFdu = self._compute_residual_derivative()
-        dFdu_adj = self._compute_adjoint(dFdu)
-
+        dFdu_adj = compute_form_adjoint(sum_form(dFdu))
         # Extract dJ/du[v] from the adjoint inputs.
         if len(adj_inputs) == 1:
             adj_rhs = adj_inputs[0]
             dJdu = dolfinx.la.vector(adj_rhs.index_map, adj_rhs.block_size)
             dJdu.array[:] = adj_rhs.array[:].copy()
         else:
+            dFdu_adj = ufl.extract_blocks(dFdu_adj)
             assert len(adj_inputs) == len(self.get_outputs()), (
                 f"Expected {len(self.get_outputs())} adjoint inputs, got {len(adj_inputs)})"
             )
@@ -621,10 +623,10 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdu_form = self._compute_residual_derivative()
 
         # For linear forms d2Fdu2 is zero, but we include it for completeness.
-        if isinstance(dFdu_form, list):
-            summed = sum(sum(dFdu_ij for dFdu_ij in dFdu_i if dFdu_ij is not None) for dFdu_i in dFdu_form)
+        if isinstance(dFdu_form, tuple):
             unknowns = [output.saved_output for output in self.get_outputs()]
-            d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed, unknowns, tlm_output))
+            summed_form = sum_form(dFdu_form)
+            d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
         else:
             d2Fdu2 = ufl.algorithms.expand_derivatives(
                 ufl.derivative(dFdu_form, outputs[0].saved_output, tlm_output[0])
@@ -648,25 +650,10 @@ class LinearProblemBlock(pyadjoint.Block):
                 raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
             else:
                 dFdu_adj = self._compute_adjoint(dFdu_form)
-                if isinstance(dFdu_form, list):
-                    dFdu_adj_applied = [
-                        ufl.ZeroBaseForm((self._adjoint_solutions[i],)) for i in range(len(self._adjoint_solutions))
-                    ]
-
-                    for i, dFdu_i in enumerate(dFdu_adj):
-                        for j, dFdu_ij in enumerate(dFdu_i):
-                            if dFdu_ij is not None and not dFdu_ij.empty():
-                                test_part, trial_part = dFdu_ij.arguments()
-                                dFdu_ij_rep = ufl.replace(
-                                    dFdu_ij,
-                                    {
-                                        test_part: ufl.TestFunction(test_part.ufl_function_space()),
-                                        trial_part: ufl.TrialFunction(trial_part.ufl_function_space()),
-                                    },
-                                )
-                                dFdu_adj_applied[i] += ufl.action(dFdu_ij_rep, self._adjoint_solutions[j])
-                    for i in range(len(b_form)):
-                        b_form[i] += ufl.derivative(dFdu_adj_applied[i], c_rep, tlm_input)
+                if isinstance(dFdu_form, tuple):
+                    summed_form = sum_form(dFdu_adj)
+                    dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
+                    b_form = ufl.extract_blocks(ufl.derivative(dFdu_adj_applied, c_rep, tlm_input))
                 else:
                     dFdu_adj_applied = ufl.action(dFdu_adj, self._adjoint_solutions)
                     b_form[0] += ufl.derivative(dFdu_adj, c_rep, tlm_input)
@@ -674,10 +661,10 @@ class LinearProblemBlock(pyadjoint.Block):
         if len(outputs) == 1:
             b = dolfinx.la.vector(hessian_inputs[0].index_map, hessian_inputs[0].block_size)
             b.array[:] = 0.0
-            b_form = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[0])
-            if not b_form.empty():
+            form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[0])
+            if not form_i.empty():
                 compiled_soa_rhs = dolfinx.fem.form(
-                    b_form,
+                    form_i,
                     jit_options=self._jit_options,
                     form_compiler_options=self._form_compiler_options,
                     entity_maps=self._entity_maps,
@@ -703,10 +690,10 @@ class LinearProblemBlock(pyadjoint.Block):
                     )
                 bs.append(bi)
                 bi.array[:] = 0.0
-                b_form[i] = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[i])
-                if not b_form[i].empty():
+                form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[i])
+                if not form_i.empty():
                     compiled_soa_rhs = dolfinx.fem.form(
-                        b_form[i],
+                        form_i,
                         jit_options=self._jit_options,
                         form_compiler_options=self._form_compiler_options,
                         entity_maps=self._entity_maps,
@@ -1097,7 +1084,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             for i, f_i in enumerate(tmp_form):
                 for j, form_ij in enumerate(f_i):
                     adj_form[j][i] = form_ij
-            return adj_form
 
     def _compute_residual(self) -> typing.Union[ufl.Form, list[ufl.Form]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where

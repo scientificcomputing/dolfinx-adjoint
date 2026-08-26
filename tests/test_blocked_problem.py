@@ -18,31 +18,38 @@ def mesh_2D():
     return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 7)
 
 
-@pytest.fixture(scope="module")
-def mesh_3D():
-    return dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 11, 13, 12, cell_type=dolfinx.mesh.CellType.hexahedron)
-
-
-@pytest.mark.parametrize("constant", [np.float64(0.2), float(-0.13), int(3)])
-@pytest.mark.parametrize("mesh_var_name", ["mesh_2D"])
-def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, np.floating]):
+@pytest.mark.parametrize("use_mixed_space", [True, False])
+def test_solver(use_mixed_space: bool, mesh_2D):
     pyadjoint.get_working_tape().clear_tape()
-    mesh = request.getfixturevalue(mesh_var_name)
+    mesh = mesh_2D
     el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
     el_p = basix.ufl.element("P", mesh.basix_cell(), 1)
     V = dolfinx.fem.functionspace(mesh, el_u)
     Q = dolfinx.fem.functionspace(mesh, el_p)
-    W = ufl.MixedFunctionSpace(*[V, Q])
-    u, p = ufl.TrialFunctions(W)
-    v, q = ufl.TestFunctions(W)
     dx = ufl.Measure("dx", domain=mesh)
-    a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx + ufl.inner(p, ufl.div(v)) * dx + ufl.inner(q, ufl.div(u)) * dx
+    a00 = lambda u, v: ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
+    a01 = lambda p, v: ufl.inner(p, ufl.div(v)) * dx
+    a10 = lambda q, u: ufl.inner(q, ufl.div(u)) * dx
+    L0 = lambda f, v: ufl.inner(f, v) * dx
+    L1 = lambda mesh, q: dolfinx.fem.Constant(mesh, 0.0) * q * dx
 
     Z = dolfinx.fem.functionspace(mesh, ("DG", 0, (mesh.geometry.dim,)))
     f = Function(Z, name="control")
     f.interpolate(lambda x: (np.sin(x[0]), x[1]))
-    L = ufl.inner(f, v) * dx
-    L += dolfinx.fem.Constant(mesh, 0.0) * q * dx
+
+    if use_mixed_space:
+        W = ufl.MixedFunctionSpace(*[V, Q])
+        u, p = ufl.TrialFunctions(W)
+        v, q = ufl.TestFunctions(W)
+        a = ufl.extract_blocks(a00(u, v) + a01(p, v) + a10(q, u))
+        L = ufl.extract_blocks(L0(f, v) + L1(mesh, q))
+    else:
+        u = ufl.TrialFunction(V)
+        p = ufl.TrialFunction(Q)
+        v = ufl.TestFunction(V)
+        q = ufl.TestFunction(Q)
+        a = [[a00(u, v), a01(p, v)], [a10(q, u), None]]
+        L = [L0(f, v), L1(mesh, q)]
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -59,8 +66,8 @@ def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, 
     }
     uh, ph = (Function(V, name="state"), Function(Q, name="pressure"))
     problem = LinearProblem(
-        ufl.extract_blocks(a),
-        ufl.extract_blocks(L),
+        a,
+        L,
         u=[uh, ph],
         bcs=[bc],
         petsc_options=options,
@@ -69,9 +76,8 @@ def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, 
     )
     problem.solve()
 
-    d = pyadjoint.AdjFloat(constant)
     x = ufl.SpatialCoordinate(mesh)
-    c = ufl.as_vector((d * ufl.sin(x[0]), d * ufl.cos(x[1])))
+    c = ufl.as_vector((2 * ufl.sin(x[0]), 3 * ufl.cos(x[1])))
     error = ufl.inner(uh - c, uh - c) * ufl.inner(uh - c, uh - c) * ufl.dx
     J = assemble_scalar(error)
 
