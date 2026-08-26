@@ -301,13 +301,6 @@ class LinearProblemBlock(pyadjoint.Block):
     def prepare_recompute_component(self, inputs, relevant_outputs):
         """Prepare for recomputing the block with different control inputs."""
 
-        # Create initial guess for the KSP solver
-        # Form independnet compilation would make it possible to use the same KSP for all re-evaluations.
-        if isinstance(self._u, Function):
-            initial_guess = dolfinx.fem.Function(self._u.function_space, name=self._u.name + "_initial_guess")
-        else:
-            initial_guess = [dolfinx.fem.Function(u.function_space, name=u.name + "_initial_guess") for u in self._u]
-
         # Replace form coefficients with checkpointed values.
         # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
         lhs = self._replace_coefficients_in_form(self._lhs)
@@ -343,7 +336,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver._L = compiled_rhs
         self._forward_solver._P = compiled_preconditioner
         self._forward_solver.bcs = self._bcs
-        self._forward_solver._u = initial_guess
+        self._forward_solver._u = self._u
         with pyadjoint.stop_annotating():
             solution = self._forward_solver.solve()
         return solution
