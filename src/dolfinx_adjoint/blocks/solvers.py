@@ -526,25 +526,29 @@ class LinearProblemBlock(pyadjoint.Block):
         # Extract dJ/du[v] from the adjoint inputs.
         if len(adj_inputs) == 1:
             adj_rhs = adj_inputs[0]
-            dJdu = dolfinx.la.vector(adj_rhs.index_map, adj_rhs.block_size)
-            dJdu.array[:] = adj_rhs.array[:].copy()
+            dJdu = self._adjoint_solver._b
+            with dJdu.localForm() as dJdu_loc:
+                dJdu_loc.set(0.0)
+            dJdu.array_w[:] = adj_rhs.array_r[:].copy()
         else:
             dFdu_adj = ufl.extract_blocks(dFdu_adj)
             assert len(adj_inputs) == len(self.get_outputs()), (
                 f"Expected {len(self.get_outputs())} adjoint inputs, got {len(adj_inputs)})"
             )
-            dJdu = []
-            for adj_rhs, output in zip(adj_inputs, self.get_outputs(), strict=True):
-                if adj_rhs is None:
-                    dJdu_i = dolfinx.la.vector(
-                        output.output.index_map, output.output.function_space.dofmap.index_map_bs
-                    )
-                    dJdu_i.array[:] = 0.0
-                else:
-                    dJdu_i = dolfinx.la.vector(adj_rhs.index_map, adj_rhs.block_size)
-                    dJdu_i.array[:] = adj_rhs.array[:].copy()
-                dJdu.append(dJdu_i)
+            dJdu = self._adjoint_solver._b
+            with dJdu.localForm() as dJdu_loc:
+                dJdu_loc.set(0.0)
+            import numpy as np
 
+            arrs = [
+                np.zeros(output.output.index_map.size_local * output.output.function_space.dofmap.index_map_bs)
+                for output in self.get_outputs()
+            ]
+            for i, adj_rhs in enumerate(adj_inputs):
+                if adj_rhs is None:
+                    arrs[i][:] = 0.0
+                else:
+                    arrs[i][: len(arrs[i])] = adj_rhs.array[: len(arrs[i])]
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(
             dFdu_adj,  # type: ignore[arg-type]
@@ -554,9 +558,9 @@ class LinearProblemBlock(pyadjoint.Block):
         )
         self._adjoint_solver._a = compiled_dFdu
         if len(adj_inputs) == 1:
-            self._adjoint_solver._b = dJdu.petsc_vec
+            self._adjoint_solver._b = dJdu
         else:
-            dolfinx.la.petsc.assign([dJdu_i.petsc_vec.array_r for dJdu_i in dJdu], self._adjoint_solver._b)
+            dolfinx.la.petsc.assign(arrs, self._adjoint_solver._b)
         self._adjoint_solver._u = self._adjoint_solutions  # type: ignore[assignment]
         self._adjoint_solver.solve()
         return F_form
@@ -652,8 +656,9 @@ class LinearProblemBlock(pyadjoint.Block):
                     b_form[0] += ufl.derivative(dFdu_adj, c_rep, tlm_input)
 
         if len(outputs) == 1:
-            b = dolfinx.la.vector(hessian_inputs[0].index_map, hessian_inputs[0].block_size)
-            b.array[:] = 0.0
+            b = self._adjoint_solver._b
+            with b.localForm() as b_loc:
+                b_loc.set(0.0)
             form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[0])
             if not form_i.empty():
                 compiled_soa_rhs = dolfinx.fem.form(
@@ -662,27 +667,26 @@ class LinearProblemBlock(pyadjoint.Block):
                     form_compiler_options=self._form_compiler_options,
                     entity_maps=self._entity_maps,
                 )
-                dolfinx.fem.petsc.assemble_vector(b.petsc_vec, compiled_soa_rhs)
-                b.scatter_reverse(dolfinx.la.InsertMode.add)
-                b.array[:] *= -1
+                dolfinx.fem.petsc.assemble_vector(b, compiled_soa_rhs)
+                b.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+                b.array_w[:] *= -1
 
-            b.array[:] += hessian_inputs[0].array
-            b.scatter_forward()
-            self._adjoint_solver._b = b.petsc_vec
+            b.array_w[:] += hessian_inputs[0].array
+            b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
+            self._adjoint_solver._b = b
 
         else:
             bs = []
             for i, hess_input in enumerate(hessian_inputs):
                 if hess_input is not None:
-                    bi = dolfinx.la.vector(hess_input.index_map, hess_input.block_size)
+                    bi = dolfinx.la.petsc.create_vector([(hess_input.index_map, hess_input.block_size)])
                 else:
                     out_i = self.get_outputs()[i].saved_output
-                    bi = dolfinx.la.vector(
-                        out_i.function_space.dofmap.index_map,
-                        out_i.function_space.dofmap.index_map_bs,
+                    bi = dolfinx.la.petsc.create_vector(
+                        [(out_i.function_space.dofmap.index_map, out_i.function_space.dofmap.index_map_bs)]
                     )
                 bs.append(bi)
-                bi.array[:] = 0.0
+                bi.array_w[:] = 0.0
                 form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[i])
                 if not form_i.empty():
                     compiled_soa_rhs = dolfinx.fem.form(
@@ -691,14 +695,14 @@ class LinearProblemBlock(pyadjoint.Block):
                         form_compiler_options=self._form_compiler_options,
                         entity_maps=self._entity_maps,
                     )
-                    dolfinx.fem.petsc.assemble_vector(bi.petsc_vec, compiled_soa_rhs)
-                    bi.scatter_reverse(dolfinx.la.InsertMode.add)
-                    bi.array[:] *= -1
+                    dolfinx.fem.petsc.assemble_vector(bi, compiled_soa_rhs)
+                    bi.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+                    bi.array_w[:] *= -1
                 if hess_input is not None:
-                    bi.array[:] += hess_input.array
-                bi.scatter_forward()
-            b = self._adjoint_solver.b
-            dolfinx.la.petsc.assign([bi.petsc_vec.array_r for bi in bs], b)
+                    bi.array_w[:] += hess_input.array[: len(bi.array_w)]
+                bi.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
+            b = self._adjoint_solver._b
+            dolfinx.la.petsc.assign([bi.array_r for bi in bs], b)
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
@@ -1197,8 +1201,10 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # Extract dJ/du[v] from the adjoint inputs.
         assert len(adj_inputs) == 1
         adj_rhs = adj_inputs[0]
-        dJdu = dolfinx.la.vector(adj_rhs.index_map, adj_rhs.block_size)
-        dJdu.array[:] = adj_rhs.array[:].copy()
+        dJdu = self._adjoint_solver._b
+        with dJdu.localForm() as dJdu_loc:
+            dJdu_loc.set(0.0)
+        dJdu.array_w[:] = adj_rhs.array[:].copy()
 
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(
@@ -1208,7 +1214,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         self._adjoint_solver._a = compiled_dFdu
-        self._adjoint_solver._b = dJdu.petsc_vec
         self._adjoint_solver._u = self._adjoint_solutions  # type: ignore[assignment]
         self._adjoint_solver.solve()
         return F_form
@@ -1281,8 +1286,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
                 dFdu_adj = ufl.action(ufl.adjoint(dFdu_form), self._adjoint_solutions)
                 b_form += ufl.derivative(dFdu_adj, c_rep, tlm_input)
 
-        b = dolfinx.la.vector(hessian_inputs[0].index_map, hessian_inputs[0].block_size)
-        b.array[:] = 0.0
+        b = dolfinx.la.create_vector([(hessian_inputs[0].index_map, hessian_inputs[0].block_size)])
+        b.array_w[:] = 0.0
         if not ufl.algorithms.apply_derivatives.apply_derivatives(b_form).empty():
             compiled_soa_rhs = dolfinx.fem.form(
                 b_form,
@@ -1292,9 +1297,9 @@ class NonlinearProblemBlock(pyadjoint.Block):
             )
             dolfinx.fem.petsc.assemble_vector(b.petsc_vec, compiled_soa_rhs)
             b.scatter_reverse(dolfinx.la.InsertMode.add)
-            b.array[:] *= -1
+            b.array_w[:] *= -1
 
-        b.array[:] += hessian_inputs[0].array
+        b.array_w[:] += hessian_inputs[0].array
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
@@ -1305,7 +1310,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         )
 
         self._adjoint_solver._a = dFdu_adj
-        self._adjoint_solver._b = b.petsc_vec
+        self._adjoint_solver._b = b
         self._adjoint_solver._u = self._second_adjoint_solutions
         self._adjoint_solver.solve()
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
