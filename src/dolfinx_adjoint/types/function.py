@@ -87,7 +87,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         return cls(obj.function_space, obj.x, obj.name)
 
     @property
-    def index_map(self) -> dolfinx.cpp.la.IndexMap:
+    def index_map(self) -> dolfinx.cpp.la.IndexMap:  # type: ignore
         """Return the index map of the function's vector."""
         return self.x.index_map
 

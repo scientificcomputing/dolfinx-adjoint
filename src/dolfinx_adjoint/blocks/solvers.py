@@ -36,6 +36,7 @@ class LinearProblemBlock(pyadjoint.Block):
     """
 
     _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _tlm_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
     _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
 
     # 2. Overload for the SCALAR case
@@ -102,7 +103,8 @@ class LinearProblemBlock(pyadjoint.Block):
         self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
 
-        # Collect all arguments in variational forms and replace them with similar once that is based on a mixed functionspace.
+        # Collect all arguments in variational forms and replace them with similar
+        # once that is based on a mixed functionspace.
         if not isinstance(a, ufl.Form):
             # Get all arguments from the RHS and LHS forms
             trial_functions = len(a) * [None]
@@ -114,20 +116,25 @@ class LinearProblemBlock(pyadjoint.Block):
                         trial_functions[j] = aij.arguments()[1]
             assert all(tf is not None for tf in trial_functions), "Not all trial functions were found."
             assert all(tf is not None for tf in test_functions), "Not all test functions were found."
-            trial_parts = [tf.part() for tf in trial_functions]
-            test_parts = [tf.part() for tf in test_functions]
+            trial_parts = [tf.part() for tf in trial_functions]  # type: ignore
+            test_parts = [tf.part() for tf in test_functions]  # type: ignore
+            assert isinstance(a, typing.MutableSequence)
             if any(tp is None for tp in trial_parts) or any(tp is None for tp in test_parts):
-                replace_map = {}
+                replace_map: dict[ufl.Argument, ufl.Argument] = {}
                 for i, tf in enumerate(trial_functions):
-                    new_tf = ufl.TrialFunction(tf.ufl_function_space(), i)
+                    assert tf is not None
+                    new_tf = ufl.TrialFunction(tf.ufl_function_space(), part=i)
                     replace_map[tf] = new_tf
                 for i, tf in enumerate(test_functions):
-                    new_tf = ufl.TestFunction(tf.ufl_function_space(), i)
+                    assert tf is not None
+                    new_tf = ufl.TestFunction(tf.ufl_function_space(), part=i)
                     replace_map[tf] = new_tf
                 for i, ai in enumerate(a):
                     for j, aij in enumerate(ai):
                         if aij is not None:
-                            a[i][j] = ufl.replace(aij, replace_map)
+                            assert isinstance(ai, typing.MutableSequence)
+                            ai[j] = ufl.replace(aij, replace_map)
+                assert isinstance(L, typing.MutableSequence)
                 for i, Li in enumerate(L):
                     if Li is not None:
                         L[i] = ufl.replace(Li, replace_map)
@@ -294,7 +301,7 @@ class LinearProblemBlock(pyadjoint.Block):
         if isinstance(form, ufl.Form):
             return ufl.replace(form, replace_map)
         elif isinstance(form, typing.Iterable):
-            replaced_forms = []
+            replaced_forms: typing.MutableSequence[ufl.Form] = []
             for f in form:
                 if f is None:
                     replaced_forms.append(None)
@@ -303,6 +310,8 @@ class LinearProblemBlock(pyadjoint.Block):
                 else:
                     replaced_forms.append(ufl.replace(f, replace_map))
             return replaced_forms
+        else:
+            raise TypeError(f"Cannot replace coefficients in form of type {type(form)}")
 
     def prepare_recompute_component(self, inputs, relevant_outputs):
         """Prepare for recomputing the block with different control inputs."""
@@ -348,13 +357,18 @@ class LinearProblemBlock(pyadjoint.Block):
         return solution
 
     def recompute_component(
-        self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
-    ) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
+        self,
+        inputs: typing.Iterable[Function],
+        block_variable,
+        idx: int,
+        prepared: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
+    ) -> dolfinx.fem.Function:
         """Recompute the block with the prepared linear problem."""
         if isinstance(prepared, dolfinx.fem.Function):
             assert idx == 0
             return prepared
         else:
+            assert isinstance(prepared, typing.Iterable)
             return prepared[idx]
 
     def _should_compute_boundary_adjoint(
@@ -440,6 +454,7 @@ class LinearProblemBlock(pyadjoint.Block):
             self._tlm_solver = self.construct_tlm_solver()
         # Even if the solver is cached, we need to replace the form, as the output from pyadjoint
         # is stored in a new function.
+        assert isinstance(self._tlm_solver, LinearAdjointProblem)
         self._tlm_solver._a = dolfinx.fem.form(
             self._compute_residual_derivative(),
             jit_options=self._jit_options,
@@ -519,6 +534,7 @@ class LinearProblemBlock(pyadjoint.Block):
         if isinstance(self._tlm_solutions, list):
             return self._tlm_solutions[idx]
         else:
+            assert isinstance(self._tlm_solutions, dolfinx.fem.Function)
             return self._tlm_solutions
 
     def prepare_evaluate_adj(
@@ -823,6 +839,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
 
     _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
     _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _tlm_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
     _rhs: ufl.Form | typing.Sequence[ufl.Form]
 
     @typing.overload
@@ -906,10 +923,12 @@ class NonlinearProblemBlock(pyadjoint.Block):
         try:
             u_list = self._u if isinstance(self._u, list) else [self._u]
             if self._lhs is not None:
+                assert isinstance(self._lhs, ufl.Form)
                 for c in self._lhs.coefficients():
                     if c not in u_list:  # Exclude unknown
                         self.add_dependency(c, no_duplicates=True)
             if self._rhs is not None:
+                assert isinstance(self._rhs, ufl.Form)
                 for c in self._rhs.coefficients():
                     if c not in u_list:  # Exclude unknown
                         self.add_dependency(c, no_duplicates=True)
@@ -1082,6 +1101,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             for i, f_i in enumerate(tmp_form):
                 for j, form_ij in enumerate(f_i):
                     adj_form[j][i] = form_ij
+            return adj_form
 
     def _compute_residual(self) -> typing.Union[ufl.Form, list[ufl.Form]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where

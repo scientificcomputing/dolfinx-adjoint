@@ -1,4 +1,3 @@
-
 from mpi4py import MPI
 
 import basix.ufl
@@ -26,11 +25,21 @@ def test_solver(use_mixed_space: bool, mesh_2D):
     V = dolfinx.fem.functionspace(mesh, el_u)
     Q = dolfinx.fem.functionspace(mesh, el_p)
     dx = ufl.Measure("dx", domain=mesh)
-    a00 = lambda u, v: ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
-    a01 = lambda p, v: ufl.inner(p, ufl.div(v)) * dx
-    a10 = lambda q, u: ufl.inner(q, ufl.div(u)) * dx
-    L0 = lambda f, v: ufl.inner(f, v) * dx
-    L1 = lambda mesh, q: dolfinx.fem.Constant(mesh, 0.0) * q * dx
+
+    def a00(u, v):
+        return ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
+
+    def a01(p, v):
+        return ufl.inner(p, ufl.div(v)) * dx
+
+    def a10(q, u):
+        return ufl.inner(q, ufl.div(u)) * dx
+
+    def L0(f, v):
+        return ufl.inner(f, v) * dx
+
+    def L1(mesh, q):
+        return dolfinx.fem.Constant(mesh, 0.0) * q * dx
 
     Z = dolfinx.fem.functionspace(mesh, ("DG", 0, (mesh.geometry.dim,)))
     f = Function(Z, name="control")
