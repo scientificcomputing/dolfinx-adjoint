@@ -133,8 +133,18 @@ with pyadjoint.stop_annotating():
     print("\n=== 1. Taylor Test at NON-ZERO Control Point ===")
     min_val_pert = pyadjoint.taylor_test(rf, m_pert, h)
     print(f"Convergence rate at perturbed point: {min_val_pert:.4f}")
+    rf(m_pert)
+    print("\n=== 2. Second order taylor test at NON-ZERO Control Point ===")
+    dJdm = sum(drfi._ad_dot(hi) for drfi, hi in zip(rf.derivative(), h, strict=True))
 
-    print("\n=== 2. Direct Finite Difference Gradient Verification ===")
+    H = rf.hessian([hi.control for hi in h])
+
+    # 2. Iterate and sum the Hessian dot products piecewise
+    dHddu = sum(Hi._ad_dot(hi) for Hi, hi in zip(H, h, strict=True))
+    min_val = pyadjoint.taylor_test(rf, m_pert, h, dJdm=dJdm, Hm=dHddu)
+    print(f"Convergence rate at perturbed point with Hessian: {min_val:.4f}")
+
+    print("\n=== 3. Direct Finite Difference Gradient Verification ===")
     eps = 1e-6
 
     # Compute Adjoint Directional Derivative at m_pert
@@ -163,6 +173,9 @@ with pyadjoint.stop_annotating():
     print(f"Relative Mismatch:                 {rel_diff:.4e}")
 
     assert rel_diff < 1e-4, f"Adjoint gradient mismatches finite differences! Relative error: {rel_diff}"
+
+# Reset to ensure that we are at the original control point for the optimization
+rf(list(ctrls.values()))
 
 tape = pyadjoint.get_working_tape()
 tape.visualise_dot("test.dot")
