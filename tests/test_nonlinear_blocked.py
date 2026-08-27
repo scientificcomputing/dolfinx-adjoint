@@ -55,11 +55,12 @@ def test_unblocked_nonlinear(mesh_2D):
     dm = Function(V)
     dm.interpolate(lambda x: 100 * np.sin(x[0] * np.pi))
 
-    # 1. Gradient Taylor Test
+    min_rate_pert = pyadjoint.taylor_test(Jh, m0, dm, dJdm=0)
+    assert np.isclose(min_rate_pert, 1.0, rtol=1e-1, atol=1e-1), f"Perturbation rate failed: {min_rate_pert}"
+
     min_rate_grad = pyadjoint.taylor_test(Jh, m0, dm, dJdm=0)
     assert np.isclose(min_rate_grad, 2.0, rtol=1e-1, atol=1e-1), f"Grad rate failed: {min_rate_grad}"
 
-    # 2. Hessian Taylor Test
     Jh(m0)
     dJ = Jh.derivative()._ad_dot(dm)
     H = Jh.hessian(dm)._ad_dot(dm)

@@ -931,6 +931,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
 
         self._J = J
         self._P = P
+
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
         else:
@@ -984,8 +985,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
                 if hasattr(bc, "block_variable"):
                     self.add_dependency(bc, no_duplicates=True)
 
-        # Build Nonlinear Forward Solver
-        self._forward_problem = dolfinx.fem.petsc.NonlinearProblem(
+        # Build Nonlinear Forward Solver using native SNES context
+        self._forward_solver = dolfinx.fem.petsc.NonlinearProblem(
             F=self._F,
             u=self._u,
             bcs=self._bcs,
@@ -998,6 +999,9 @@ class NonlinearProblemBlock(pyadjoint.Block):
             petsc_options_prefix=self._petsc_options_prefix,
             petsc_options=self._petsc_options,
         )
+
+        self._kind = "nest" if self._forward_solver.A.getType() == "nest" else kind
+
         if isinstance(self._u, dolfinx.fem.Function):
             self._adjoint_solutions = self._u.copy()
             self._second_adjoint_solutions = self._u.copy()
@@ -1010,17 +1014,44 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # Initialize Adjoint Solver matching the architecture of the Linear problem
         self._adjoint_solver = LinearAdjointProblem(
             self._compute_adjoint(self._J),
-            self._F,  # Dummy RHS for initialization
+            self._F,  # Dummy RHS for initialization formatting
             bcs=self._bcs,
             u=self._adjoint_solutions,
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
             petsc_options=self._adjoint_petsc_options,
             petsc_options_prefix=self._petsc_options_prefix,
-            kind=kind,
+            kind=self._kind,
             entity_maps=self._entity_maps,
         )
         self._tlm_solver = None
+
+    def _recover_bcs(self):
+        bcs = []
+        for block_variable in self.get_dependencies():
+            c = block_variable.output
+            c_rep = block_variable.saved_output
+
+            if isinstance(c, dolfinx.fem.DirichletBC):
+                bcs.append(c_rep)
+        return bcs
+
+    def construct_tlm_solver(self):
+        dFdu_form = self._compute_residual_derivative()
+        tlm_solver = LinearAdjointProblem(
+            dFdu_form,
+            self._F,  # Dummy RHS
+            bcs=self._bcs,
+            u=self._tlm_solutions,
+            P=self._P,
+            form_compiler_options=self._form_compiler_options,
+            jit_options=self._jit_options,
+            petsc_options=self._tlm_petsc_options,
+            petsc_options_prefix=self._petsc_options_prefix,
+            kind=self._kind,
+            entity_maps=self._entity_maps,
+        )
+        return tlm_solver
 
     def _create_replace_map(self, form: ufl.Form | typing.Iterable[ufl.Form] | None) -> dict[Function, Function]:
         replace_map = {}
@@ -1054,37 +1085,25 @@ class NonlinearProblemBlock(pyadjoint.Block):
             return replaced_forms
 
     def prepare_recompute_component(self, inputs, relevant_outputs):
-        # 1. Restore the initial guess for the Newton solver
-        u_list = [self._u] if isinstance(self._u, dolfinx.fem.Function) else self._u
+        """Prepare for recomputing the block with different control inputs."""
+
+        # 1. Update coefficients IN-PLACE.
+        # This dynamically updates the evaluation of F and J without triggering FFCx recompilation
         for block_variable in self.get_dependencies():
             coeff = block_variable.output
-            if coeff in u_list:
+            if isinstance(coeff, dolfinx.fem.Function):
                 coeff.x.array[:] = block_variable.saved_output.x.array[:]
                 coeff.x.scatter_forward()
 
-        # 2. Re-compile forms with checkpointed coefficients
-        replaced_F = self._replace_coefficients_in_form(self._F)
-        replaced_J = self._replace_coefficients_in_form(self._J)
+        # 2. Warm-start the initial guess identically to the original forward pass
+        u_list = self._u if isinstance(self._u, list) else [self._u]
+        for idx, out_bv in relevant_outputs:
+            u_list[idx].x.array[:] = out_bv.saved_output.x.array[:]
+            u_list[idx].x.scatter_forward()
 
-        compiled_F = dolfinx.fem.form(
-            replaced_F,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        compiled_J = dolfinx.fem.form(
-            replaced_J,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-
-        self._forward_problem._L = compiled_F
-        self._forward_problem._a = compiled_J
-        self._forward_problem.bcs = self._bcs
-
+        # 3. Solve the nonlinear system seamlessly utilizing the updated array memory
         with pyadjoint.stop_annotating():
-            self._forward_problem.solve()
+            self._forward_solver.solve()
 
         return self._u
 
@@ -1117,22 +1136,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         """J is the residual derivative. Map coefficients to saved memory."""
         replacement_map = self._create_replace_map(self._J)
         return ufl.replace(self._J, replacement_map)
-
-    def construct_tlm_solver(self):
-        dFdu_form = self._compute_residual_derivative()
-        tlm_solver = LinearAdjointProblem(
-            dFdu_form,
-            self._F,  # Dummy RHS
-            bcs=self._bcs,
-            u=self._tlm_solutions,
-            form_compiler_options=self._form_compiler_options,
-            jit_options=self._jit_options,
-            petsc_options=self._tlm_petsc_options,
-            petsc_options_prefix=self._petsc_options_prefix,
-            kind=self._kind,
-            entity_maps=self._entity_maps,
-        )
-        return tlm_solver
 
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
@@ -1272,8 +1275,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
         part = idx if isinstance(self._u, list) else None
         dc = ufl.TrialFunction(c_rep.function_space, part=part)
 
-        # UFL automatically handles list extraction safely
-        dFdm = -ufl.derivative(sum_form(residual), c_rep, dc)
+        sum_res = sum_form(residual)
+        dFdm = -ufl.derivative(sum_res, c_rep, dc)
 
         if dFdm.empty():
             dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))
@@ -1302,7 +1305,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         dFdu_form = self._compute_residual_derivative()
         dFdu_adj = self._compute_adjoint(dFdu_form)
 
-        # Nonlinear addition: Keep d2Fdu2 term
+        # Nonlinear addition: Keep d2Fdu2 term for the Hessian
         if isinstance(dFdu_form, tuple) or isinstance(dFdu_form, list):
             unknowns = [output.saved_output for output in outputs]
             summed_form = sum_form(dFdu_form)
@@ -1455,8 +1458,9 @@ class NonlinearProblemBlock(pyadjoint.Block):
             raise NotImplementedError(f"Hessian computation for {type(c)} not implemented yet.")
 
         dc = ufl.TestFunction(c.function_space)
-        form_adj = ufl.action(sum_form(F_form), adj_sol)
-        form_adj2 = ufl.action(sum_form(F_form), adj_sol2)
+        F_summed = sum_form(F_form)
+        form_adj = ufl.action(F_summed, adj_sol)
+        form_adj2 = ufl.action(F_summed, adj_sol2)
 
         dFdm_adj = ufl.derivative(form_adj, c_rep, dc)
         dFdm_adj2 = ufl.derivative(form_adj2, c_rep, dc)
