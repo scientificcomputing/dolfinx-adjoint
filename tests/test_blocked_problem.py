@@ -101,3 +101,14 @@ def test_solver(use_mixed_space: bool, mesh_2D):
     dHddu = hessian._ad_dot(e)
     min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
     assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+    z = Function(Z)
+    z.interpolate(lambda x: (np.sin(x[1]), -(x[0] ** 2)))
+    f = Function(Z)
+    f.interpolate(lambda x: (1e4 * x[0], 1e5 * np.sin(x[1])))
+    Jh(z)
+    dJdm = Jh.derivative()._ad_dot(f)
+    hessian = Jh.hessian(f)
+    dHddu = hessian._ad_dot(f)
+    min_rate = pyadjoint.taylor_test(Jh, z, f, dJdm=dJdm, Hm=dHddu)
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
