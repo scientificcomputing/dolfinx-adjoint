@@ -330,7 +330,6 @@ class LinearProblemBlock(pyadjoint.Block):
             self._compute_adjoint(sum_form(self._lhs)),  # type: ignore[arg-type]
             self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._adjoint_solutions,  # type: ignore[arg-type]
             P=self._preconditioner,  # type: ignore[arg-type]
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
@@ -470,6 +469,12 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver.bcs = self._bcs
         self._forward_solver._u = self._u
 
+        # Clear solution vector
+        if isinstance(self._u, dolfinx.fem.Function):
+            self._u.x.array[:] = 0.0
+        else:
+            for ui in self._u:
+                ui.x.array[:] = 0.0
         # 4. Solve forward state while halting annotation
         with pyadjoint.stop_annotating():
             self._forward_solver.solve()
@@ -567,10 +572,10 @@ class LinearProblemBlock(pyadjoint.Block):
         )
         #  Build RHS (dFdm) for the monolithic system
         if isinstance(self._u, list):
-            test_funcs = get_sorted_arguments(sum_form(self._rhs).arguments(), 0)
+            test_funcs = get_sorted_arguments(F_form.arguments(), 0)
             dFdm = sum([ufl.ZeroBaseForm((test,)) for test in test_funcs])
         else:
-            test_funcs = [self._rhs.arguments()[0]]
+            test_funcs = [F_form.arguments()[0]]
             dFdm = ufl.ZeroBaseForm((test_funcs[0],))
 
         for block_variable in self.get_dependencies():
@@ -688,8 +693,12 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         self._adjoint_solver._a = compiled_dFdu
-        self._adjoint_solver._u = self._adjoint_solutions  # type: ignore[assignment]
         self._adjoint_solver.solve()
+        if isinstance(self._adjoint_solutions, list):
+            for adj_sol, sol in zip(self._adjoint_solutions, self._adjoint_solver.u):
+                adj_sol.x.array[:] = sol.x.array[:]
+        else:
+            self._adjoint_solutions.x.array[:] = self._adjoint_solver.u.x.array[:]
         return F_form, replacement_map
 
     def evaluate_adj_component(
@@ -827,6 +836,7 @@ class LinearProblemBlock(pyadjoint.Block):
             b = self._adjoint_solver._b
             local_arrays = [bi.array[: bi.index_map.size_local * bi.block_size] for bi in bs]
             dolfinx.la.petsc.assign(local_arrays, b)
+            b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
@@ -838,8 +848,13 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Solve adjoint problem
         self._adjoint_solver._a = dFdu_adj
-        self._adjoint_solver._u = self._second_adjoint_solutions
         self._adjoint_solver.solve()
+        if isinstance(self._second_adjoint_solutions, list):
+            for adj_sol, sol in zip(self._second_adjoint_solutions, self._adjoint_solver.u):
+                adj_sol.x.array[:] = sol.x.array[:]
+        else:
+            self._second_adjoint_solutions.x.array[:] = self._adjoint_solver.u.x.array[:]
+
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
 
     def evaluate_hessian_component(
@@ -1094,7 +1109,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             dFdu_adj,  # type: ignore[arg-type]
             self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
-            u=self._adjoint_solutions,  # type: ignore[arg-type]
             P=self._preconditioner,  # type: ignore[arg-type]
             form_compiler_options=self._form_compiler_options,
             jit_options=self._jit_options,
@@ -1339,8 +1353,12 @@ class NonlinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         self._adjoint_solver._a = compiled_dFdu
-        self._adjoint_solver._u = self._adjoint_solutions  # type: ignore[assignment]
         self._adjoint_solver.solve()
+        if isinstance(self._adjoint_solutions, list):
+            for adj_sol, sol in zip(self._adjoint_solutions, self._adjoint_solver.u):
+                adj_sol.x.array[:] = sol.x.array[:]
+        else:
+            self._adjoint_solutions.x.array[:] = self._adjoint_solver.u.x.array[:]
         return F_form
 
     def evaluate_adj_component(
@@ -1437,6 +1455,11 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._adjoint_solver._a = dFdu_adj
         self._adjoint_solver._u = self._second_adjoint_solutions
         self._adjoint_solver.solve()
+        if isinstance(self._second_adjoint_solutions, list):
+            for adj_sol, sol in zip(self._second_adjoint_solutions, self._adjoint_solver.u):
+                adj_sol.x.array[:] = sol.x.array[:]
+        else:
+            self._second_adjoint_solutions.x.array[:] = self._adjoint_solver.u.x.array[:]
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
 
     def evaluate_hessian_component(

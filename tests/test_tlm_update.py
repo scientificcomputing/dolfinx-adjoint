@@ -106,7 +106,7 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
     m1.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
     m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
     h = Function(Z)
-    h.interpolate(lambda x: 0.3 + 0.2 * np.sin(3 * x[0]))
+    h.interpolate(lambda x: 10.0 + 3.2 * np.sin(3 * x[0]))
 
     if warm_up_at_another_point:
         Jh(m1)
@@ -119,3 +119,57 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
 
     min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
     assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+
+def test_hessian_mpi_breakdown(mesh_2D):
+    pyadjoint.get_working_tape().clear_tape()
+    Jh, Z = _viscous_stokes(mesh_2D)
+
+    m1, m2 = Function(Z), Function(Z)
+    m1.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    h = Function(Z)
+    h.interpolate(lambda x: 3.0 + 2.0 * np.sin(3 * x[0]))
+
+    # === COLD START ===
+    J_cold = float(Jh(m2))
+    dJ_cold = Jh.derivative()
+    H_cold = Jh.hessian(h)
+
+    # Extract underlying FEniCSx arrays securely
+    dJ_cold_array = dJ_cold.x.array.copy() if hasattr(dJ_cold, "x") else dJ_cold.array.copy()
+    H_cold_array = H_cold.x.array.copy() if hasattr(H_cold, "x") else H_cold.array.copy()
+
+    # === WARM START (Pollution check) ===
+    Jh(m1)
+    Jh.derivative()
+    Jh.hessian(h)
+
+    J_warm = float(Jh(m2))
+    dJ_warm = Jh.derivative()
+    H_warm = Jh.hessian(h)
+
+    dJ_warm_array = dJ_warm.x.array if hasattr(dJ_warm, "x") else dJ_warm.array
+    H_warm_array = H_warm.x.array if hasattr(H_warm, "x") else H_warm.array
+
+    # === ASSERTIONS ===
+
+    comm = mesh_2D.comm
+    rank = comm.rank
+
+    # 1. Forward State Check
+    assert np.isclose(J_cold, J_warm), f"Rank {rank}: Forward evaluation J(m2) differs!"
+
+    # 2. Gradient Check
+    grad_diff = np.linalg.norm(dJ_cold_array - dJ_warm_array)
+    assert grad_diff < 1e-10, f"Rank {rank}: Gradient differs after warm up! Diff: {grad_diff}"
+
+    # 3. Hessian Check
+    hess_diff = np.linalg.norm(H_cold_array - H_warm_array)
+    assert hess_diff < 1e-10, f"Rank {rank}: Hessian differs after warm up! Diff: {hess_diff}"
+
+    # 4. If arrays match, run Taylor test
+    dJdm = dJ_warm._ad_dot(h)
+    Hm = H_warm._ad_dot(h)
+    min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected 3.0, got {min_rate}"
