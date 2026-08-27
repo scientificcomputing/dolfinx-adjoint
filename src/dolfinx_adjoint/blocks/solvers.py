@@ -19,9 +19,15 @@ type NestedMutableSequence[T] = T | typing.MutableSequence["NestedMutableSequenc
 type NestedSequence[T] = T | typing.Sequence["NestedSequence[T]"]
 
 
+@typing.overload
+def assign_mixed_parts[T: NestedSequence[ufl.Form]](form1: T, /) -> T: ...
+@typing.overload
+def assign_mixed_parts[T: NestedSequence[ufl.Form], S: NestedSequence[ufl.Form]](
+    form1: T, form2: S, /
+) -> tuple[T, S]: ...
 def assign_mixed_parts(
-    *form_structs: typing.Sequence[NestedSequence[ufl.Form]],
-) -> typing.Sequence[NestedSequence[ufl.Form]]:
+    *form_structs: NestedSequence[ufl.Form],
+) -> NestedSequence[ufl.Form] | tuple[NestedSequence[ufl.Form], ...]:
     """
     Recursively assigns mixed-space `part` indices to UFL Test and Trial functions
     within nested iterables of forms.
@@ -212,7 +218,8 @@ class LinearProblemBlock(pyadjoint.Block):
         # once that is based on a mixed functionspace.
         if not isinstance(a, ufl.Form):
             a, L = assign_mixed_parts(a, L)
-            P, _ = assign_mixed_parts(P, L) if P is not None else None, None
+            if P is not None:
+                P, _ = assign_mixed_parts(P, L)
 
         self._lhs = a
         self._rhs = L
@@ -237,6 +244,8 @@ class LinearProblemBlock(pyadjoint.Block):
         # To ensure that the solver can be recycled in time dependent loops, the unknown is also added as a dependency
         # if present in the form.
         if isinstance(self._u, dolfinx.fem.Function):
+            assert isinstance(self._lhs, ufl.Form)
+            assert isinstance(self._rhs, ufl.Form)
             if self._u in self._lhs.coefficients() or self._u in self._rhs.coefficients():
                 raise RuntimeError("The unknown function u should not be present in the variational forms a or L.")
             for c in self._lhs.coefficients():
@@ -393,8 +402,14 @@ class LinearProblemBlock(pyadjoint.Block):
             replace_map[coeff] = val
         return replace_map
 
+    @typing.overload
     def _replace_form_coefficients_recompute(
-        self, form: ufl.Form | NestedMutableSequence[ufl.Form] | None, replace_map: dict
+        self, form: ufl.Form | NestedSequence[ufl.Form], replace_map: dict
+    ) -> ufl.Form | NestedMutableSequence[ufl.Form | None]: ...
+    @typing.overload
+    def _replace_form_coefficients_recompute(self, form: None, replace_map: dict) -> None: ...
+    def _replace_form_coefficients_recompute(
+        self, form: ufl.Form | NestedSequence[ufl.Form] | None, replace_map: dict
     ) -> ufl.Form | NestedMutableSequence[ufl.Form | None] | None:
         """Recursively replace form coefficients for scalar or blocked form structures."""
         if form is None:
@@ -426,20 +441,20 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # 2. Recompile UFL forms with candidate inputs
         compiled_lhs = dolfinx.fem.form(
-            lhs,
+            lhs,  # type: ignore[arg-type]
             jit_options=self._jit_options,
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
         )
         compiled_rhs = dolfinx.fem.form(
-            rhs,
+            rhs,  # type: ignore[arg-type]
             jit_options=self._jit_options,
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
         )
         compiled_preconditioner = (
             dolfinx.fem.form(
-                preconditioner,
+                preconditioner,  # type: ignore[arg-type]
                 jit_options=self._jit_options,
                 form_compiler_options=self._form_compiler_options,
                 entity_maps=self._entity_maps,
@@ -451,7 +466,7 @@ class LinearProblemBlock(pyadjoint.Block):
         # 3. Hot-swap solver forms
         self._forward_solver._a = compiled_lhs
         self._forward_solver._L = compiled_rhs
-        self._forward_solver._P = compiled_preconditioner
+        self._forward_solver._preconditioner = compiled_preconditioner
         self._forward_solver.bcs = self._bcs
         self._forward_solver._u = self._u
 
@@ -494,7 +509,7 @@ class LinearProblemBlock(pyadjoint.Block):
         """
         return ufl.extract_blocks(compute_form_adjoint(form))
 
-    def _compute_residual(self) -> tuple[ufl.Form, dict[ufl.Coefficient, ufl.Coefficient]]:
+    def _compute_residual(self) -> tuple[ufl.Form, dict[Function, Function]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where
         :math:`u_b` is the solution of the forward problem at the current time and all coefficients are updated.
         """
@@ -631,7 +646,7 @@ class LinearProblemBlock(pyadjoint.Block):
         inputs: typing.Sequence[Function],
         adj_inputs: typing.Sequence[dolfinx.la.Vector],
         relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]],
-    ) -> tuple[ufl.Form, dict[ufl.Coefficient, ufl.Coefficient]]:
+    ) -> tuple[ufl.Form, dict[Function, Function]]:
         """Prepare the block for evaluating the adjoint."""
 
         # Extract dJ/du[v] from the adjoint inputs.
@@ -656,7 +671,7 @@ class LinearProblemBlock(pyadjoint.Block):
                 else:
                     arrs.append(adj_rhs.array[:local_size])
             dolfinx.la.petsc.assign(arrs, dJdu)
-            dJdu.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+            dJdu.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)  # type: ignore[arg-type]
 
         # Compute (dF/du[v])* for the linear problem.
         F_form, replacement_map = self._compute_residual()
@@ -683,14 +698,14 @@ class LinearProblemBlock(pyadjoint.Block):
         adj_inputs: typing.Iterable[dolfinx.la.Vector],
         block_variable: pyadjoint.block_variable.BlockVariable,
         idx: int,
-        prepared: tuple[ufl.Form, dict[ufl.Coefficient, ufl.Coefficient]],
+        prepared: tuple[ufl.Form, dict[Function, Function]],
     ) -> _SpecialVector:
         """Evaluate the adjoint component, i.e. :math:`\\frac{\\partial F}{\\partial m}`."""
 
         residual, replacement_map = prepared
         c = block_variable.output
         c_rep = block_variable.saved_output
-        if isinstance(c, dolfinx.fem.Function):
+        if isinstance(c, Function):
             # Need some clever construction of the TrialFunction to get a part of the mixed space
             part = idx if isinstance(self._u, list) else None
             dc = ufl.TrialFunction(c_rep.function_space, part=part)
@@ -704,7 +719,7 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdm = -ufl.derivative(sum_res, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
-            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))  # type: ignore[call-overload]
+            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))  # type: ignore[arg-type]
 
         dFdm_adj = ufl.adjoint(dFdm)
         sensitivity = ufl.action(dFdm_adj, self._adjoint_solutions)
