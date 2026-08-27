@@ -233,27 +233,36 @@ class LinearProblemBlock(pyadjoint.Block):
             self._u = [pyadjoint.create_overloaded_object(ui) for ui in u]
 
         # NOTE: Add mesh and constants as dependencies later on
+
+        # To ensure that the solver can be recycled in time dependent loops, the unknown is also added as a dependency
+        # if present in the form.
         if isinstance(self._u, dolfinx.fem.Function):
-            for c in self._lhs.coefficients():  # type: ignore
-                if c != self._u:  # Exclude the unknown
-                    self.add_dependency(c, no_duplicates=True)
-            for c in self._rhs.coefficients():  # type: ignore
-                if c != self._u:  # Exclude the unknown
-                    self.add_dependency(c, no_duplicates=True)
+            if self._u in self._lhs.coefficients() or self._u in self._rhs.coefficients():
+                raise RuntimeError("The unknown function u should not be present in the variational forms a or L.")
+            for c in self._lhs.coefficients():
+                self.add_dependency(c, no_duplicates=True)
+            for c in self._rhs.coefficients():
+                self.add_dependency(c, no_duplicates=True)
         elif isinstance(self._u, typing.Iterable):
             for Ai in self._lhs:  # type: ignore
                 for Aij in Ai:
                     if Aij is not None:
                         assert isinstance(Aij, ufl.Form)
                         for c in Aij.coefficients():
-                            if c not in self._u:
-                                self.add_dependency(c, no_duplicates=True)
-            for i, part in enumerate(self._rhs):  # type: ignore
+                            if c in self._u:
+                                raise RuntimeError(
+                                    "The unknown function u should not be present in the variational forms a or L."
+                                )
+                            self.add_dependency(c, no_duplicates=True)
+            for part in self._rhs:  # type: ignore
                 for c in part.coefficients():
-                    if c not in self._u:
-                        self.add_dependency(c, no_duplicates=True)
+                    if c in self._u:
+                        raise RuntimeError(
+                            "The unknown function u should not be present in the variational forms a or L."
+                        )
+                    self.add_dependency(c, no_duplicates=True)
         else:
-            raise NotImplementedError("Blocked systems not implemented yet.")
+            raise RuntimeError(f"Unknown type for unknown function u={type(self._u)}.")
         self._compiled_lhs = dolfinx.fem.form(
             self._lhs,
             jit_options=jit_options,
@@ -354,6 +363,16 @@ class LinearProblemBlock(pyadjoint.Block):
         """Replace dependencies with latest checkpoint."""
         replace_map = {}
         for block_variable in self.get_dependencies():
+            coeff = block_variable.output
+            if isinstance(form, ufl.Form):
+                if coeff in form.coefficients():
+                    replace_map[coeff] = block_variable.saved_output
+            elif form is None:
+                return {}
+            else:
+                for f in form:
+                    replace_map.update(self._create_replace_map(f))
+        for block_variable in self.get_outputs():
             coeff = block_variable.output
             if isinstance(form, ufl.Form):
                 if coeff in form.coefficients():
@@ -466,7 +485,7 @@ class LinearProblemBlock(pyadjoint.Block):
         """
         return ufl.extract_blocks(compute_form_adjoint(form))
 
-    def _compute_residual(self) -> ufl.Form:
+    def _compute_residual(self) -> tuple[ufl.Form, dict[ufl.Coefficient, ufl.Coefficient]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where
         :math:`u_b` is the solution of the forward problem at the current time and all coefficients are updated.
         """
@@ -481,27 +500,28 @@ class LinearProblemBlock(pyadjoint.Block):
         F_form = ufl.action(summed_form, r_funcs) - sum_form(self._rhs)
         replacement_map = self._create_replace_map(F_form)
         F_form = ufl.replace(F_form, replacement_map)
-        return F_form
+        return F_form, replacement_map
 
     def _compute_residual_derivative(self) -> typing.Union[ufl.Form, list[list[ufl.Form]]]:
         """Compute the derivative of the residual with respect to the outputs."""
 
-        F_form = self._compute_residual()
-        outputs = [output.saved_output for output in self.get_outputs()]
+        F_form, replacement_map = self._compute_residual()
         assert isinstance(F_form, ufl.Form), "Residual form must be a single UFL form."
+        outputs = self.get_outputs()
+        r_funcs = [replacement_map[r.saved_output] for r in outputs]
         test_functions = get_sorted_arguments(F_form.arguments(), 0)
         trial_functions = [
             ufl.TrialFunction(output.function_space, part=arg.part())
-            for arg, output in zip(test_functions, outputs, strict=True)
+            for arg, output in zip(test_functions, r_funcs, strict=True)
         ]
-        dFdu = ufl.derivative(F_form, outputs, trial_functions)
+        dFdu = ufl.derivative(F_form, r_funcs, trial_functions)
         return ufl.extract_blocks(dFdu)
 
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
     ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
 
-        F_form = self._compute_residual()
+        F_form, replacement_map = self._compute_residual()
         if self._tlm_solver is None:
             self._tlm_solver = self.construct_tlm_solver()
         # Even if the solver is cached, we need to replace the form, as the output from pyadjoint
@@ -526,7 +546,7 @@ class LinearProblemBlock(pyadjoint.Block):
             c_rep = block_variable.saved_output
             if tlm_value is None:
                 continue
-
+            assert c_rep in replacement_map.values()
             # Accumulate sensitivities across all block components
             dFdm += ufl.derivative(-F_form, c_rep, tlm_value)
 
@@ -594,14 +614,9 @@ class LinearProblemBlock(pyadjoint.Block):
         inputs: typing.Sequence[Function],
         adj_inputs: typing.Sequence[dolfinx.la.Vector],
         relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]],
-    ) -> ufl.Form:
+    ) -> tuple[ufl.Form, dict[ufl.Coefficient, ufl.Coefficient]]:
         """Prepare the block for evaluating the adjoint."""
 
-        # Compute (dF/du[v])* for the linear problem.
-        F_form = self._compute_residual()
-        dFdu = self._compute_residual_derivative()
-        summed = sum_form(dFdu)
-        dFdu_adj = compute_form_adjoint(summed)
         # Extract dJ/du[v] from the adjoint inputs.
         if len(adj_inputs) == 1:
             adj_rhs = adj_inputs[0]
@@ -609,7 +624,6 @@ class LinearProblemBlock(pyadjoint.Block):
             with dJdu.localForm() as dJdu_loc, adj_rhs.petsc_vec.localForm() as adj_rhs_loc:
                 dJdu_loc.array[:] = adj_rhs_loc.array[:]
         else:
-            dFdu_adj = ufl.extract_blocks(dFdu_adj)
             assert len(adj_inputs) == len(self.get_outputs()), (
                 f"Expected {len(self.get_outputs())} adjoint inputs, got {len(adj_inputs)})"
             )
@@ -625,7 +639,15 @@ class LinearProblemBlock(pyadjoint.Block):
                 else:
                     arrs.append(adj_rhs.array[:local_size])
             dolfinx.la.petsc.assign(arrs, dJdu)
+            dJdu.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
 
+        # Compute (dF/du[v])* for the linear problem.
+        F_form, replacement_map = self._compute_residual()
+        dFdu = self._compute_residual_derivative()
+        summed = sum_form(dFdu)
+        dFdu_adj = compute_form_adjoint(summed)
+        dFdu_adj = ufl.algorithms.apply_derivatives.apply_derivatives(ufl.algorithms.expand_derivatives(dFdu_adj))
+        assert dFdu_adj.empty() is False, "Adjoint of dF/du[v] is empty. Check if the problem is linear."
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(
             dFdu_adj,  # type: ignore[arg-type]
@@ -636,7 +658,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._adjoint_solver._a = compiled_dFdu
         self._adjoint_solver._u = self._adjoint_solutions  # type: ignore[assignment]
         self._adjoint_solver.solve()
-        return F_form
+        return F_form, replacement_map
 
     def evaluate_adj_component(
         self,
@@ -644,11 +666,11 @@ class LinearProblemBlock(pyadjoint.Block):
         adj_inputs: typing.Iterable[dolfinx.la.Vector],
         block_variable: pyadjoint.block_variable.BlockVariable,
         idx: int,
-        prepared: ufl.Form,
+        prepared: tuple[ufl.Form, dict[ufl.Coefficient, ufl.Coefficient]],
     ) -> _SpecialVector:
         """Evaluate the adjoint component, i.e. :math:`\\frac{\\partial F}{\\partial m}`."""
 
-        residual = prepared
+        residual, replacement_map = prepared
         c = block_variable.output
         c_rep = block_variable.saved_output
         if isinstance(c, dolfinx.fem.Function):
@@ -660,6 +682,8 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Compute the sensitivity of the residual with respect to the parameter
         sum_res = sum_form(residual)
+        assert c in replacement_map.keys()
+        assert c_rep == replacement_map[c]
         dFdm = -ufl.derivative(sum_res, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
@@ -674,7 +698,6 @@ class LinearProblemBlock(pyadjoint.Block):
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
         )
-
         vec = _create_vector(compiled_sensitivity, sensitivity.arguments()[0].ufl_function_space())
         vec.array[:] = 0.0
         assemble_compiled_form(compiled_sensitivity, tensor=vec)
@@ -691,6 +714,7 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdu_form = self._compute_residual_derivative()
 
         # For linear forms d2Fdu2 is zero, but we include it for completeness.
+
         unknowns = [output.saved_output for output in self.get_outputs()]
         summed_form = sum_form(dFdu_form)
         d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
@@ -798,7 +822,7 @@ class LinearProblemBlock(pyadjoint.Block):
     ):
         c = block_variable.output
 
-        F_form, adj_sol, adj_sol2 = prepared
+        (F_form, replacement_map), adj_sol, adj_sol2 = prepared
 
         outputs = self.get_outputs()
         tlm_output = [output.tlm_value for output in outputs]
@@ -834,6 +858,7 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Compute first derivatives (1-forms tested exactly against the single 'dc' object)
         dc = ufl.TestFunction(W)
+        assert c_rep in replacement_map.values()
         dL1dm = ufl.derivative(L1, c_rep, dc)
         dL2dm = ufl.derivative(L2, c_rep, dc)
 

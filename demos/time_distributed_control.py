@@ -23,7 +23,7 @@ t.name = "time"
 d = 16 * x[0] * (x[0] - 1) * x[1] * (x[1] - 1) * ufl.sin(ufl.pi * t)
 
 dt = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.1))  # type: ignore
-T = 0.3
+T = 1
 
 V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))  # type: ignore[arg-type]
 ctrls = OrderedDict()
@@ -41,7 +41,6 @@ def solve_heat(ctrls):
 
     u_prev = dolfinx_adjoint.Function(V, name="u_prev")
     uh = dolfinx_adjoint.Function(V, name="solution")
-    dolfinx_adjoint.assign(0.0, uh)
 
     F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
     a, L = ufl.system(F)
@@ -122,6 +121,10 @@ with pyadjoint.stop_annotating():
     h = [dolfinx_adjoint.Function(ci.function_space) for ci in m]
     for hi in h:
         hi.x.array[:] = np.random.random(hi.x.array.shape)
+
+    # Prove the perturbation is mathematically exact
+    min_val = pyadjoint.taylor_test(rf, list(ctrls.values()), h, dJdm=0)
+    assert np.isclose(min_val, 1.0, rtol=5e-2, atol=1e-5), f"Expected convergence rate close to 1.0, got {min_val}"
 
     # Prove the gradient is mathematically exact
     min_val = pyadjoint.taylor_test(rf, list(ctrls.values()), h)
