@@ -7,6 +7,8 @@ from petsc4py import PETSc
 import dolfinx.fem.petsc
 import pyadjoint
 import ufl
+import numpy as np
+
 from dolfinx.fem.function import Function as _Function
 
 from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
@@ -527,9 +529,8 @@ class LinearProblemBlock(pyadjoint.Block):
         if len(adj_inputs) == 1:
             adj_rhs = adj_inputs[0]
             dJdu = self._adjoint_solver._b
-            with dJdu.localForm() as dJdu_loc:
-                dJdu_loc.set(0.0)
-            dJdu.array_w[:] = adj_rhs.array_r[:].copy()
+            with dJdu.localForm() as dJdu_loc, adj_rhs.localForm() as adj_rhs_loc:
+                dJdu_loc.array[:] = adj_rhs_loc.array[:]
         else:
             dFdu_adj = ufl.extract_blocks(dFdu_adj)
             assert len(adj_inputs) == len(self.get_outputs()), (
@@ -538,7 +539,6 @@ class LinearProblemBlock(pyadjoint.Block):
             dJdu = self._adjoint_solver._b
             with dJdu.localForm() as dJdu_loc:
                 dJdu_loc.set(0.0)
-            import numpy as np
 
             arrs = [
                 np.zeros(output.output.index_map.size_local * output.output.function_space.dofmap.index_map_bs)
@@ -669,7 +669,8 @@ class LinearProblemBlock(pyadjoint.Block):
                 )
                 dolfinx.fem.petsc.assemble_vector(b, compiled_soa_rhs)
                 b.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
-                b.array_w[:] *= -1
+
+                b.scale(-1)
 
             b.array_w[:] += hessian_inputs[0].array
             b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
@@ -686,7 +687,8 @@ class LinearProblemBlock(pyadjoint.Block):
                         [(out_i.function_space.dofmap.index_map, out_i.function_space.dofmap.index_map_bs)]
                     )
                 bs.append(bi)
-                bi.array_w[:] = 0.0
+                with bi.localForm() as bi_loc:
+                    bi_loc.set(0.0)
                 form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[i])
                 if not form_i.empty():
                     compiled_soa_rhs = dolfinx.fem.form(
@@ -697,12 +699,16 @@ class LinearProblemBlock(pyadjoint.Block):
                     )
                     dolfinx.fem.petsc.assemble_vector(bi, compiled_soa_rhs)
                     bi.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
-                    bi.array_w[:] *= -1
+                    bi.scale(-1)
+
                 if hess_input is not None:
-                    bi.array_w[:] += hess_input.array[: len(bi.array_w)]
+                    with bi.localForm() as bi_loc:
+                        bi_loc.array[:] += hess_input.array
                 bi.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
             b = self._adjoint_solver._b
             dolfinx.la.petsc.assign([bi.array_r for bi in bs], b)
+            for bi in bs:
+                bi.destroy()
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
