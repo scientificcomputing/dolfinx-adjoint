@@ -1,4 +1,3 @@
-import typing
 
 from mpi4py import MPI
 

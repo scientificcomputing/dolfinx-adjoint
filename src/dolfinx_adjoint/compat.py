@@ -5,7 +5,6 @@ from ufl.algorithms.map_integrands import map_integrands
 from ufl.algorithms.replace import replace
 from ufl.argument import Argument
 
-
 try:
     from ufl.algorithms.extract_linear_combination import extract_linear_combination
 

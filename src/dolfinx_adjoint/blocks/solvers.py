@@ -5,16 +5,15 @@ import typing
 from petsc4py import PETSc
 
 import dolfinx.fem.petsc
+import numpy as np
 import pyadjoint
 import ufl
-import numpy as np
-
 from dolfinx.fem.function import Function as _Function
 
+from ..compat import compute_form_adjoint
 from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
 from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
-from ..compat import compute_form_adjoint
 
 
 def get_sorted_arguments(arguments: typing.Iterable[ufl.Argument], number: int) -> typing.Iterable[ufl.Argument]:
