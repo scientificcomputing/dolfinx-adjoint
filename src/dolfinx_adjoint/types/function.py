@@ -14,9 +14,9 @@ from pyadjoint.overloaded_type import (
 )
 from pyadjoint.tape import no_annotations
 
+from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
 from ..utils import function_from_vector, gather
-from ..blocks._vector import _vector, _SpecialVector
 
 
 def _create_function(
@@ -87,7 +87,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         return cls(obj.function_space, obj.x, obj.name)
 
     @property
-    def index_map(self) -> dolfinx.cpp.la.IndexMap:
+    def index_map(self) -> dolfinx.cpp.la.IndexMap:  # type: ignore [name-defined]
         """Return the index map of the function's vector."""
         return self.x.index_map
 

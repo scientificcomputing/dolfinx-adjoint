@@ -117,18 +117,7 @@ class LinearProblemBlock(pyadjoint.Block):
                     self.add_dependency(c, no_duplicates=True)
         except AttributeError:
             raise NotImplementedError("Blocked systems not implemented yet.")
-        self._compiled_lhs = dolfinx.fem.form(
-            self._lhs,
-            jit_options=jit_options,
-            form_compiler_options=form_compiler_options,
-            entity_maps=entity_maps,
-        )
-        self._compiled_rhs = dolfinx.fem.form(
-            self._rhs,
-            jit_options=jit_options,
-            form_compiler_options=form_compiler_options,
-            entity_maps=entity_maps,
-        )
+
         # Cache form parameters for later
         # NOTE: Should probably be in a struct
         self._jit_options = jit_options
@@ -762,7 +751,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._adjoint_petsc_options = adjoint_petsc_options
         self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
-        self._lhs = J
         self._preconditioner = P
 
         # Create overloaded functions
@@ -772,7 +760,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             self._u = pyadjoint.create_overloaded_object(u)
             replace_dict = {u: self._u}
             self._rhs = ufl.replace(F, replace_dict)
-            self._lhs = ufl.replace(J, replace_dict) if J is not None else None
+            J = ufl.replace(J, replace_dict) if J is not None else None
             self._preconditioner = ufl.replace(P, replace_dict) if P is not None else None
         else:
             self._u = [pyadjoint.create_overloaded_object(ui) for ui in u]
@@ -783,29 +771,17 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # NOTE: Add mesh and constants as dependencies later on
         try:
             u_list = self._u if isinstance(self._u, list) else [self._u]
-            if self._lhs is not None:
-                for c in self._lhs.coefficients():
+            if J is not None:
+                for c in J.coefficients():  # type: ignore
                     if c not in u_list:  # Exclude unknown
                         self.add_dependency(c, no_duplicates=True)
             if self._rhs is not None:
-                for c in self._rhs.coefficients():
+                for c in self._rhs.coefficients():  # type: ignore
                     if c not in u_list:  # Exclude unknown
                         self.add_dependency(c, no_duplicates=True)
         except AttributeError:
             raise NotImplementedError("Blocked systems not implemented yet.")
 
-        self._compiled_lhs = dolfinx.fem.form(
-            self._lhs,  # type: ignore
-            jit_options=jit_options,
-            form_compiler_options=form_compiler_options,
-            entity_maps=entity_maps,
-        )
-        self._compiled_rhs = dolfinx.fem.form(
-            self._rhs,
-            jit_options=jit_options,
-            form_compiler_options=form_compiler_options,
-            entity_maps=entity_maps,
-        )
         # Cache form parameters for later
         # NOTE: Should probably be in a struct
         self._jit_options = jit_options
@@ -816,7 +792,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._bcs = bcs if bcs is not None else []
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.NonlinearProblem(
-            J=self._lhs,  # type: ignore[arg-type]
+            J=J,  # type: ignore[arg-type]
             F=self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
             u=self._u,  # type: ignore[arg-type]
