@@ -548,15 +548,15 @@ class LinearProblemBlock(pyadjoint.Block):
             with dJdu.localForm() as dJdu_loc:
                 dJdu_loc.set(0.0)
 
-            arrs = [
-                np.zeros(output.output.index_map.size_local * output.output.function_space.dofmap.index_map_bs)
-                for output in self.get_outputs()
-            ]
-            for i, adj_rhs in enumerate(adj_inputs):
+            arrs = []
+            for adj_rhs, output in zip(adj_inputs, self.get_outputs()):
+                local_size = output.output.index_map.size_local * output.output.function_space.dofmap.index_map_bs
                 if adj_rhs is None:
-                    arrs[i][:] = 0.0
+                    arrs.append(np.zeros(local_size, dtype=dolfinx.default_scalar_type))
                 else:
-                    arrs[i][: len(arrs[i])] = adj_rhs.array[: len(arrs[i])]
+                    arrs.append(adj_rhs.array[:local_size])
+            dolfinx.la.petsc.assign(arrs, dJdu)
+
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(
             dFdu_adj,  # type: ignore[arg-type]
@@ -565,10 +565,6 @@ class LinearProblemBlock(pyadjoint.Block):
             entity_maps=self._entity_maps,
         )
         self._adjoint_solver._a = compiled_dFdu
-        if len(adj_inputs) == 1:
-            self._adjoint_solver._b = dJdu
-        else:
-            dolfinx.la.petsc.assign(arrs, self._adjoint_solver._b)
         self._adjoint_solver._u = self._adjoint_solutions  # type: ignore[assignment]
         self._adjoint_solver.solve()
         return F_form
@@ -594,10 +590,8 @@ class LinearProblemBlock(pyadjoint.Block):
             raise NotImplementedError(f"Unsupported control {type(c)}")
 
         # Compute the sensitivity of the residual with respect to the parameter
-        if isinstance(residual, list):
-            dFdm = -ufl.derivative(residual[idx], c_rep, dc)
-        else:
-            dFdm = -ufl.derivative(residual, c_rep, dc)
+        sum_res = sum_form(residual)
+        dFdm = -ufl.derivative(sum_res, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
             dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))
@@ -770,12 +764,9 @@ class LinearProblemBlock(pyadjoint.Block):
             W = c.function_space
 
         dc = ufl.TestFunction(W)
-        if isinstance(F_form, list):
-            form_adj = sum(ufl.action(F_form[i], adj_sol) for i in range(len(F_form)))
-            form_adj2 = sum(ufl.action(F_form[i], adj_sol2) for i in range(len(F_form)))
-        else:
-            form_adj = ufl.action(F_form, adj_sol)
-            form_adj2 = ufl.action(F_form, adj_sol2)
+        F_summed = sum_form(F_form)
+        form_adj = ufl.action(F_summed, adj_sol)
+        form_adj2 = ufl.action(F_summed, adj_sol2)
         if isinstance(c, dolfinx.mesh.Mesh):
             raise NotImplementedError("Hessian computation for Mesh control not implemented yet.")
             # dFdm_adj = ufl.derivative(form_adj, X, dc)
