@@ -23,7 +23,7 @@ t.name = "time"
 d = 16 * x[0] * (x[0] - 1) * x[1] * (x[1] - 1) * ufl.sin(ufl.pi * t)
 
 dt = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.1))  # type: ignore
-T = 1
+T = 0.3
 
 V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))  # type: ignore[arg-type]
 ctrls = OrderedDict()
@@ -38,9 +38,12 @@ def solve_heat(ctrls):
     v = ufl.TestFunction(V)
 
     f = dolfinx_adjoint.Function(V, name="source")
-    u_0 = dolfinx_adjoint.Function(V, name="solution")
 
-    F = ((u - u_0) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
+    u_prev = dolfinx_adjoint.Function(V, name="u_prev")
+    uh = dolfinx_adjoint.Function(V, name="solution")
+    dolfinx_adjoint.assign(0.0, uh)
+
+    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
     a, L = ufl.system(F)
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     exterior_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -48,13 +51,13 @@ def solve_heat(ctrls):
 
     bc = dolfinx.fem.dirichletbc(0.0, exterior_dofs, V)
 
-    j = 0.5 * float(dt) * dolfinx_adjoint.assemble_scalar((u_0 - d) ** 2 * ufl.dx)
+    j = 0.5 * float(dt) * dolfinx_adjoint.assemble_scalar((uh - d) ** 2 * ufl.dx)
 
     t_val = float(dt)
     problem = dolfinx_adjoint.LinearProblem(
         a,
         L,
-        u=u_0,
+        u=uh,
         bcs=[bc],
         petsc_options={
             "ksp_type": "preonly",
@@ -81,6 +84,7 @@ def solve_heat(ctrls):
         dolfinx_adjoint.assign(ctrls[t_val], f)
 
         # Update data function
+        dolfinx_adjoint.assign(uh, u_prev)
 
         # Solve PDE
         problem.solve()
@@ -90,12 +94,12 @@ def solve_heat(ctrls):
             weight = 0.5
         else:
             weight = 1
-        j += weight * float(dt) * dolfinx_adjoint.assemble_scalar((u_0 - d) ** 2 * ufl.dx)
+        j += weight * float(dt) * dolfinx_adjoint.assemble_scalar((uh - d) ** 2 * ufl.dx)
         # Update time
         t_val += float(dt)
         dolfinx_adjoint.assign(t_val, t)
 
-    return u_0, d, j
+    return uh, d, j
 
 
 u, d, j = solve_heat(ctrls)
@@ -111,8 +115,26 @@ regularisation = (
 J = j + dolfinx_adjoint.assemble_scalar(regularisation)
 m = [pyadjoint.Control(c) for c in ctrls.values()]
 
-
 rf = pyadjoint.ReducedFunctional(J, m)
+
+# Check accuracy of gradient and Hessian using Taylor test
+with pyadjoint.stop_annotating():
+    h = [dolfinx_adjoint.Function(ci.function_space) for ci in m]
+    for hi in h:
+        hi.x.array[:] = np.random.random(hi.x.array.shape)
+
+    # Prove the gradient is mathematically exact
+    min_val = pyadjoint.taylor_test(rf, list(ctrls.values()), h)
+    assert np.isclose(min_val, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_val}"
+
+    # Prove the Hessian is mathematically exact
+    rf(list(ctrls.values()))
+    dJdm = sum(drfi._ad_dot(hi) for drfi, hi in zip(rf.derivative(), h, strict=True))
+    H = rf.hessian(h)
+    dHddu = sum(Hi._ad_dot(hi) for Hi, hi in zip(H, h, strict=True))
+    pyadjoint.taylor_test(rf, list(ctrls.values()), h, dJdm=dJdm, Hm=dHddu)
+    rf(list(ctrls.values()))
+
 
 tape = pyadjoint.get_working_tape()
 tape.visualise_dot("test.dot")
@@ -120,7 +142,6 @@ tape.visualise_dot("test.dot")
 opt_ctrls = pyadjoint.minimize(
     rf,
     method="BFGS",
-    # method="Newton-CG",
     options={"maxiter": 100, "disp": True},
 )
 

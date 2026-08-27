@@ -19,6 +19,82 @@ type NestedMutableSequence[T] = T | typing.MutableSequence["NestedMutableSequenc
 type NestedSequence[T] = T | typing.Sequence["NestedSequence[T]"]
 
 
+def assign_mixed_parts(
+    *form_structs: typing.Sequence[NestedSequence[ufl.Form]],
+) -> typing.Sequence[NestedSequence[ufl.Form]]:
+    """
+    Recursively assigns mixed-space `part` indices to UFL Test and Trial functions
+    within nested iterables of forms.
+
+    When solving monolithic block systems in FEniCSx, the UFL arguments must be tagged
+    with a `.part()` index corresponding to their block position. For a block matrix
+    (list of lists), the TestFunction corresponds to the row index, and the
+    TrialFunction corresponds to the column index.
+
+    This utility traverses arbitrary nested structures (e.g., a 2D list for the LHS
+    matrix `a` and a 1D list for the RHS vector `L` simultaneously), extracts arguments
+    that lack a part index, builds a unified replacement map, and applies it.
+
+    Args:
+        *form_structs: One or more UFL forms, or nested iterables (lists/tuples) of
+            UFL forms. Passing multiple structures (like `a` and `L`) ensures they
+            share the same replacement map, preventing mismatched compilation.
+
+    Returns:
+        The modified form structures with identical nesting and sequence types, where
+        all unassigned TestFunction and TrialFunction arguments have been mapped.
+        Returns a single structure if one was passed, otherwise returns a tuple.
+    """
+    replace_map = {}
+
+    def _build_map(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
+        """
+        Recursively discover forms, tracking the depth and index of the nesting.
+        `indices` will be `(row,)` for vectors and `(row, col)` for matrices.
+        """
+        if isinstance(obj, ufl.Form):
+            for arg in obj.arguments():
+                # Only map arguments that haven't been assigned a part yet
+                if arg.part() is None and arg not in replace_map:
+                    num = arg.number()
+
+                    # Because num is 0 for TestFunctions and 1 for TrialFunctions,
+                    # it maps perfectly to our nested dimension indices!
+                    # If num < len(indices), we have traversed deep enough to assign it.
+                    if num < len(indices):
+                        replace_map[arg] = ufl.Argument(arg.ufl_function_space(), number=num, part=indices[num])
+
+        elif isinstance(obj, typing.Iterable):
+            for i, item in enumerate(obj):
+                if item is not None:
+                    # Append current topological index to the path and recurse
+                    _build_map(item, indices + (i,))
+
+    def _replace(obj: typing.Any) -> typing.Any:
+        """
+        Recursively rebuild the structure using the populated replace_map,
+        strictly preserving original sequence types (lists vs. tuples).
+        """
+        if isinstance(obj, ufl.Form):
+            return ufl.replace(obj, replace_map)
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(_replace(item) for item in obj)
+        return obj
+
+    # 1. Build a shared map across all inputs (e.g., ensuring RHS TestFunctions
+    # perfectly match LHS TestFunctions)
+    for struct in form_structs:
+        _build_map(struct, ())
+
+    # 2. If no replacements are needed, exit early to save computation
+    if not replace_map:
+        return form_structs if len(form_structs) > 1 else form_structs[0]
+
+    # 3. Apply the replacements and unpack if necessary
+    replaced = tuple(_replace(struct) for struct in form_structs)
+    return replaced if len(replaced) > 1 else replaced[0]
+
+
 def to_list(data):
     if isinstance(data, (tuple, list)):
         return [to_list(item) for item in data]
@@ -135,39 +211,8 @@ class LinearProblemBlock(pyadjoint.Block):
         # Collect all arguments in variational forms and replace them with similar
         # once that is based on a mixed functionspace.
         if not isinstance(a, ufl.Form):
-            # Get all arguments from the RHS and LHS forms
-            trial_functions = len(a) * [None]
-            test_functions = len(a) * [None]
-            for i, ai in enumerate(a):
-                for j, aij in enumerate(ai):
-                    if aij is not None:
-                        test_functions[i] = aij.arguments()[0]
-                        trial_functions[j] = aij.arguments()[1]
-            assert all(tf is not None for tf in trial_functions), "Not all trial functions were found."
-            assert all(tf is not None for tf in test_functions), "Not all test functions were found."
-            trial_parts = [tf.part() for tf in trial_functions]  # type: ignore
-            test_parts = [tf.part() for tf in test_functions]  # type: ignore
-            a = to_list(a)
-            if any(tp is None for tp in trial_parts) or any(tp is None for tp in test_parts):
-                replace_map: dict[ufl.Argument, ufl.Argument] = {}
-                for i, tf in enumerate(trial_functions):
-                    assert tf is not None
-                    new_tf = ufl.TrialFunction(tf.ufl_function_space(), part=i)
-                    replace_map[tf] = new_tf
-                for i, tf in enumerate(test_functions):
-                    assert tf is not None
-                    new_tf = ufl.TestFunction(tf.ufl_function_space(), part=i)
-                    replace_map[tf] = new_tf
-                assert isinstance(a, typing.MutableSequence)
-                for i, ai in enumerate(a):
-                    for j, aij in enumerate(ai):
-                        if aij is not None:
-                            assert isinstance(ai, typing.MutableSequence)
-                            ai[j] = ufl.replace(aij, replace_map)
-                assert isinstance(L, typing.MutableSequence)
-                for i, Li in enumerate(L):
-                    if Li is not None:
-                        L[i] = ufl.replace(Li, replace_map)
+            a, L = assign_mixed_parts(a, L)
+            P, _ = assign_mixed_parts(P, L) if P is not None else None, None
 
         self._lhs = a
         self._rhs = L
@@ -199,6 +244,7 @@ class LinearProblemBlock(pyadjoint.Block):
             for Ai in self._lhs:  # type: ignore
                 for Aij in Ai:
                     if Aij is not None:
+                        assert isinstance(Aij, ufl.Form)
                         for c in Aij.coefficients():
                             if c not in self._u:
                                 self.add_dependency(c, no_duplicates=True)
