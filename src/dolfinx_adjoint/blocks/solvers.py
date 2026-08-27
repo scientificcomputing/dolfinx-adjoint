@@ -510,7 +510,7 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdm = -ufl.derivative(residual, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
-            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))
+            dFdm = ufl.ZeroBaseForm((dc,))
 
         dFdm_adj = ufl.adjoint(dFdm)
         sensitivity = ufl.action(dFdm_adj, self._adjoint_solutions)
@@ -888,9 +888,9 @@ class NonlinearProblemBlock(pyadjoint.Block):
             self._forward_solver.solve()
 
         if isinstance(self._forward_solver._u, list):
-            return self._forward_solver._u[idx]
+            return self._forward_solver._u[idx]._ad_copy()
         else:
-            return self._forward_solver._u
+            return self._forward_solver._u._ad_copy()
 
     def _should_compute_boundary_adjoint(
         self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
