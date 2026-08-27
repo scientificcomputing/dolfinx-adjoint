@@ -622,14 +622,9 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdu_form = self._compute_residual_derivative()
 
         # For linear forms d2Fdu2 is zero, but we include it for completeness.
-        if isinstance(dFdu_form, tuple):
-            unknowns = [output.saved_output for output in self.get_outputs()]
-            summed_form = sum_form(dFdu_form)
-            d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
-        else:
-            d2Fdu2 = ufl.algorithms.expand_derivatives(
-                ufl.derivative(dFdu_form, outputs[0].saved_output, tlm_output[0])
-            )
+        unknowns = [output.saved_output for output in self.get_outputs()]
+        summed_form = sum_form(dFdu_form)
+        d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
 
         # bdy = self._should_compute_boundary_adjoint(relevant_dependencies)
 
@@ -638,7 +633,6 @@ class LinearProblemBlock(pyadjoint.Block):
         if not d2Fdu2.empty():
             raise RuntimeError(f"This term {d2Fdu2:s} should be zero for linear problems.")
         b_form = d2Fdu2 if d2Fdu2.empty() else ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
-        b_form = len(outputs) * [b_form]
         for bo in self.get_dependencies():
             c = bo.output
             c_rep = bo.saved_output
@@ -649,19 +643,15 @@ class LinearProblemBlock(pyadjoint.Block):
                 raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
             else:
                 dFdu_adj = self._compute_adjoint(dFdu_form)
-                if isinstance(dFdu_form, tuple):
-                    summed_form = sum_form(dFdu_adj)
-                    dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
-                    b_form = ufl.extract_blocks(ufl.derivative(dFdu_adj_applied, c_rep, tlm_input))
-                else:
-                    dFdu_adj_applied = ufl.action(dFdu_adj, self._adjoint_solutions)
-                    b_form[0] += ufl.derivative(dFdu_adj_applied, c_rep, tlm_input)
+                summed_form = sum_form(dFdu_adj)
+                dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
+                b_form += ufl.derivative(dFdu_adj_applied, c_rep, tlm_input)
 
         if len(outputs) == 1:
             b = self._adjoint_solver._b
             with b.localForm() as b_loc:
                 b_loc.set(0.0)
-            form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[0])
+            form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form)
             if not form_i.empty():
                 compiled_soa_rhs = dolfinx.fem.form(
                     form_i,
@@ -681,6 +671,7 @@ class LinearProblemBlock(pyadjoint.Block):
 
         else:
             bs = []
+            b_form = ufl.extract_blocks(b_form)
             for i, hess_input in enumerate(hessian_inputs):
                 if hess_input is not None:
                     bi = dolfinx.la.vector(hess_input.index_map, hess_input.block_size)
