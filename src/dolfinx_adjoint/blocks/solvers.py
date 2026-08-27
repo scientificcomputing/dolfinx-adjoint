@@ -263,7 +263,7 @@ class LinearProblemBlock(pyadjoint.Block):
             self._tlm_solutions = [u.copy() for u in self._u]
 
         self._adjoint_solver = LinearAdjointProblem(
-            self._compute_adjoint(self._lhs),  # type: ignore[arg-type]
+            self._compute_adjoint(sum_form(self._lhs)),  # type: ignore[arg-type]
             self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
             u=self._adjoint_solutions,  # type: ignore[arg-type]
@@ -414,28 +414,11 @@ class LinearProblemBlock(pyadjoint.Block):
         return bdy
 
     @classmethod
-    @typing.overload
-    def _compute_adjoint(
-        cls, form: typing.Sequence[typing.Sequence[ufl.Form]]
-    ) -> typing.Sequence[typing.Sequence[ufl.Form]]: ...
-
-    @classmethod
-    @typing.overload
-    def _compute_adjoint(cls, form: ufl.Form) -> ufl.Form: ...
-
-    @classmethod
-    def _compute_adjoint(
-        cls, form: typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]
-    ) -> typing.Union[ufl.Form, typing.Sequence[typing.Sequence[ufl.Form]]]:
+    def _compute_adjoint(cls, form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
         """
         Compute adjoint of a bilinear form :math:`a(u, v)`, which could be written as a blocked system.
         """
-        if isinstance(form, ufl.Form):
-            return ufl.adjoint(form)
-        else:
-            assert isinstance(form, typing.Iterable)
-            sum_form = sum([fij for fi in form for fij in fi if fij is not None])
-            return ufl.extract_blocks(compute_form_adjoint(sum_form))
+        return ufl.extract_blocks(compute_form_adjoint(form))
 
     def _compute_residual(self) -> ufl.Form:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where
@@ -673,6 +656,7 @@ class LinearProblemBlock(pyadjoint.Block):
         if not d2Fdu2.empty():
             raise RuntimeError(f"This term {d2Fdu2:s} should be zero for linear problems.")
         b_form = d2Fdu2 if d2Fdu2.empty() else ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
+        dFdu_adj = self._compute_adjoint(sum_form(dFdu_form))
         for bo in self.get_dependencies():
             c = bo.output
             c_rep = bo.saved_output
@@ -682,7 +666,6 @@ class LinearProblemBlock(pyadjoint.Block):
             if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
                 raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
             else:
-                dFdu_adj = self._compute_adjoint(dFdu_form)
                 summed_form = sum_form(dFdu_adj)
                 dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
                 b_form += ufl.derivative(dFdu_adj_applied, c_rep, tlm_input)
@@ -745,7 +728,7 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # Compile SOA LHS
         dFdu_adj = dolfinx.fem.form(
-            self._compute_adjoint(dFdu_form),
+            self._compute_adjoint(sum_form(dFdu_form)),
             jit_options=self._jit_options,
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
@@ -1313,6 +1296,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
 
         # Assemble right hand side of second order adjoint equation
         b_form = d2Fdu2 if d2Fdu2.empty() else ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
+        dFdu_adj = ufl.action(ufl.adjoint(dFdu_form), self._adjoint_solutions)
         for bo in self.get_dependencies():
             c = bo.output
             c_rep = bo.saved_output
@@ -1322,7 +1306,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
                 raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
             else:
-                dFdu_adj = ufl.action(ufl.adjoint(dFdu_form), self._adjoint_solutions)
                 b_form += ufl.derivative(dFdu_adj, c_rep, tlm_input)
         b = self._adjoint_solver._b
         with b.localForm() as b_loc:
