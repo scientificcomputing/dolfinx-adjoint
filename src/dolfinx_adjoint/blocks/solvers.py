@@ -21,12 +21,12 @@ def get_sorted_arguments(arguments: typing.Iterable[ufl.Argument], number: int) 
     return sorted(filter(lambda x: x.number() == number, arguments), key=lambda a: a.part())
 
 
-def sum_form(form: typing.Sequence[typing.Sequence[ufl.Form] | ufl.Form] | ufl.Form) -> ufl.Form:
+def sum_form(form: typing.Iterable[typing.Iterable[ufl.Form] | ufl.Form] | ufl.Form) -> ufl.Form:
     """Sum a blocked form into a single form."""
     if isinstance(form, ufl.Form):
         return form
     if isinstance(form, typing.Iterable):
-        return sum(sum_form(fi) for fi in form if fi is not None)
+        return sum(sum_form(fi) for fi in form if fi is not None)  # type: ignore[return-value]
 
 
 class LinearProblemBlock(pyadjoint.Block):
@@ -291,7 +291,7 @@ class LinearProblemBlock(pyadjoint.Block):
 
     def _replace_coefficients_in_form(
         self, form: ufl.Form | typing.Iterable[ufl.Form]
-    ) -> ufl.Form | typing.Iterable[ufl.Form]:
+    ) -> ufl.Form | typing.Iterable[ufl.Form | None]:
         """Replace coefficients in the form with saved outputs.
 
         Args:
@@ -301,12 +301,14 @@ class LinearProblemBlock(pyadjoint.Block):
         if isinstance(form, ufl.Form):
             return ufl.replace(form, replace_map)
         elif isinstance(form, typing.Iterable):
-            replaced_forms: typing.MutableSequence[ufl.Form] = []
+            replaced_forms: typing.MutableSequence[ufl.Form | None] = []
             for f in form:
                 if f is None:
                     replaced_forms.append(None)
                 elif isinstance(f, typing.Iterable):
-                    replaced_forms.append(self._replace_coefficients_in_form(f))
+                    new_form = self._replace_coefficients_in_form(f)
+                    assert isinstance(new_form, ufl.Form)
+                    replaced_forms.append(new_form)
                 else:
                     replaced_forms.append(ufl.replace(f, replace_map))
             return replaced_forms
@@ -610,7 +612,7 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdm = -ufl.derivative(sum_res, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
-            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))
+            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))  # type: ignore[call-overload]
 
         dFdm_adj = ufl.adjoint(dFdm)
         sensitivity = ufl.action(dFdm_adj, self._adjoint_solutions)
@@ -1110,6 +1112,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # NOTE: Should probably be possible to compile this form once.
         replacement_functions = self.get_outputs()
         assert isinstance(self._rhs, (ufl.Form, typing.Sequence))
+        assert isinstance(self._rhs, ufl.Form)
         replacement_map = self._create_replace_map(self._rhs)
 
         u_list = self._u if isinstance(self._u, list) else [self._u]
@@ -1119,6 +1122,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         if isinstance(self._u, dolfinx.fem.Function):
             F_form = ufl.replace(self._rhs, replacement_map)
         else:
+            assert isinstance(self._rhs, typing.Iterable)
             F_form = [ufl.replace(rhs_j, replacement_map) for rhs_j in self._rhs]
         return F_form
 
