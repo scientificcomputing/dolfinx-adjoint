@@ -23,7 +23,7 @@ t.name = "time"
 d = 16 * x[0] * (x[0] - 1) * x[1] * (x[1] - 1) * ufl.sin(ufl.pi * t)
 
 dt = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.1))  # type: ignore
-T = 0.3
+T = 1
 
 V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))  # type: ignore[arg-type]
 ctrls = OrderedDict()
@@ -42,7 +42,6 @@ def solve_heat(ctrls):
     u_prev = dolfinx_adjoint.Function(V, name="u_prev")
     uh = dolfinx_adjoint.Function(V, name="solution")
     dolfinx_adjoint.assign(0.0, uh)
-
     F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
     a, L = ufl.system(F)
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -119,22 +118,64 @@ rf = pyadjoint.ReducedFunctional(J, m)
 
 # Check accuracy of gradient and Hessian using Taylor test
 with pyadjoint.stop_annotating():
-    h = [dolfinx_adjoint.Function(ci.function_space) for ci in m]
+    # Insert this diagnostic section into your demo right after J and m are defined:
+
+    # 1. Generate a non-zero base control point m_pert
+    m_pert = [dolfinx_adjoint.Function(V, name=f"pert_ctrl_{t_val}") for t_val in ctrls.keys()]
+    for c in m_pert:
+        c.x.array[:] = np.random.uniform(0.1, 1.0, size=c.x.array.shape)
+
+    # 2. Define random directions h
+    h = [pyadjoint.Control(dolfinx_adjoint.Function(V)) for _ in m]
     for hi in h:
-        hi.x.array[:] = np.random.random(hi.x.array.shape)
+        hi.control.x.array[:] = np.random.uniform(-0.1, 0.1, size=hi.control.x.array.shape)
 
-    # Prove the gradient is mathematically exact
-    min_val = pyadjoint.taylor_test(rf, list(ctrls.values()), h)
-    assert np.isclose(min_val, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_val}"
-
-    # Prove the Hessian is mathematically exact
-    rf(list(ctrls.values()))
+    print("\n=== 1. Taylor Test at NON-ZERO Control Point ===")
+    min_val_pert = pyadjoint.taylor_test(rf, m_pert, h)
+    print(f"Convergence rate at perturbed point: {min_val_pert:.4f}")
+    rf(m_pert)
+    print("\n=== 2. Second order taylor test at NON-ZERO Control Point ===")
     dJdm = sum(drfi._ad_dot(hi) for drfi, hi in zip(rf.derivative(), h, strict=True))
-    H = rf.hessian(h)
-    dHddu = sum(Hi._ad_dot(hi) for Hi, hi in zip(H, h, strict=True))
-    pyadjoint.taylor_test(rf, list(ctrls.values()), h, dJdm=dJdm, Hm=dHddu)
-    rf(list(ctrls.values()))
 
+    H = rf.hessian([hi.control for hi in h])
+
+    # 2. Iterate and sum the Hessian dot products piecewise
+    dHddu = sum(Hi._ad_dot(hi) for Hi, hi in zip(H, h, strict=True))
+    min_val = pyadjoint.taylor_test(rf, m_pert, h, dJdm=dJdm, Hm=dHddu)
+    print(f"Convergence rate at perturbed point with Hessian: {min_val:.4f}")
+
+    print("\n=== 3. Direct Finite Difference Gradient Verification ===")
+    eps = 1e-6
+
+    # Compute Adjoint Directional Derivative at m_pert
+    rf(m_pert)
+    grad_adj = rf.derivative()
+    adj_dir_deriv = sum(g._ad_dot(hi) for g, hi in zip(grad_adj, h, strict=True))
+
+    # Forward Perturbation J(m + eps*h)
+    m_plus = [dolfinx_adjoint.Function(V) for _ in m_pert]
+    for mp, m_p, hi in zip(m_plus, m_pert, h, strict=True):
+        mp.x.array[:] = m_p.x.array[:] + eps * hi.control.x.array[:]
+    J_plus = float(rf(m_plus))
+
+    # Backward Perturbation J(m - eps*h)
+    m_minus = [dolfinx_adjoint.Function(V) for _ in m_pert]
+    for mm, m_p, hi in zip(m_minus, m_pert, h, strict=True):
+        mm.x.array[:] = m_p.x.array[:] - eps * hi.control.x.array[:]
+    J_minus = float(rf(m_minus))
+
+    # Central Finite Difference
+    fd_dir_deriv = (J_plus - J_minus) / (2 * eps)
+
+    print(f"Adjoint Directional Derivative:    {adj_dir_deriv:.10e}")
+    print(f"Finite Difference Directional Dev: {fd_dir_deriv:.10e}")
+    rel_diff = abs(adj_dir_deriv - fd_dir_deriv) / (abs(fd_dir_deriv) + 1e-15)
+    print(f"Relative Mismatch:                 {rel_diff:.4e}")
+
+    assert rel_diff < 1e-4, f"Adjoint gradient mismatches finite differences! Relative error: {rel_diff}"
+
+# Reset to ensure that we are at the original control point for the optimization
+rf(list(ctrls.values()))
 
 tape = pyadjoint.get_working_tape()
 tape.visualise_dot("test.dot")
