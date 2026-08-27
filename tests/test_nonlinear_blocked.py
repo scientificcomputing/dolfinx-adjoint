@@ -1,5 +1,5 @@
-import typing
 from mpi4py import MPI
+
 import basix.ufl
 import dolfinx
 import numpy as np
@@ -35,8 +35,25 @@ def test_unblocked_nonlinear(mesh_2D):
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
     boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
     bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
-
-    problem = NonlinearProblem(F, u=uh, bcs=[bc])
+    petsc_options = {
+        "snes_error_if_not_converged": True,
+        "ksp_error_if_not_converged": True,
+        "snes_type": "newtonls",
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+        "snes_rtol": 1e-14,
+        "snes_atol": 1e-14,
+        "snes_monitor": None,
+    }
+    problem = NonlinearProblem(
+        F,
+        u=uh,
+        bcs=[bc],
+        petsc_options=petsc_options,
+        adjoint_petsc_options=petsc_options,
+        tlm_petsc_options=petsc_options,
+    )
     problem.solve()
 
     # Define Objective
@@ -58,7 +75,7 @@ def test_unblocked_nonlinear(mesh_2D):
     min_rate_pert = pyadjoint.taylor_test(Jh, m0, dm, dJdm=0)
     assert np.isclose(min_rate_pert, 1.0, rtol=1e-1, atol=1e-1), f"Perturbation rate failed: {min_rate_pert}"
 
-    min_rate_grad = pyadjoint.taylor_test(Jh, m0, dm, dJdm=0)
+    min_rate_grad = pyadjoint.taylor_test(Jh, m0, dm)
     assert np.isclose(min_rate_grad, 2.0, rtol=1e-1, atol=1e-1), f"Grad rate failed: {min_rate_grad}"
 
     Jh(m0)
@@ -77,11 +94,10 @@ def test_blocked_nonlinear(mesh_2D):
     el_p = basix.ufl.element("P", mesh.basix_cell(), 1)
     V = dolfinx.fem.functionspace(mesh, el_u)
     Q = dolfinx.fem.functionspace(mesh, el_p)
-
+    W = ufl.MixedFunctionSpace(V, Q)
     uh = Function(V, name="velocity")
     ph = Function(Q, name="pressure")
-    v = ufl.TestFunction(V)
-    q = ufl.TestFunction(Q)
+    v, q = ufl.TestFunctions(W)
 
     f = Function(V, name="control")
     f.interpolate(lambda x: (np.sin(x[0]), np.cos(x[1])))
@@ -111,15 +127,24 @@ def test_blocked_nonlinear(mesh_2D):
     bc_u = dolfinx.fem.dirichletbc(np.zeros(2, dtype=dolfinx.default_scalar_type), boundary_dofs_V, V)
 
     options = {
+        "snes_error_if_not_converged": True,
+        "ksp_error_if_not_converged": True,
         "snes_type": "newtonls",
         "ksp_type": "preonly",
         "pc_type": "lu",
         "pc_factor_mat_solver_type": "mumps",
-        "snes_rtol": 1e-9,
-        "snes_atol": 1e-9,
+        "snes_rtol": 1e-14,
+        "snes_atol": 1e-14,
     }
 
-    problem = NonlinearProblem(F_blocks, u=[uh, ph], bcs=[bc_u], petsc_options=options)
+    problem = NonlinearProblem(
+        F_blocks,
+        u=[uh, ph],
+        bcs=[bc_u],
+        petsc_options=options,
+        adjoint_petsc_options=options,
+        tlm_petsc_options=options,
+    )
     problem.solve()
 
     # Target velocity field

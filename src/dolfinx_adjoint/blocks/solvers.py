@@ -11,7 +11,7 @@ import ufl
 from dolfinx.fem.function import Function as _Function
 
 from ..compat import compute_form_adjoint
-from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
+from ..petsc_utils import LinearAdjointProblem
 from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
@@ -919,7 +919,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
                         for j, Jij in enumerate(Ji):
                             if Jij is not None:
                                 J[i][j] = ufl.replace(Jij, replace_map)
-
         self._F = F
 
         # Auto-derive Jacobian if not provided
@@ -1272,11 +1271,10 @@ class NonlinearProblemBlock(pyadjoint.Block):
         if not isinstance(c, dolfinx.fem.Function):
             raise NotImplementedError(f"Unsupported control {type(c)}")
 
-        part = idx if isinstance(self._u, list) else None
-        dc = ufl.TrialFunction(c_rep.function_space, part=part)
+        dc = ufl.TrialFunction(c_rep.function_space)
 
         sum_res = sum_form(residual)
-        dFdm = -ufl.derivative(sum_res, c_rep, dc)
+        dFdm = ufl.algorithms.apply_derivatives.apply_derivatives((ufl.derivative(sum_res, c_rep, dc)))
 
         if dFdm.empty():
             dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))
@@ -1305,65 +1303,59 @@ class NonlinearProblemBlock(pyadjoint.Block):
         dFdu_form = self._compute_residual_derivative()
         dFdu_adj = self._compute_adjoint(dFdu_form)
 
-        # Nonlinear addition: Keep d2Fdu2 term for the Hessian
-        if isinstance(dFdu_form, tuple) or isinstance(dFdu_form, list):
-            unknowns = [output.saved_output for output in outputs]
-            summed_form = sum_form(dFdu_form)
-            d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
-        else:
-            d2Fdu2 = ufl.algorithms.expand_derivatives(
-                ufl.derivative(dFdu_form, outputs[0].saved_output, tlm_output[0])
-            )
-
+        # 1. Base adjoint action: lambda^T * dF/du
+        # This yields a linear form whose TestFunction is exactly the original TrialFunction.
         if isinstance(self._u, list):
-            test_funcs = get_sorted_arguments(sum_form(self._F).arguments(), 0)
+            dFdu_adj_applied = ufl.action(sum_form(dFdu_adj), self._adjoint_solutions)
+            # CRITICAL FIX: Extract TrialFunctions (index 1) to use as the new TestFunctions
+            test_funcs = get_sorted_arguments(sum_form(dFdu_form).arguments(), 1)
             b_form = [ufl.ZeroBaseForm((test,)) for test in test_funcs]
         else:
-            test_funcs = [self._F.arguments()[0]]
+            dFdu_adj_applied = ufl.action(dFdu_adj, self._adjoint_solutions)
+            test_funcs = [dFdu_form.arguments()[1]]
             b_form = ufl.ZeroBaseForm((test_funcs[0],))
 
-        # Add the nonlinear state Hessian term (lambda^T * d^2F/du^2 * delta_u)
-        if not d2Fdu2.empty():
-            d2Fdu2_adj_applied = ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
-            if isinstance(self._u, list):
-                blocks = ufl.extract_blocks(d2Fdu2_adj_applied)
-                for block in blocks:
-                    if block is None or (hasattr(block, "empty") and block.empty()):
-                        continue
-                    b_form[block.arguments()[0].part()] += block
-            else:
-                b_form += d2Fdu2_adj_applied
+        # 2. Add State Hessian Term: d/du (lambda^T * dF/du) * delta_u
+        # Differentiating the applied linear form is mathematically exact and avoids
+        # brittle UFL tensor transpositions.
+        unknowns = [output.saved_output for output in outputs]
+        if isinstance(self._u, list):
+            d2Fdu2_term = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_adj_applied, unknowns, tlm_output))
+        else:
+            d2Fdu2_term = ufl.algorithms.expand_derivatives(
+                ufl.derivative(dFdu_adj_applied, unknowns[0], tlm_output[0])
+            )
 
+        if not (isinstance(d2Fdu2_term, (int, float)) or (hasattr(d2Fdu2_term, "empty") and d2Fdu2_term.empty())):
+            if isinstance(self._u, list):
+                for block in ufl.extract_blocks(d2Fdu2_term):
+                    if block is not None and not (hasattr(block, "empty") and block.empty()):
+                        b_form[block.arguments()[0].part()] += block
+            else:
+                b_form += d2Fdu2_term
+
+        # 3. Add Control Hessian Term: d/dm (lambda^T * dF/du) * delta_m
         for bo in self.get_dependencies():
             c = bo.output
             c_rep = bo.saved_output
             tlm_input = bo.tlm_value
-            if tlm_input is None:
+
+            # Skip non-differentiable dependencies
+            if tlm_input is None or isinstance(bo.output, dolfinx.fem.DirichletBC):
                 continue
 
-            if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
-                raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
-
-            if isinstance(dFdu_form, tuple) or isinstance(dFdu_form, list):
-                summed_adj = sum_form(dFdu_adj)
-                dFdu_adj_applied = ufl.action(summed_adj, self._adjoint_solutions)
-            else:
-                dFdu_adj_applied = ufl.action(dFdu_adj, self._adjoint_solutions)
-
             term = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_adj_applied, c_rep, tlm_input))
-            if isinstance(term, (int, float)):
+            if isinstance(term, (int, float)) or (hasattr(term, "empty") and term.empty()):
                 continue
 
             if isinstance(self._u, list):
-                blocks = ufl.extract_blocks(term)
-                for block in blocks:
-                    if block is None or (hasattr(block, "empty") and block.empty()):
-                        continue
-                    b_form[block.arguments()[0].part()] += block
+                for block in ufl.extract_blocks(term):
+                    if block is not None and not (hasattr(block, "empty") and block.empty()):
+                        b_form[block.arguments()[0].part()] += block
             else:
-                if not (hasattr(term, "empty") and term.empty()):
-                    b_form += term
+                b_form += term
 
+        # 4. Clean up forms to prevent FEniCSx compilation crashes
         if isinstance(self._u, list):
             b_form = [ufl.algorithms.expand_derivatives(bf) for bf in b_form]
             for i, bf in enumerate(b_form):
@@ -1385,12 +1377,17 @@ class NonlinearProblemBlock(pyadjoint.Block):
         with b_petsc.localForm() as b_loc:
             b_loc.set(0.0)
 
+        # 5. Native assembly into blocks
         dolfinx.fem.petsc.assemble_vector(b_petsc, compiled_soa_rhs)
         try:
             dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
         except AttributeError:
             b_petsc.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+
         b_petsc.scale(-1.0)
+
+        # 6. Accumulate incoming Hessian DOFs
+        import numpy as np
 
         tmp_b = b_petsc.duplicate()
         arrs = []
