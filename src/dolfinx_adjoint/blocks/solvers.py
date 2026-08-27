@@ -667,7 +667,7 @@ class LinearProblemBlock(pyadjoint.Block):
         assert dFdu_adj.empty() is False, "Adjoint of dF/du[v] is empty. Check if the problem is linear."
         # Solve adjoint problem
         compiled_dFdu = dolfinx.fem.form(
-            dFdu_adj,  # type: ignore[arg-type]
+            ufl.extract_blocks(dFdu_adj),  # type: ignore[arg-type]
             jit_options=self._jit_options,
             form_compiler_options=self._form_compiler_options,
             entity_maps=self._entity_maps,
