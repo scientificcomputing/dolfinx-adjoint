@@ -384,41 +384,47 @@ class LinearProblemBlock(pyadjoint.Block):
                     replace_map.update(self._create_replace_map(f))
         return replace_map
 
-    def _replace_coefficients_in_form(
-        self, form: ufl.Form | NestedMutableSequence[ufl.Form]
-    ) -> ufl.Form | NestedMutableSequence[ufl.Form | None]:
-        """Replace coefficients in the form with saved outputs.
+    def _create_recompute_replace_map(self, inputs: typing.Sequence[typing.Any]) -> dict:
+        """Map original dependency coefficients to active recomputation inputs."""
+        replace_map = {}
+        for block_variable, input_val in zip(self.get_dependencies(), inputs, strict=True):
+            coeff = block_variable.output
+            val = input_val.output if isinstance(input_val, pyadjoint.block_variable.BlockVariable) else input_val
+            replace_map[coeff] = val
+        return replace_map
 
-        Args:
-            form: The UFL form to replace coefficients in.
-        """
-        replace_map = self._create_replace_map(form)
+    def _replace_form_coefficients_recompute(
+        self, form: ufl.Form | NestedMutableSequence[ufl.Form] | None, replace_map: dict
+    ) -> ufl.Form | NestedMutableSequence[ufl.Form | None] | None:
+        """Recursively replace form coefficients for scalar or blocked form structures."""
+        if form is None:
+            return None
         if isinstance(form, ufl.Form):
-            return ufl.replace(form, replace_map)
+            coeffs_in_form = form.coefficients()
+            sub_map = {k: v for k, v in replace_map.items() if k in coeffs_in_form}
+            return ufl.replace(form, sub_map) if sub_map else form
         elif isinstance(form, typing.Sequence):
-            replaced_forms: typing.MutableSequence[NestedMutableSequence[ufl.Form | None] | ufl.Form | None] = []
-            for f in form:
-                if f is None:
-                    replaced_forms.append(None)
-                elif isinstance(f, typing.Sequence):
-                    new_form = self._replace_coefficients_in_form(f)
-                    replaced_forms.append(new_form)
-                else:
-                    replaced_forms.append(ufl.replace(f, replace_map))
-            return replaced_forms
+            return [self._replace_form_coefficients_recompute(f, replace_map) for f in form]
         else:
             raise TypeError(f"Cannot replace coefficients in form of type {type(form)}")
 
-    def prepare_recompute_component(self, inputs, relevant_outputs):
+    def prepare_recompute_component(
+        self, inputs: typing.Sequence[typing.Any], relevant_outputs: typing.Sequence[typing.Any]
+    ) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
         """Prepare for recomputing the block with different control inputs."""
 
-        # Replace form coefficients with checkpointed values.
-        # Loop through the dependencies of the lhs and rhs, check if they are in the respective form
-        lhs = self._replace_coefficients_in_form(self._lhs)
-        rhs = self._replace_coefficients_in_form(self._rhs)
+        replace_map = self._create_recompute_replace_map(inputs)
+
+        # 1. Substitute forms using active candidate inputs instead of static tape checkpoints
+        lhs = self._replace_form_coefficients_recompute(self._lhs, replace_map)
+        rhs = self._replace_form_coefficients_recompute(self._rhs, replace_map)
         preconditioner = (
-            self._replace_coefficients_in_form(self._preconditioner) if self._preconditioner is not None else None
+            self._replace_form_coefficients_recompute(self._preconditioner, replace_map)
+            if self._preconditioner is not None
+            else None
         )
+
+        # 2. Recompile UFL forms with candidate inputs
         compiled_lhs = dolfinx.fem.form(
             lhs,
             jit_options=self._jit_options,
@@ -442,24 +448,27 @@ class LinearProblemBlock(pyadjoint.Block):
             else None
         )
 
-        # Replace the compiled forms with those with new coefficients.
+        # 3. Hot-swap solver forms
         self._forward_solver._a = compiled_lhs
         self._forward_solver._L = compiled_rhs
         self._forward_solver._P = compiled_preconditioner
         self._forward_solver.bcs = self._bcs
         self._forward_solver._u = self._u
+
+        # 4. Solve forward state while halting annotation
         with pyadjoint.stop_annotating():
             solution = self._forward_solver.solve()
+
         return solution
 
     def recompute_component(
         self,
         inputs: typing.Iterable[Function],
-        block_variable,
+        block_variable: pyadjoint.block_variable.BlockVariable,
         idx: int,
         prepared: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
     ) -> dolfinx.fem.Function:
-        """Recompute the block with the prepared linear problem."""
+        """Return the recomputed solution corresponding to the requested output index."""
         if isinstance(prepared, dolfinx.fem.Function):
             assert idx == 0
             return prepared
