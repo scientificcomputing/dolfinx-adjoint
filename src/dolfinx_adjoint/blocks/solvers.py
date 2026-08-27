@@ -457,9 +457,8 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # 4. Solve forward state while halting annotation
         with pyadjoint.stop_annotating():
-            solution = self._forward_solver.solve()
-
-        return solution
+            self._forward_solver.solve()
+        return self._u
 
     def recompute_component(
         self,
@@ -468,13 +467,14 @@ class LinearProblemBlock(pyadjoint.Block):
         idx: int,
         prepared: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
     ) -> dolfinx.fem.Function:
-        """Return the recomputed solution corresponding to the requested output index."""
+        """Recompute and return an isolated copy of the solution state."""
         if isinstance(prepared, dolfinx.fem.Function):
             assert idx == 0
-            return prepared
+            # Return an explicit copy so each tape block gets an isolated state snapshot
+            return prepared.copy()
         else:
             assert isinstance(prepared, typing.Iterable)
-            return prepared[idx]
+            return prepared[idx].copy()
 
     def _should_compute_boundary_adjoint(
         self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
@@ -514,17 +514,25 @@ class LinearProblemBlock(pyadjoint.Block):
     def _compute_residual_derivative(self) -> typing.Union[ufl.Form, list[list[ufl.Form]]]:
         """Compute the derivative of the residual with respect to the outputs."""
 
-        F_form, replacement_map = self._compute_residual()
+        res = self._compute_residual()
+        F_form = res[0] if isinstance(res, tuple) else res
         assert isinstance(F_form, ufl.Form), "Residual form must be a single UFL form."
+
         outputs = self.get_outputs()
-        r_funcs = [replacement_map[r.saved_output] for r in outputs]
+        # Use r.saved_output directly; no lookup in replacement_map needed!
+        r_funcs = [r.saved_output for r in outputs]
+
         test_functions = get_sorted_arguments(F_form.arguments(), 0)
         trial_functions = [
             ufl.TrialFunction(output.function_space, part=arg.part())
             for arg, output in zip(test_functions, r_funcs, strict=True)
         ]
+
         dFdu = ufl.derivative(F_form, r_funcs, trial_functions)
-        return ufl.extract_blocks(dFdu)
+
+        if isinstance(self._u, list):
+            return ufl.extract_blocks(dFdu)
+        return dFdu
 
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
