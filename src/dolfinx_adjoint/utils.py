@@ -59,6 +59,7 @@ def assign_linear_combination(value: ufl.core.expr.Expr, function: dolfinx.fem.F
     function.x.array[:] = 0.0
     floatifier = Floatify()
     for weight, func in pairs:
+        assert isinstance(func, dolfinx.fem.Function), "All operands in the linear combination must be Functions."
         if not func.function_space == function.function_space:
             raise ValueError("Function spaces of all functions in the linear combination must match for assignment.")
         function.x.array[:] += floatifier.process(weight) * func.x.array[:]

@@ -153,7 +153,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
                 self._lhs,  # type: ignore[arg-type]
                 self._rhs,  # type: ignore[arg-type]
                 bcs=self.bcs,
-                u=self.u,
+                u=self.u,  # type: ignore[arg-type]
                 P=self._preconditioner,  # type: ignore[arg-type]
                 kind=self._kind,  # type: ignore[arg-type]
                 petsc_options=self._petsc_options,
@@ -292,10 +292,10 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
         annotate = pyadjoint.annotate_tape({"annotate": annotate})
         if annotate:
             block = NonlinearProblemBlock(
-                J=self._lhs,
+                J=self._lhs,  # type: ignore[arg-type]
                 F=self._rhs,  # type: ignore[arg-type]
                 bcs=self._bcs,
-                u=self.u,
+                u=self.u,  # type: ignore[arg-type]
                 P=self._preconditioner,  # type: ignore[arg-type]
                 kind=self._kind,  # type: ignore[arg-type]
                 petsc_options=self._petsc_options,
