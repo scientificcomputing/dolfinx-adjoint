@@ -1039,20 +1039,17 @@ class NonlinearProblemBlock(pyadjoint.Block):
             self._rhs = [ufl.replace(Fi, replace_dict) for Fi in F]
 
         # NOTE: Add mesh and constants as dependencies later on
-        try:
-            u_list = self._u if isinstance(self._u, list) else [self._u]
-            if self._lhs is not None:
-                assert isinstance(self._lhs, ufl.Form)
-                for c in self._lhs.coefficients():
-                    if c not in u_list:  # Exclude unknown
-                        self.add_dependency(c, no_duplicates=True)
-            if self._rhs is not None:
-                assert isinstance(self._rhs, ufl.Form)
-                for c in self._rhs.coefficients():
-                    if c not in u_list:  # Exclude unknown
-                        self.add_dependency(c, no_duplicates=True)
-        except AttributeError:
-            raise NotImplementedError("Blocked systems not implemented yet.")
+        u_list = self._u if isinstance(self._u, list) else [self._u]
+        if J is not None:
+            assert isinstance(J, ufl.Form)
+            for c in J.coefficients():
+                if c not in u_list:  # Exclude unknown
+                    self.add_dependency(c, no_duplicates=True)
+        if self._rhs is not None:
+            assert isinstance(self._rhs, ufl.Form)
+            for c in self._rhs.coefficients():
+                if c not in u_list:  # Exclude unknown
+                    self.add_dependency(c, no_duplicates=True)
 
         # Cache form parameters for later
         # NOTE: Should probably be in a struct
