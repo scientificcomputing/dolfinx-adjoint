@@ -53,31 +53,68 @@ def assign_mixed_parts(
         The modified form structures with identical nesting and sequence types, where
         all unassigned TestFunction and TrialFunction arguments have been mapped.
         Returns a single structure if one was passed, otherwise returns a tuple.
-    """
-    replace_map = {}
 
-    def _build_map(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
-        """
-        Recursively discover forms, tracking the depth and index of the nesting.
+    Note:
+        The replacement arguments are drawn from ``ufl.TestFunctions``/``ufl.TrialFunctions``
+        of a single ``ufl.MixedFunctionSpace`` built from the row/column function spaces
+        discovered while walking the structure, rather than hand-constructed
+        via ``ufl.Argument(..., part=...)``: this is exactly what a user who
+        builds the block system directly on a ``ufl.MixedFunctionSpace`` (and
+        then calls ``ufl.extract_blocks``) already gets, so a form assembled
+        this way and one assembled from a plain ``[[a00, ...], ...]`` nested
+        list end up as the same UFL objects -- one code path handles both,
+        rather than two subtly different ones.
+    """
+    spaces: dict[int, ufl.functionspace.AbstractFunctionSpace] = {}
+
+    def _discover_spaces(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
+        """Recursively discover, for each row/column index, the function space of the
+        (as yet unassigned) argument occupying that position.
+
         `indices` will be `(row,)` for vectors and `(row, col)` for matrices.
         """
         if isinstance(obj, ufl.Form):
             for arg in obj.arguments():
-                # Only map arguments that haven't been assigned a part yet
-                if arg.part() is None and arg not in replace_map:
+                if arg.part() is None:
                     num = arg.number()
-
                     # Because num is 0 for TestFunctions and 1 for TrialFunctions,
                     # it maps perfectly to our nested dimension indices!
                     # If num < len(indices), we have traversed deep enough to assign it.
                     if num < len(indices):
-                        replace_map[arg] = ufl.Argument(arg.ufl_function_space(), number=num, part=indices[num])
-
+                        spaces.setdefault(indices[num], arg.ufl_function_space())
         elif isinstance(obj, typing.Iterable):
             for i, item in enumerate(obj):
                 if item is not None:
-                    # Append current topological index to the path and recurse
+                    _discover_spaces(item, indices + (i,))
+
+    for struct in form_structs:
+        _discover_spaces(struct, ())
+
+    # If no replacements are needed, exit early to save computation
+    if not spaces:
+        return form_structs if len(form_structs) > 1 else form_structs[0]
+
+    num_parts = max(spaces) + 1
+    mixed_space = ufl.MixedFunctionSpace(*(spaces[i] for i in range(num_parts)))
+    test_functions = ufl.TestFunctions(mixed_space)
+    trial_functions = ufl.TrialFunctions(mixed_space)
+
+    replace_map = {}
+
+    def _build_map(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
+        if isinstance(obj, ufl.Form):
+            for arg in obj.arguments():
+                if arg.part() is None and arg not in replace_map:
+                    num = arg.number()
+                    if num < len(indices):
+                        replace_map[arg] = (test_functions if num == 0 else trial_functions)[indices[num]]
+        elif isinstance(obj, typing.Iterable):
+            for i, item in enumerate(obj):
+                if item is not None:
                     _build_map(item, indices + (i,))
+
+    for struct in form_structs:
+        _build_map(struct, ())
 
     def _replace(obj: typing.Any) -> typing.Any:
         """
@@ -90,16 +127,7 @@ def assign_mixed_parts(
             return type(obj)(_replace(item) for item in obj)
         return obj
 
-    # 1. Build a shared map across all inputs (e.g., ensuring RHS TestFunctions
-    # perfectly match LHS TestFunctions)
-    for struct in form_structs:
-        _build_map(struct, ())
-
-    # 2. If no replacements are needed, exit early to save computation
-    if not replace_map:
-        return form_structs if len(form_structs) > 1 else form_structs[0]
-
-    # 3. Apply the replacements and unpack if necessary
+    # Apply the replacements and unpack if necessary
     replaced = tuple(_replace(struct) for struct in form_structs)
     return replaced if len(replaced) > 1 else replaced[0]
 
@@ -461,67 +489,50 @@ class LinearProblemBlock(pyadjoint.Block):
         self, inputs, tlm_inputs, relevant_outputs
     ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
 
-        F_form, replacement_map = self._compute_residual()
-        # The TLM solver is shared across every block this Problem records
-        # (built once, lazily, on first TLM evaluation of this Problem) --
-        # even so, we need to replace the form and re-establish this block's
-        # own bcs on every call, since another block may have used the same
-        # solver in between.
-        dFdu_form = self._compute_residual_derivative()
-        tlm_solver = self._problem()._get_or_build_tlm_solver(dFdu_form)
+        # The TLM solver -- and the compiled LHS it solves with, shared
+        # verbatim with dF/du (see LinearProblem._get_or_build_dFdu_template)
+        # -- are shared across every block this Problem records; likewise the
+        # per-dependency TLM right-hand-side templates (see
+        # LinearProblem._get_or_build_tlm_rhs_templates) are each compiled
+        # once. Refresh this block's own checkpointed values into the
+        # placeholders and re-establish this block's own bcs on every call,
+        # since another block may have used the same solver in between -- but
+        # never rebuild or recompile any of these forms.
+        problem = self._problem()
+        tlm_solver = problem._get_or_build_tlm_solver()
         tlm_solver.bcs = self._bcs
-        tlm_solver._a = dolfinx.fem.form(
-            dFdu_form,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        #  Build RHS (dFdm) for the monolithic system
-        if isinstance(self._u, list):
-            test_funcs = get_sorted_arguments(F_form.arguments(), 0)
-            dFdm = sum([ufl.ZeroBaseForm((test,)) for test in test_funcs])
-        else:
-            test_funcs = [F_form.arguments()[0]]
-            dFdm = ufl.ZeroBaseForm((test_funcs[0],))
+        templates, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
 
         for block_variable in self.get_dependencies():
-            tlm_value = block_variable.tlm_value
-            c_rep = block_variable.saved_output
-            if tlm_value is None:
-                continue
-            assert c_rep in replacement_map.values()
-            # Accumulate sensitivities across all block components
-            dFdm += ufl.derivative(-F_form, c_rep, tlm_value)
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
+        state_list = state_placeholder if isinstance(state_placeholder, list) else [state_placeholder]
+        for placeholder, out_bv in zip(state_list, self.get_outputs(), strict=True):
+            placeholder.x.array[:] = out_bv.saved_output.x.array[:]
+            placeholder.x.scatter_forward()
 
-        # Safely wrap zero forms to prevent compilation crashes
-        dFdm = ufl.algorithms.expand_derivatives(dFdm)
-        if isinstance(self._u, list):
-            blocks = ufl.extract_blocks(dFdm)
-            if len(blocks) != len(self._u):
-                # Some zero blocks, manually pad with zero forms
-                _dFdm = [ufl.ZeroBaseForm((test,)) for test in test_funcs]
-                for block in blocks:
-                    args = block.arguments()
-                    assert len(args) == 1, "Expected a single test function in the block."
-                    _dFdm[args[0].part()] = block
-                dFdm = _dFdm
-        else:
-            if dFdm == 0 or dFdm.empty():
-                dFdm = ufl.ZeroBaseForm((test_funcs[0],))
-
-        dFdm_compiled = dolfinx.fem.form(
-            dFdm,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-
-        # 3. Assemble RHS Vector utilizing the shared solver's cached vector
+        # 3. Assemble RHS Vector utilizing the shared solver's cached vector,
+        # accumulating only the dependencies that actually have a
+        # tangent-linear value this call -- see
+        # LinearProblem._get_or_build_tlm_rhs_templates for why an inactive
+        # dependency's term must be skipped entirely rather than evaluated
+        # with a zeroed direction.
         b_petsc = tlm_solver._b
         with b_petsc.localForm() as b_loc:
             b_loc.set(0.0)
-
-        dolfinx.fem.petsc.assemble_vector(b_petsc, dFdm_compiled)
+        for block_variable in self.get_dependencies():
+            tlm_value = block_variable.tlm_value
+            if tlm_value is None:
+                continue
+            template = templates.get(block_variable.output)
+            if template is None:
+                continue
+            seed = seed_placeholders[block_variable.output]
+            seed.x.array[:] = tlm_value.x.array[:]
+            seed.x.scatter_forward()
+            dolfinx.fem.petsc.assemble_vector(b_petsc, template)
         dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
 
         # Homogeneous boundary conditions are applied to b_petsc by

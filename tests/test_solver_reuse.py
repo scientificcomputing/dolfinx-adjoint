@@ -345,3 +345,129 @@ def test_nonlinear_adjoint_lhs_compiled_once():
     dm.interpolate(lambda x: np.sin(x[0] * np.pi))
     Jh.hessian(dm)
     assert adjoint_solver._a is compiled_lhs, "the SOA (Hessian) solve rebuilt the shared adjoint LHS"
+
+
+def test_tlm_rhs_templates_compiled_once():
+    """Each dependency's TLM right-hand-side template
+    (``LinearProblem._get_or_build_tlm_rhs_templates``) must be compiled exactly
+    once and never rebuilt, including across repeated ``hessian()`` calls at
+    different control values (a Hessian evaluation always drives a TLM sweep
+    first).
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2 + x[1] ** 2)
+
+    f = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0))
+    a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = f * v * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    petsc_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
+    problem.solve()
+
+    d = Function(V)
+    d.interpolate(lambda x: np.sin(np.pi * x[0]))
+    J = assemble_scalar(0.5 * ufl.inner(uh - d, uh - d) * ufl.dx)
+    control = pyadjoint.Control(m)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    dm = Function(V)
+    dm.interpolate(lambda x: np.cos(x[0] * np.pi))
+    Jh.hessian(dm)
+
+    templates, _, _ = problem._get_or_build_tlm_rhs_templates()
+    compiled_ids = {c: id(form) for c, form in templates.items()}
+    assert compiled_ids, "no TLM RHS templates were built"
+
+    m2 = Function(V)
+    m2.interpolate(lambda x: 2.0 + np.sin(x[0]))
+    Jh(m2)
+    Jh.hessian(dm)
+
+    templates_after, _, _ = problem._get_or_build_tlm_rhs_templates()
+    for c, form in templates_after.items():
+        assert id(form) == compiled_ids[c], f"TLM RHS template for {c.name} was rebuilt"
+
+
+def test_tlm_skips_inactive_dependency_with_singular_derivative():
+    """An inactive dependency (no tangent-linear value) whose derivative would be
+    singular at its current value must never be evaluated at all -- not even
+    with a zeroed seed.
+
+    ``c`` enters the bilinear form as ``sqrt(c)``, which is finite at ``c == 0``
+    but whose derivative, ``1 / (2 * sqrt(c))``, is not. ``c`` is set to exactly
+    zero over part of the domain and is never declared a control, so its
+    tangent-linear value is always ``None``. If that dependency's contribution
+    were assembled with a zeroed seed instead of skipped outright, the ``0 *
+    inf`` there would poison the whole tangent-linear (and, downstream,
+    Hessian) result with ``NaN``. Only ``m`` is seeded.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    Z = dolfinx.fem.functionspace(mesh, ("DG", 0))
+
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+
+    c = Function(Z, name="not_a_control")
+    c.interpolate(lambda x: np.maximum(x[0] - 0.5, 0.0))
+
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2 + x[1] ** 2)
+
+    a = (1.0 + ufl.sqrt(c)) * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = m * v * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    petsc_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
+    problem.solve()
+    assert np.isfinite(uh.x.array).all()
+
+    d = Function(V)
+    d.interpolate(lambda x: np.sin(np.pi * x[0]))
+    J = assemble_scalar(0.5 * ufl.inner(uh - d, uh - d) * ufl.dx)
+    control = pyadjoint.Control(m)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    dm = Function(V)
+    dm.interpolate(lambda x: np.cos(x[0] * np.pi))
+
+    grad = Jh.derivative()
+    assert np.isfinite(grad.x.array).all(), "gradient contains NaN/Inf from the inactive singular dependency"
+
+    hessian_action = Jh.hessian(dm)
+    assert np.isfinite(hessian_action.x.array).all(), (
+        "Hessian action contains NaN/Inf from the inactive singular dependency"
+    )
