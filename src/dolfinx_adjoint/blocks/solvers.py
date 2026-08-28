@@ -463,7 +463,7 @@ class LinearProblemBlock(pyadjoint.Block):
         )
 
         # 3. Hot-swap solver forms
-        self._forward_solver._a = compiled_lhs
+        self._forward_solver._a = compiled_lhs  # type: ignore[assignment]
         self._forward_solver._L = compiled_rhs  # type: ignore[assignment]
         self._forward_solver._preconditioner = compiled_preconditioner
         self._forward_solver.bcs = self._bcs
