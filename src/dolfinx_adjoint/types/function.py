@@ -49,6 +49,14 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     """
 
+    _ad_bc_backing: bool = False
+    """Set on a Function that backs a live dolfinx.fem.DirichletBC (by DirichletBC.__init__).
+
+    A DirichletBC reads this Function's array directly through its C++ binding, not through UFL
+    form substitution, so FunctionAssignBlock.recompute_component must keep mutating the exact
+    same object in place for a tagged Function instead of returning an isolated snapshot.
+    """
+
     def __init__(
         self,
         V: dolfinx.fem.FunctionSpace,
