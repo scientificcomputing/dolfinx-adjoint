@@ -232,9 +232,9 @@ class FunctionAssignBlock(Block):
         if self.expr is None:
             prepared = inputs[0]
 
-        # We should return the exact object instance to maintain C++ memory bindings
-        # (especially for DirichletBCs), updating it in-place.
         output = block_variable.saved_output
+        if isinstance(output, _Function):
+            output = output._ad_new_like()
         if isinstance(prepared, dolfinx.fem.Function):
             output.x.array[:] = prepared.x.array[:]
         elif isinstance(prepared, (float, int)):

@@ -9,6 +9,7 @@ import numpy as np
 import pyadjoint
 import pytest
 import ufl
+from checkpoint_schedules import Revolve
 
 from dolfinx_adjoint import Constant, Function, assemble_scalar, assign
 
@@ -304,3 +305,52 @@ def test_assign_real_function_equals_constant(mesh_1D):
     # Verify the adjoint derivative is correct (should converge at rate ~ 2.0)
     convergence_rate = pyadjoint.taylor_test(rf, r_func, h)
     assert convergence_rate > 1.9, f"Taylor test failed with rate {convergence_rate}"
+
+
+def test_recompute_does_not_alias_state_across_timesteps(mesh_1D):
+    V = dolfinx.fem.functionspace(mesh_1D, ("Lagrange", 1))
+
+    def run(schedule):
+        pyadjoint.get_working_tape().clear_tape()
+        tape = pyadjoint.Tape()
+        pyadjoint.set_working_tape(tape)
+        if schedule is not None:
+            tape.enable_checkpointing(schedule)
+
+        controls = []
+        for i in range(5):
+            c = Function(V, name=f"control_{i}")
+            c.interpolate(lambda x, i=i: 1.0 + 0.1 * (i + 1) * x[0])
+            controls.append(c)
+
+        prev = Function(V, name="prev")
+        assign(0.0, prev)
+
+        J = 0.0
+        for i in tape.timestepper(iter(range(5))):
+            state = Function(V, name="state")
+            assign(prev + controls[i], state)
+            J = J + assemble_scalar(state * state * ufl.dx)
+            assign(state, prev)
+
+        rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+        return rf, controls
+
+    # A tape that has had checkpointing enabled keeps eagerly checkpointing outputs even after
+    # clear_tape() (see tests/test_checkpointing.py's isolated_tape fixture docstring), so the
+    # Revolve-enabled tape built by run() below must not leak out as the working tape once this
+    # test returns -- restore whatever was active beforehand.
+    previous_tape = pyadjoint.get_working_tape()
+    try:
+        rf_plain, controls_plain = run(None)
+        rf_plain(controls_plain)
+        grad_plain = [np.copy(g.x.array) for g in rf_plain.derivative()]
+
+        rf_ckpt, controls_ckpt = run(Revolve(5, 2))
+        rf_ckpt(controls_ckpt)
+        grad_ckpt = [np.copy(g.x.array) for g in rf_ckpt.derivative()]
+
+        for i, (a, e) in enumerate(zip(grad_ckpt, grad_plain, strict=True)):
+            np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+    finally:
+        pyadjoint.set_working_tape(previous_tape)
