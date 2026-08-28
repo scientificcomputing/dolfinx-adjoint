@@ -8,6 +8,9 @@ place (doing so would corrupt them for any later use of that same object, such a
 a Taylor test that perturbs the original control directly).
 """
 
+import gc
+import weakref
+
 from mpi4py import MPI
 
 import dolfinx
@@ -536,3 +539,111 @@ def test_nonlinear_tlm_rhs_templates_compiled_once():
     templates_after, _, _ = problem._get_or_build_tlm_rhs_templates()
     for c, form in templates_after.items():
         assert id(form) == compiled_ids[c], f"TLM RHS template for {c.name} was rebuilt"
+
+
+def test_linear_problem_released_by_refcounting_not_gc():
+    """Dropping a LinearProblem (and clearing the tape) must release it -- and its
+    PETSc solvers -- via ordinary reference counting, never leaving it as cyclic
+    garbage collected only by a later ``gc.collect()``.
+
+    Regression test for a real bug found while building the placeholder-substitution
+    machinery: a recursive nested ``_replace`` helper inside ``LinearProblem.__init__``
+    captured *itself* (for the recursive call) and ``self`` in its closure, forming a
+    reference cycle. That cycle kept the Problem -- and hence its PETSc Mat/KSP
+    objects -- alive until whenever the cyclic garbage collector next ran, exactly
+    the "freed at a rank-nondeterministic moment" hazard the whole
+    Problem-owns-its-solvers refactor exists to eliminate: confirmed live under
+    ``mpirun -n 2`` by observing the two ranks diverge into two different collective
+    calls -- one inside a PETSc Mat's collective MUMPS-termination destructor, the
+    other already building an unrelated dofmap for the next test -- while this bug
+    was present. Fixed by making the recursive helper
+    (``dolfinx_adjoint.solvers._replace_with_placeholders``) a plain module-level
+    function taking the placeholder dict as an explicit argument, so it does not need
+    to capture itself or ``self``.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2)
+
+    a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    petsc_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    gc.disable()
+    try:
+        problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
+        problem.solve()
+
+        problem_ref = weakref.ref(problem)
+        del problem
+        pyadjoint.get_working_tape().clear_tape()
+
+        assert problem_ref() is None, (
+            "LinearProblem was not released by ordinary refcounting -- it is cyclic "
+            "garbage, collected only by gc.collect() at a moment that can differ "
+            "between MPI ranks"
+        )
+    finally:
+        gc.enable()
+
+
+def test_nonlinear_problem_released_by_refcounting_not_gc():
+    """As above, but for NonlinearProblem."""
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    f = Function(V, name="control")
+    f.interpolate(lambda x: 2.0 + np.sin(x[0]))
+
+    u1 = Function(V, name="state")
+    u1.interpolate(lambda x: np.ones_like(x[0]))
+    v1 = ufl.TestFunction(V)
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
+    bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
+
+    options = {
+        "snes_error_if_not_converged": True,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    gc.disable()
+    try:
+        problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+        problem.solve()
+
+        problem_ref = weakref.ref(problem)
+        del problem
+        pyadjoint.get_working_tape().clear_tape()
+
+        assert problem_ref() is None, (
+            "NonlinearProblem was not released by ordinary refcounting -- it is cyclic "
+            "garbage, collected only by gc.collect() at a moment that can differ "
+            "between MPI ranks"
+        )
+    finally:
+        gc.enable()

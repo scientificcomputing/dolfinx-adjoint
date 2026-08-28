@@ -37,6 +37,33 @@ def _collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set:
     return coefficients
 
 
+def _replace_with_placeholders(
+    form: ufl.Form | typing.Sequence | None, placeholders: dict
+) -> ufl.Form | typing.Sequence | None:
+    """Recursively apply ``ufl.replace(form, placeholders)`` to a (possibly nested) form
+    structure.
+
+    A module-level function, not a nested closure: a nested function that
+    recurses by calling itself by name captures *itself* as a free variable,
+    which makes the function object (and, via ``self`` if the closure also
+    needs it) part of a reference cycle -- collected only by the cyclic
+    garbage collector, at a moment that differs between MPI ranks, not by
+    ordinary refcounting. That is exactly the hazard ``Problem`` owning its
+    solvers (rather than each ``Block``) exists to avoid: a self-referential
+    ``_replace`` closure inside ``LinearProblem``/``NonlinearProblem.__init__``
+    would keep the ``Problem`` itself -- and its PETSc solvers -- alive as
+    cyclic garbage. Taking ``placeholders`` as a plain argument instead of
+    capturing ``self`` sidesteps this entirely: a module-level function
+    referring to itself by name is looked up through the module's namespace,
+    not a closure cell, so no cycle is created.
+    """
+    if form is None:
+        return None
+    if isinstance(form, ufl.Form):
+        return ufl.replace(form, placeholders)
+    return [_replace_with_placeholders(f, placeholders) for f in form]
+
+
 @typing.overload
 def resolve_u(u: _Function | None, L: ufl.Form) -> _Function: ...
 @typing.overload
@@ -187,20 +214,13 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             c: dolfinx.fem.Function(c.function_space) for c in coefficients
         }
 
-        def _replace(form):
-            if form is None:
-                return None
-            if isinstance(form, ufl.Form):
-                return ufl.replace(form, self._value_placeholders)
-            return [_replace(f) for f in form]
-
         # Initialize linear solver
         super().__init__(
-            a=_replace(a),  # type: ignore[arg-type]
-            L=_replace(L),  # type: ignore[arg-type]
+            a=_replace_with_placeholders(a, self._value_placeholders),  # type: ignore[arg-type]
+            L=_replace_with_placeholders(L, self._value_placeholders),  # type: ignore[arg-type]
             bcs=bcs,
             u=self._u,  # type: ignore[arg-type]
-            P=_replace(P),  # type: ignore[arg-type]
+            P=_replace_with_placeholders(P, self._value_placeholders),  # type: ignore[arg-type]
             kind=kind,  # type: ignore[arg-type]
             petsc_options_prefix=petsc_options_prefix,
             petsc_options=petsc_options,
@@ -682,18 +702,11 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
             c: dolfinx.fem.Function(c.function_space) for c in coefficients
         }
 
-        def _replace(form):
-            if form is None:
-                return None
-            if isinstance(form, ufl.Form):
-                return ufl.replace(form, self._value_placeholders)
-            return [_replace(f) for f in form]
-
         # Initialize nonlinear solver
         super().__init__(
-            F=_replace(F),  # type: ignore[arg-type]
-            J=_replace(J),  # type: ignore[arg-type]
-            P=_replace(P),  # type: ignore[arg-type]
+            F=_replace_with_placeholders(F, self._value_placeholders),  # type: ignore[arg-type]
+            J=_replace_with_placeholders(J, self._value_placeholders),  # type: ignore[arg-type]
+            P=_replace_with_placeholders(P, self._value_placeholders),  # type: ignore[arg-type]
             bcs=self._bcs,
             u=self._u,  # type: ignore[arg-type]
             kind=kind,  # type: ignore[arg-type]

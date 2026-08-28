@@ -121,6 +121,82 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
     assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
 
+def _diffusive_poisson(mesh):
+    """Scalar Poisson problem whose control ``m`` sits inside ``a`` (the diffusivity).
+
+    A scalar-space sibling of ``_viscous_stokes``: the control has to enter the
+    bilinear form for this test to have any teeth, for the same reason noted there.
+    """
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    Z = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    dx = ufl.Measure("dx", domain=mesh)
+
+    m = Function(Z, name="diffusivity")
+    m.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    x = ufl.SpatialCoordinate(mesh)
+    f = 1e2 * ufl.sin(ufl.pi * x[0]) * ufl.cos(ufl.pi * x[1])
+
+    a = ufl.inner(m * ufl.grad(u), ufl.grad(v)) * dx
+    L = ufl.inner(f, v) * dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), dofs, V)
+
+    uh = Function(V, name="state")
+    problem = LinearProblem(
+        a,
+        L,
+        u=uh,
+        bcs=[bc],
+        petsc_options=direct_solve,
+        adjoint_petsc_options=direct_solve,
+        tlm_petsc_options=direct_solve,
+    )
+    problem.solve()
+
+    # Quartic in the state, for the same round-off-avoidance reason as
+    # ``_viscous_stokes``'s objective.
+    J = assemble_scalar(uh**4 * dx)
+    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(m)), Z
+
+
+@pytest.mark.parametrize("warm_up_at_another_point", [False, True])
+def test_hessian_is_independent_of_previous_evaluation_points_scalar(warm_up_at_another_point, mesh_2D):
+    """Scalar-space sibling of ``test_hessian_is_independent_of_previous_evaluation_points``.
+
+    That test only covers the blocked/Stokes path; a plain (non-blocked) ``LinearProblem``
+    with the control inside the bilinear form is the common case the cached, compiled-once
+    adjoint/TLM/Hessian templates (``LinearProblem._get_or_build_adjoint_solver``/
+    ``_get_or_build_tlm_solver``/``_get_or_build_hessian_templates``) exist to serve, and
+    deserves the identical regression coverage: the Hessian at ``m2`` must not depend on
+    whether ``J`` was evaluated at ``m1`` first.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    Jh, Z = _diffusive_poisson(mesh_2D)
+
+    m1, m2 = Function(Z), Function(Z)
+    m1.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    h = Function(Z)
+    h.interpolate(lambda x: 1.0 + 0.3 * np.sin(3 * x[0]))
+
+    if warm_up_at_another_point:
+        Jh(m1)
+        Jh.derivative()
+        Jh.hessian(h)
+
+    Jh(m2)
+    dJdm = Jh.derivative()._ad_dot(h)
+    Hm = Jh.hessian(h)._ad_dot(h)
+
+    min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+
 def test_hessian_mpi_breakdown(mesh_2D):
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _viscous_stokes(mesh_2D)
