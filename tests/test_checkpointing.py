@@ -120,8 +120,14 @@ def _tape_heat_equation(n_steps, schedule=None, disk=False, use_mpio=None):
     v = ufl.TestFunction(V)
     f = dolfinx_adjoint.Function(V, name="source")
     uh = dolfinx_adjoint.Function(V, name="solution")
+    u_prev = dolfinx_adjoint.Function(V, name="previous")
 
-    F = ((u - uh) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
+    # The unknown and the previous state must be distinct functions: the block that solves
+    # for uh must not also depend on uh through its own form, or recompute under a checkpoint
+    # schedule would read whatever value happens to be in uh at replay time instead of the
+    # checkpointed one. The state update is therefore an explicit, tape-recorded assignment,
+    # matching _tape_snes_heat_equation below.
+    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
     a, L = ufl.system(F)
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -144,6 +150,7 @@ def _tape_heat_equation(n_steps, schedule=None, disk=False, use_mpio=None):
     for i in tape.timestepper(iter(range(n_steps))):
         dolfinx_adjoint.assign(controls[i], f)
         problem.solve()
+        dolfinx_adjoint.assign(uh, u_prev)
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
