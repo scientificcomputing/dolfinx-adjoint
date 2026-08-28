@@ -7,7 +7,8 @@ import pyadjoint
 import ufl
 from dolfinx.fem.function import Function as _Function
 
-from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock
+from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock, assign_mixed_parts, sum_form
+from .petsc_utils import LinearAdjointProblem
 from .types import Function
 
 
@@ -117,6 +118,17 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self.ad_block_tag = ad_block_tag
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options
+
+        # Assign mixed-space `part` indices to Test/Trial arguments once,
+        # here, for blocked systems (mirroring what LinearProblemBlock used to
+        # redo per block): needed so a blocked bilinear/linear form can be
+        # safely combined into one whole-system form (via sum_form) when
+        # building the adjoint solver below.
+        if not isinstance(a, ufl.Form):
+            a, L = assign_mixed_parts(a, L)  # type: ignore[arg-type]
+            if P is not None:
+                P, _ = assign_mixed_parts(P, L)  # type: ignore[arg-type]
+
         self._u = resolve_u(u, L)  # type: ignore[arg-type]
 
         # Cache some objects
@@ -126,6 +138,7 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self._form_compiler_options = form_compiler_options
         self._entity_maps = entity_maps
         self._petsc_options = petsc_options
+        self._petsc_options_prefix = petsc_options_prefix
         self._kind = kind
 
         # Initialize linear solver
@@ -143,6 +156,66 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             entity_maps=entity_maps,
         )  # type: ignore[misc]
 
+        # Match the adjoint/TLM solvers' matrix layout to whatever `kind` the
+        # forward solver actually resolved to (kind=None can auto-resolve to
+        # "nest" for blocked problems).
+        self._kind = "nest" if self.A.getType() == "nest" else kind
+
+        # Adjoint and tangent-linear solvers: built lazily (on first use, see
+        # _get_or_build_adjoint_solver/_get_or_build_tlm_solver below) and shared
+        # by every LinearProblemBlock this Problem records, rather than one per
+        # block/solve() call. Blocks only ever hold a weak reference back to this
+        # Problem (see LinearProblemBlock._problem), so dropping this Problem
+        # releases the forward, adjoint and TLM solvers' PETSc objects
+        # deterministically instead of leaving that to pyadjoint's tape/cyclic-GC
+        # schedule -- see the "mpi-collective-destruction-hazard" note in the
+        # dolfinx-adjoint-knowledge repository for why that matters. Laziness
+        # keeps pure forward (non-annotated) use from paying for a symbolic
+        # adjoint form it never needs.
+        self._adjoint_solver: typing.Optional[LinearAdjointProblem] = None
+        self._tlm_solver: typing.Optional[LinearAdjointProblem] = None
+
+    def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
+        """Build (once) and return the adjoint solver shared by every block this Problem records."""
+        if self._adjoint_solver is None:
+            self._adjoint_solver = LinearAdjointProblem(
+                LinearProblemBlock._compute_adjoint(sum_form(self._lhs)),  # type: ignore[arg-type]
+                self._rhs,  # type: ignore[arg-type]
+                bcs=self.bcs,
+                P=self._preconditioner,  # type: ignore[arg-type]
+                form_compiler_options=self._form_compiler_options,
+                jit_options=self._jit_options,
+                petsc_options=self._adj_options,
+                petsc_options_prefix=f"{self._petsc_options_prefix}adjoint_",
+                kind=self._kind,  # type: ignore[arg-type]
+                entity_maps=self._entity_maps,
+            )  # type: ignore[misc]
+        return self._adjoint_solver
+
+    def _get_or_build_tlm_solver(self, dFdu_form: ufl.Form | typing.Sequence) -> LinearAdjointProblem:
+        """Build (once) and return the TLM solver shared by every block this Problem records.
+
+        No explicit ``u=`` is passed: like the adjoint solver, this gets its own
+        scratch solution Function from the base class, and callers copy the
+        result out (see ``LinearProblemBlock.prepare_evaluate_tlm``) rather than
+        relying on solver-owned storage identity, since that storage is now
+        shared across every block instead of private to one.
+        """
+        if self._tlm_solver is None:
+            self._tlm_solver = LinearAdjointProblem(
+                dFdu_form,  # type: ignore[arg-type]
+                self._rhs,  # type: ignore[arg-type]
+                bcs=self.bcs,
+                P=self._preconditioner,  # type: ignore[arg-type]
+                form_compiler_options=self._form_compiler_options,
+                jit_options=self._jit_options,
+                petsc_options=self._tlm_options,
+                petsc_options_prefix=f"{self._petsc_options_prefix}tlm_",
+                kind=self._kind,  # type: ignore[arg-type]
+                entity_maps=self._entity_maps,
+            )  # type: ignore[misc]
+        return self._tlm_solver
+
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
         Solve the linear problem and return the solution.
@@ -155,14 +228,11 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
                 bcs=self.bcs,
                 u=self.u,  # type: ignore[arg-type]
                 P=self._preconditioner,  # type: ignore[arg-type]
-                kind=self._kind,  # type: ignore[arg-type]
-                petsc_options=self._petsc_options,
                 form_compiler_options=self._form_compiler_options,
                 jit_options=self._jit_options,
                 entity_maps=self._entity_maps,
                 ad_block_tag=self.ad_block_tag,
-                adjoint_petsc_options=self._adj_options,
-                tlm_petsc_options=self._tlm_options,
+                problem=self,
             )  # type: ignore[misc]
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
@@ -268,6 +338,7 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
         self._form_compiler_options = form_compiler_options
         self._entity_maps = entity_maps
         self._petsc_options = petsc_options
+        self._petsc_options_prefix = petsc_options_prefix
         self._kind = kind
 
         # Initialize linear solver
@@ -285,6 +356,31 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
             entity_maps=entity_maps,
         )  # type: ignore[misc]
 
+        # Adjoint solver: built lazily (see _get_or_build_adjoint_solver) and
+        # shared by every NonlinearProblemBlock this Problem records, rather
+        # than one per block/solve() call -- same rationale as LinearProblem.
+        self._adjoint_solver: typing.Optional[LinearAdjointProblem] = None
+
+    def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
+        """Build (once) and return the adjoint solver shared by every block this Problem records."""
+        if self._adjoint_solver is None:
+            if not isinstance(self._rhs, ufl.Form):
+                raise NotImplementedError("Blocked systems not implemented yet.")
+            dFdu_adj = ufl.adjoint(ufl.derivative(self._rhs, self._u))
+            self._adjoint_solver = LinearAdjointProblem(
+                dFdu_adj,  # type: ignore[arg-type]
+                self._rhs,  # type: ignore[arg-type]
+                bcs=self._bcs,
+                P=self._preconditioner,  # type: ignore[arg-type]
+                form_compiler_options=self._form_compiler_options,
+                jit_options=self._jit_options,
+                petsc_options=self._adj_options,
+                petsc_options_prefix=f"{self._petsc_options_prefix}adjoint_",
+                kind=self._kind,  # type: ignore[arg-type]
+                entity_maps=self._entity_maps,
+            )  # type: ignore[misc]
+        return self._adjoint_solver
+
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
         Solve the linear problem and return the solution.
@@ -297,14 +393,12 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
                 bcs=self._bcs,
                 u=self.u,  # type: ignore[arg-type]
                 P=self._preconditioner,  # type: ignore[arg-type]
-                kind=self._kind,  # type: ignore[arg-type]
-                petsc_options=self._petsc_options,
                 form_compiler_options=self._form_compiler_options,
                 jit_options=self._jit_options,
                 entity_maps=self._entity_maps,
                 ad_block_tag=self.ad_block_tag,
-                adjoint_petsc_options=self._adj_options,
                 tlm_petsc_options=self._tlm_options,
+                problem=self,
             )  # type: ignore[misc]
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
