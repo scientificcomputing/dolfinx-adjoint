@@ -253,22 +253,6 @@ def _tape_snes_heat_equation(n_steps, schedule=None, solution_dependent_diffusiv
     return rf, controls, _perturbation_directions(V, n_steps)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-existing NonlinearProblemBlock defect, unrelated to checkpointing: a residual "
-        "problem advanced over several timesteps gets a wrong adjoint. The unknown is a "
-        "coefficient of the residual and so is registered as one of the block's own "
-        "dependencies; once its incoming value is itself control-dependent (which is what a "
-        "time loop creates) the adjoint contribution for it is computed against a residual in "
-        "which that value no longer appears, and ufl.adjoint raises IndexError on the "
-        "resulting argument-less form. Suppressing the error is not a fix: the gradient is "
-        "then silently wrong (observed Taylor rate -0.41 rather than 2). Checkpointing is not "
-        "involved -- this test does not enable a schedule. Until it is fixed, NonlinearProblem "
-        "cannot be used in a time loop and so cannot be covered by the checkpointing tests "
-        "above."
-    ),
-)
 def test_snes_time_loop_gradient_is_correct():
     """Records that NonlinearProblem cannot yet be advanced over timesteps."""
     rf, controls, directions = _tape_snes_heat_equation(4)
