@@ -1021,7 +1021,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._adjoint_petsc_options = adjoint_petsc_options
         self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
-        self._lhs = J
         self._preconditioner = P
 
         # Create overloaded functions
@@ -1031,7 +1030,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             self._u = pyadjoint.create_overloaded_object(u)
             replace_dict = {u: self._u}
             self._rhs = ufl.replace(F, replace_dict)
-            self._lhs = ufl.replace(J, replace_dict) if J is not None else None
+            J = ufl.replace(J, replace_dict) if J is not None else None
             self._preconditioner = ufl.replace(P, replace_dict) if P is not None else None
         else:
             self._u = [pyadjoint.create_overloaded_object(ui) for ui in u]
@@ -1040,33 +1039,18 @@ class NonlinearProblemBlock(pyadjoint.Block):
             self._rhs = [ufl.replace(Fi, replace_dict) for Fi in F]
 
         # NOTE: Add mesh and constants as dependencies later on
-        try:
-            u_list = self._u if isinstance(self._u, list) else [self._u]
-            if self._lhs is not None:
-                assert isinstance(self._lhs, ufl.Form)
-                for c in self._lhs.coefficients():
-                    if c not in u_list:  # Exclude unknown
-                        self.add_dependency(c, no_duplicates=True)
-            if self._rhs is not None:
-                assert isinstance(self._rhs, ufl.Form)
-                for c in self._rhs.coefficients():
-                    if c not in u_list:  # Exclude unknown
-                        self.add_dependency(c, no_duplicates=True)
-        except AttributeError:
-            raise NotImplementedError("Blocked systems not implemented yet.")
+        u_list = self._u if isinstance(self._u, list) else [self._u]
+        if J is not None:
+            assert isinstance(J, ufl.Form)
+            for c in J.coefficients():
+                if c not in u_list:  # Exclude unknown
+                    self.add_dependency(c, no_duplicates=True)
+        if self._rhs is not None:
+            assert isinstance(self._rhs, ufl.Form)
+            for c in self._rhs.coefficients():
+                if c not in u_list:  # Exclude unknown
+                    self.add_dependency(c, no_duplicates=True)
 
-        self._compiled_lhs = dolfinx.fem.form(
-            self._lhs,  # type: ignore
-            jit_options=jit_options,
-            form_compiler_options=form_compiler_options,
-            entity_maps=entity_maps,
-        )
-        self._compiled_rhs = dolfinx.fem.form(
-            self._rhs,
-            jit_options=jit_options,
-            form_compiler_options=form_compiler_options,
-            entity_maps=entity_maps,
-        )
         # Cache form parameters for later
         # NOTE: Should probably be in a struct
         self._jit_options = jit_options
@@ -1077,7 +1061,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._bcs = bcs if bcs is not None else []
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.NonlinearProblem(
-            J=self._lhs,  # type: ignore[arg-type]
+            J=J,  # type: ignore[arg-type]
             F=self._rhs,  # type: ignore[arg-type]
             bcs=self._bcs,
             u=self._u,  # type: ignore[arg-type]
@@ -1168,15 +1152,16 @@ class NonlinearProblemBlock(pyadjoint.Block):
 
     def recompute_component(
         self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
-    ) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
+    ) -> Function:
         """Recompute the block with the prepared linear problem."""
         with pyadjoint.tape.stop_annotating():
             self._forward_solver.solve()
-
         if isinstance(self._forward_solver._u, list):
-            return self._forward_solver._u[idx]
+            output = self._forward_solver._u[idx]
         else:
-            return self._forward_solver._u
+            output = self._forward_solver._u
+        assert isinstance(output, Function)
+        return output
 
     def _should_compute_boundary_adjoint(
         self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
