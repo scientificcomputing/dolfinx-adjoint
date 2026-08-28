@@ -344,84 +344,37 @@ class LinearProblemBlock(pyadjoint.Block):
                     replace_map.update(self._create_replace_map(f))
         return replace_map
 
-    def _create_recompute_replace_map(self, inputs: typing.Sequence[typing.Any]) -> dict:
-        """Map original dependency coefficients to active recomputation inputs."""
-        replace_map = {}
-        for block_variable, input_val in zip(self.get_dependencies(), inputs, strict=True):
-            coeff = block_variable.output
-            val = input_val.output if isinstance(input_val, pyadjoint.block_variable.BlockVariable) else input_val
-            replace_map[coeff] = val
-        return replace_map
-
-    @typing.overload
-    def _replace_form_coefficients_recompute(
-        self, form: ufl.Form | NestedSequence[ufl.Form], replace_map: dict
-    ) -> ufl.Form | NestedMutableSequence[ufl.Form | None]: ...
-    @typing.overload
-    def _replace_form_coefficients_recompute(self, form: None, replace_map: dict) -> None: ...
-    def _replace_form_coefficients_recompute(
-        self, form: ufl.Form | NestedSequence[ufl.Form] | None, replace_map: dict
-    ) -> ufl.Form | NestedMutableSequence[ufl.Form | None] | None:
-        """Recursively replace form coefficients for scalar or blocked form structures."""
-        if form is None:
-            return None
-        if isinstance(form, ufl.Form):
-            coeffs_in_form = form.coefficients()
-            sub_map = {k: v for k, v in replace_map.items() if k in coeffs_in_form}
-            return ufl.replace(form, sub_map) if sub_map else form
-        elif isinstance(form, typing.Sequence):
-            return [self._replace_form_coefficients_recompute(f, replace_map) for f in form]
-        else:
-            raise TypeError(f"Cannot replace coefficients in form of type {type(form)}")
-
     def prepare_recompute_component(
         self, inputs: typing.Sequence[typing.Any], relevant_outputs: typing.Sequence[typing.Any]
     ) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
         """Prepare for recomputing the block with different control inputs."""
 
-        replace_map = self._create_recompute_replace_map(inputs)
-
-        # 1. Substitute forms using active candidate inputs instead of static tape checkpoints
-        lhs = self._replace_form_coefficients_recompute(self._lhs, replace_map)
-        rhs = self._replace_form_coefficients_recompute(self._rhs, replace_map)
-        preconditioner = (
-            self._replace_form_coefficients_recompute(self._preconditioner, replace_map)
-            if self._preconditioner is not None
-            else None
-        )
-
-        # 2. Recompile UFL forms with candidate inputs
-        compiled_lhs = dolfinx.fem.form(
-            lhs,  # type: ignore[arg-type]
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        compiled_rhs = dolfinx.fem.form(
-            rhs,  # type: ignore[arg-type]
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        compiled_preconditioner = (
-            dolfinx.fem.form(
-                preconditioner,  # type: ignore[arg-type]
-                jit_options=self._jit_options,
-                form_compiler_options=self._form_compiler_options,
-                entity_maps=self._entity_maps,
-            )
-            if preconditioner is not None
-            else None
-        )
-
-        # 3. Hot-swap solver forms onto the shared forward solver (the Problem
-        # itself -- see _problem()). It is mutated here and re-established on
-        # every recompute/solve rather than assumed to still hold this block's
-        # values, since another block may have used it in between.
+        # Write this call's candidate/checkpointed dependency values into the
+        # Problem's dedicated recompute placeholders (built once, compiled
+        # once -- see LinearProblem._get_or_build_recompute_forms), rather
+        # than building a fresh ufl.replace'd copy of the forms and
+        # recompiling it via FFCx on every call. Crucially, this never
+        # mutates the user's own coefficient objects: a Taylor test commonly
+        # perturbs the original control object directly
+        # (`pyadjoint.taylor_test(Jh, m, dm)`), and that perturbation must
+        # always be computed relative to the *pristine* original value, not
+        # whatever a previous recompute happened to leave in it.
         problem = self._problem()
-        problem._a = compiled_lhs  # type: ignore[assignment]
-        problem._L = compiled_rhs  # type: ignore[assignment]
-        problem._preconditioner = compiled_preconditioner
+        placeholders, recompute_a, recompute_L, recompute_preconditioner = problem._get_or_build_recompute_forms()
+        for block_variable in self.get_dependencies():
+            placeholder = placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
+
+        # Point the shared forward solver (the Problem itself -- see
+        # _problem()) at the recompute forms and re-establish this block's
+        # own bcs, since another block may have used it (in "live" or
+        # "recompute" mode, with different bcs) in between. solve() always
+        # restores the "live" forms before an ordinary .solve() call.
+        problem._a = recompute_a  # type: ignore[assignment]
+        problem._L = recompute_L  # type: ignore[assignment]
+        problem._preconditioner = recompute_preconditioner
         problem.bcs = self._bcs
         problem._u = self._u
 
@@ -431,7 +384,7 @@ class LinearProblemBlock(pyadjoint.Block):
         else:
             for ui in self._u:
                 ui.x.array[:] = 0.0
-        # 4. Solve forward state while halting annotation. Call the base-class
+        # Solve forward state while halting annotation. Call the base-class
         # solve() directly (not problem.solve()), which would record another
         # block onto the tape.
         with pyadjoint.stop_annotating():

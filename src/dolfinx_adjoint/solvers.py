@@ -161,6 +161,31 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         # "nest" for blocked problems).
         self._kind = "nest" if self.A.getType() == "nest" else kind
 
+        # The "live" compiled forms, referencing the user's own coefficient
+        # objects directly -- used for every ordinary .solve() call. Snapshot
+        # them once so solve() can always restore them, even after a
+        # recompute (see _get_or_build_recompute_forms) has pointed self._a/
+        # self._L/self._preconditioner at the placeholder-based recompute
+        # forms in between.
+        self._live_a = self._a
+        self._live_L = self._L
+        self._live_preconditioner = self._preconditioner
+
+        # Recompute forms: built lazily (see _get_or_build_recompute_forms),
+        # compiled once against dedicated placeholder coefficients rather than
+        # the user's own dependency objects. Blocks replaying this Problem
+        # with a checkpointed/candidate value (e.g. during a Taylor test or an
+        # optimisation iteration) write into these placeholders instead of the
+        # user's own Functions: mutating the user's own control object in
+        # place would corrupt it for any later use of that same object (e.g.
+        # a Taylor test that perturbs the original control directly, as
+        # `pyadjoint.taylor_test(Jh, m, dm)` does), silently invalidating
+        # every subsequent perturbation computed relative to it.
+        self._recompute_value_placeholders: typing.Optional[dict] = None
+        self._recompute_a = None
+        self._recompute_L = None
+        self._recompute_preconditioner = None
+
         # Adjoint and tangent-linear solvers: built lazily (on first use, see
         # _get_or_build_adjoint_solver/_get_or_build_tlm_solver below) and shared
         # by every LinearProblemBlock this Problem records, rather than one per
@@ -216,6 +241,68 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             )  # type: ignore[misc]
         return self._tlm_solver
 
+    def _get_or_build_recompute_forms(self) -> tuple[dict, typing.Any, typing.Any, typing.Any]:
+        """Build (once) and return the placeholder-based forms used to replay this
+        Problem's forward solve with different dependency values.
+
+        Returns a ``(value_placeholders, compiled_a, compiled_L, compiled_preconditioner)``
+        tuple. ``value_placeholders`` maps each of this Problem's dependency
+        coefficients (as they appear in ``a``/``L``) to a dedicated, plain
+        ``dolfinx.fem.Function`` that the compiled forms reference instead.
+        Blocks write a checkpointed/candidate value into the placeholder
+        before replaying (see ``LinearProblemBlock.prepare_recompute_component``),
+        leaving the user's own coefficient objects untouched.
+        """
+        if self._recompute_value_placeholders is None:
+            coefficients: set = set()
+            lhs_summed = sum_form(self._lhs)  # type: ignore[arg-type]
+            rhs_summed = sum_form(self._rhs)  # type: ignore[arg-type]
+            if lhs_summed is not None:
+                coefficients.update(lhs_summed.coefficients())
+            if rhs_summed is not None:
+                coefficients.update(rhs_summed.coefficients())
+            placeholders = {c: dolfinx.fem.Function(c.function_space) for c in coefficients}
+
+            def _replace(form):
+                if form is None:
+                    return None
+                if isinstance(form, ufl.Form):
+                    return ufl.replace(form, placeholders)
+                return [_replace(f) for f in form]
+
+            recompute_lhs = _replace(self._lhs)
+            recompute_rhs = _replace(self._rhs)
+            recompute_preconditioner = _replace(self._preconditioner) if self._preconditioner is not None else None
+            self._recompute_value_placeholders = placeholders
+            self._recompute_a = dolfinx.fem.form(
+                recompute_lhs,
+                jit_options=self._jit_options,
+                form_compiler_options=self._form_compiler_options,
+                entity_maps=self._entity_maps,
+            )
+            self._recompute_L = dolfinx.fem.form(
+                recompute_rhs,
+                jit_options=self._jit_options,
+                form_compiler_options=self._form_compiler_options,
+                entity_maps=self._entity_maps,
+            )
+            self._recompute_preconditioner = (
+                dolfinx.fem.form(
+                    recompute_preconditioner,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+                if recompute_preconditioner is not None
+                else None
+            )
+        return (
+            self._recompute_value_placeholders,
+            self._recompute_a,
+            self._recompute_L,
+            self._recompute_preconditioner,
+        )
+
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
         Solve the linear problem and return the solution.
@@ -237,6 +324,14 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
 
+        # A prior recompute (see LinearProblemBlock.prepare_recompute_component)
+        # may have pointed self._a/self._L/self._preconditioner at the
+        # placeholder-based recompute forms; always restore the "live" forms
+        # -- which reference the user's own, current coefficient values
+        # directly -- before an ordinary solve.
+        self._a = self._live_a  # type: ignore[assignment]
+        self._L = self._live_L  # type: ignore[assignment]
+        self._preconditioner = self._live_preconditioner
         out = dolfinx.fem.petsc.LinearProblem.solve(self)
         if annotate:
             if isinstance(out, Function):
