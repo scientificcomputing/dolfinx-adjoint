@@ -88,3 +88,77 @@ def test_solver(mesh_var_name: str, request, constant: typing.Union[float, int, 
     dHddu = hessian._ad_dot(e)
     min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
     assert np.isclose(min_rate, 3.0, rtol=5e-3, atol=5e-3), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+
+def test_linear_mixed_derivative_hessian(mesh_2D):
+    """Test LinearProblem with a control in the bilinear form (d2F/dudm != 0)."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = mesh_2D
+
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+
+    # Control variable (conductivity)
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2 + x[1] ** 2)
+
+    # Constant Source term
+    f = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0))
+
+    # Linear problem where the bilinear form explicitly depends on the control 'm'
+    a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = f * v * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    # Forward Solve
+    petsc_options = {
+        "ksp_monitor": None,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(
+        a,
+        L,
+        bcs=[bc],
+        u=uh,
+        petsc_options=petsc_options,
+        adjoint_petsc_options=petsc_options,
+        tlm_petsc_options=petsc_options,
+    )
+    problem.solve()
+
+    # Define Objective
+    d = Function(V)
+    d.interpolate(lambda x: np.sin(np.pi * x[0]))
+    J = assemble_scalar(0.5 * ufl.inner(uh - d, uh - d) * ufl.dx)
+
+    control = pyadjoint.Control(m)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    # Perturbation
+    dm = Function(V)
+    dm.interpolate(lambda x: 2 * np.sin(x[0] * np.pi) * np.cos(x[1] * np.pi))
+
+    # Perturbation test
+    min_rate = pyadjoint.taylor_test(Jh, m, dm, dJdm=0)
+    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+    Jh(m)
+
+    # Gradient Taylor Test
+    min_rate_grad = pyadjoint.taylor_test(Jh, m, dm)
+    assert np.isclose(min_rate_grad, 2.0, rtol=1e-1, atol=1e-1), f"Grad rate failed: {min_rate_grad}"
+
+    # Hessian Taylor Test
+    Jh(m)
+    dJ = Jh.derivative()._ad_dot(dm)
+    H = Jh.hessian(dm)._ad_dot(dm)
+    min_rate_hess = pyadjoint.taylor_test(Jh, m, dm, dJdm=dJ, Hm=H)
+    assert np.isclose(min_rate_hess, 3.0, rtol=1e-1, atol=1e-1), f"Hessian rate failed: {min_rate_hess}"
