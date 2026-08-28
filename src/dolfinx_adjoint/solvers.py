@@ -228,11 +228,16 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self._adjoint_solver: typing.Optional[LinearAdjointProblem] = None
         self._tlm_solver: typing.Optional[LinearAdjointProblem] = None
         self._dFdu_template: typing.Optional[ufl.Form | typing.Sequence] = None
+        self._dFdu_adj_template: typing.Optional[ufl.Form | typing.Sequence] = None
         self._tlm_rhs_templates: typing.Optional[dict] = None
         self._tlm_seed_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {}
         self._residual_state_placeholder: typing.Union[
             dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function], None
         ] = None
+        self._hessian_templates: typing.Optional[tuple[dict, dict, dict]] = None
+        self._adjoint_solution_placeholder: typing.Optional[dolfinx.fem.Function] = None
+        self._second_adjoint_solution_placeholder: typing.Optional[dolfinx.fem.Function] = None
+        self._hessian_u_seed: typing.Optional[dolfinx.fem.Function] = None
 
     def _get_or_build_dFdu_template(self) -> ufl.Form | typing.Sequence:
         """Build (once) and return dF/du with every non-u coefficient replaced by its
@@ -253,11 +258,29 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             self._dFdu_template = ufl.replace(sum_form(self._lhs), self._value_placeholders)  # type: ignore[arg-type]
         return self._dFdu_template
 
+    def _get_or_build_dFdu_adj_template(self) -> ufl.Form | typing.Sequence:
+        """Build (once) and return adjoint(dF/du), shared by the adjoint solver
+        (``_get_or_build_adjoint_solver``) and, for scalar problems, the Hessian
+        SOA right-hand-side's cross-dependency templates
+        (``_get_or_build_hessian_templates``).
+
+        Kept exactly as ``_compute_adjoint`` returns it -- a nested list of
+        forms for a blocked problem -- since that structure is what
+        ``LinearAdjointProblem``/``dolfinx.fem.petsc.LinearProblem`` needs for
+        block matrix assembly; callers that need a single summed form (Hessian
+        templating, scalar-only) apply ``sum_form`` themselves.
+        """
+        if self._dFdu_adj_template is None:
+            self._dFdu_adj_template = LinearProblemBlock._compute_adjoint(
+                self._get_or_build_dFdu_template()  # type: ignore[arg-type]
+            )
+        return self._dFdu_adj_template
+
     def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
         """Build (once) and return the adjoint solver shared by every block this Problem records."""
         if self._adjoint_solver is None:
             self._adjoint_solver = LinearAdjointProblem(
-                LinearProblemBlock._compute_adjoint(self._get_or_build_dFdu_template()),  # type: ignore[arg-type]
+                self._get_or_build_dFdu_adj_template(),  # type: ignore[arg-type]
                 self._rhs,  # type: ignore[arg-type]
                 bcs=self.bcs,
                 P=self._preconditioner,  # type: ignore[arg-type]
@@ -385,6 +408,117 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
                 self._tlm_seed_placeholders[c] = seed
             self._tlm_rhs_templates = templates
         return self._tlm_rhs_templates, self._tlm_seed_placeholders, self._residual_state_placeholder  # type: ignore[return-value]
+
+    def _get_or_build_hessian_templates(self) -> tuple[dict, dict, dict]:
+        """Build (once) and return the per-dependency Hessian templates used by
+        ``LinearProblemBlock.prepare_evaluate_hessian``'s SOA right-hand side and
+        ``evaluate_hessian_component``'s own Hessian-action output.
+
+        Scalar (non-blocked) problems only -- the blocked Hessian cross-term
+        stays on the pre-templating, per-call ``ufl.replace`` + recompile path
+        (see the module-level plan notes: this is deferred, ownership-move
+        only, for the blocked case).
+
+        Three dicts are returned:
+
+        - ``soa_templates[c]``: the SOA right-hand-side's contribution from
+          dependency ``c``'s tangent-linear direction, a 1-form in the state's
+          own test function.
+        - ``fixed_templates[c]``: the part of dependency ``c``'s own
+          Hessian-action output that does not depend on any *other*
+          dependency's tangent-linear value (``dL2dm + d2Fdudm``) -- always
+          assembled.
+        - ``cross_templates[(c, c2)]``: dependency ``c``'s Hessian-action
+          contribution from *another* dependency ``c2``'s tangent-linear
+          direction (``d2Fdm2``).
+
+        Each is kept as its own compiled one-form, using a dedicated
+        "direction" placeholder (the same ``_tlm_seed_placeholders`` the TLM
+        right-hand side already uses -- safe to share, since the TLM forward
+        sweep has always finished computing every tangent-linear value before
+        the reverse (adjoint/Hessian) sweep that needs these runs), for the
+        same reason as ``_get_or_build_tlm_rhs_templates``: summing every
+        dependency's cross-term contribution into one combined form and
+        zeroing an inactive dependency's seed has the same ``0 * inf = NaN``
+        hazard there does.
+        """
+        if self._hessian_templates is None:
+            assert not isinstance(self._u, list), "Hessian templating is only implemented for scalar problems."
+            _, seed_placeholders, state_placeholder = self._get_or_build_tlm_rhs_templates()
+            dFdu_template = self._get_or_build_dFdu_template()
+            dFdu_adj_template = sum_form(self._get_or_build_dFdu_adj_template())  # type: ignore[arg-type]
+            assert isinstance(dFdu_template, ufl.Form)
+            assert isinstance(dFdu_adj_template, ufl.Form)
+            assert isinstance(state_placeholder, dolfinx.fem.Function)
+
+            self._adjoint_solution_placeholder = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
+            self._second_adjoint_solution_placeholder = dolfinx.fem.Function(
+                self._u.function_space  # type: ignore[union-attr]
+            )
+            self._hessian_u_seed = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
+
+            L_template = ufl.replace(sum_form(self._rhs), self._value_placeholders)  # type: ignore[arg-type]
+            F_template = ufl.action(dFdu_template, state_placeholder) - L_template  # type: ignore[arg-type]
+
+            # dF/du does not depend on u for a linear problem, so its second
+            # derivative w.r.t. u is always exactly zero: there is no SOA
+            # "self" term to template here, only the cross-dependency terms
+            # below (contrast NonlinearProblem, where F is nonlinear in u).
+            # Verify this invariant once, here, rather than on every call.
+            d2Fdu2_check = ufl.algorithms.expand_derivatives(
+                ufl.derivative(dFdu_template, state_placeholder, self._hessian_u_seed)
+            )
+            if not d2Fdu2_check.empty():
+                raise RuntimeError(f"This term {d2Fdu2_check} should be zero for linear problems.")
+
+            dFdu_adj_applied = ufl.action(dFdu_adj_template, self._adjoint_solution_placeholder)
+            L1 = ufl.action(F_template, self._adjoint_solution_placeholder)
+            L2 = ufl.action(F_template, self._second_adjoint_solution_placeholder)
+
+            soa_templates: dict = {}
+            fixed_templates: dict = {}
+            cross_templates: dict = {}
+            for c, c_placeholder in self._value_placeholders.items():
+                seed = seed_placeholders[c]
+
+                soa_form = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_adj_applied, c_placeholder, seed))
+                if not (soa_form == 0 or soa_form.empty()):
+                    soa_templates[c] = dolfinx.fem.form(
+                        soa_form,
+                        jit_options=self._jit_options,
+                        form_compiler_options=self._form_compiler_options,
+                        entity_maps=self._entity_maps,
+                    )
+
+                dc = ufl.TestFunction(c.function_space)
+                dL1dm = ufl.derivative(L1, c_placeholder, dc)
+                dL2dm = ufl.derivative(L2, c_placeholder, dc)
+                d2Fdudm = ufl.algorithms.expand_derivatives(
+                    ufl.derivative(dL1dm, state_placeholder, self._hessian_u_seed)
+                )
+                fixed_form = ufl.algorithms.expand_derivatives(dL2dm + d2Fdudm)
+                if fixed_form == 0 or fixed_form.empty():
+                    fixed_form = ufl.ZeroBaseForm((dc,))
+                fixed_templates[c] = dolfinx.fem.form(
+                    fixed_form,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+
+                for c2, c2_placeholder in self._value_placeholders.items():
+                    seed2 = seed_placeholders[c2]
+                    cross_form = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, c2_placeholder, seed2))
+                    if cross_form == 0 or cross_form.empty():
+                        continue
+                    cross_templates[(c, c2)] = dolfinx.fem.form(
+                        cross_form,
+                        jit_options=self._jit_options,
+                        form_compiler_options=self._form_compiler_options,
+                        entity_maps=self._entity_maps,
+                    )
+            self._hessian_templates = (soa_templates, fixed_templates, cross_templates)
+        return self._hessian_templates
 
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
@@ -570,32 +704,51 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
             entity_maps=entity_maps,
         )  # type: ignore[misc]
 
-        # Adjoint solver: built lazily (see _get_or_build_adjoint_solver) and
-        # shared by every NonlinearProblemBlock this Problem records, rather
-        # than one per block/solve() call -- same rationale as LinearProblem.
+        # Adjoint and tangent-linear solvers: built lazily (see
+        # _get_or_build_adjoint_solver/_get_or_build_tlm_solver) and shared by
+        # every NonlinearProblemBlock this Problem records, rather than one
+        # per block/solve() call -- same rationale as LinearProblem.
         self._adjoint_solver: typing.Optional[LinearAdjointProblem] = None
+        self._tlm_solver: typing.Optional[LinearAdjointProblem] = None
+        self._dFdu_template: typing.Optional[ufl.Form] = None
+        self._state_placeholder: typing.Optional[dolfinx.fem.Function] = None
+        self._tlm_rhs_templates: typing.Optional[dict] = None
+        self._tlm_seed_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {}
+        self._hessian_templates: typing.Optional[tuple] = None
+        self._adjoint_solution_placeholder: typing.Optional[dolfinx.fem.Function] = None
+        self._second_adjoint_solution_placeholder: typing.Optional[dolfinx.fem.Function] = None
+        self._hessian_u_seed: typing.Optional[dolfinx.fem.Function] = None
 
-    def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
-        """Build (once) and return the adjoint solver shared by every block this Problem records.
+    def _get_or_build_dFdu_template(self) -> ufl.Form:
+        """Build (once) and return dF/du with every non-u coefficient replaced by its
+        placeholder, and u itself replaced by a dedicated "state" placeholder
+        standing in for "u at this evaluation point".
 
-        Unlike the linear case, adjoint(dF/du) genuinely depends on u's
-        current value here (F is nonlinear in u), so it needs a coefficient
-        slot for "u at this evaluation point" -- but that slot need not be
-        ``self._u`` itself (which the live SNES/forward path owns): a
-        dedicated placeholder, refreshed from a block's own checkpointed
-        output before each adjoint/Hessian solve (see
-        ``NonlinearProblemBlock.prepare_evaluate_adj``/``prepare_evaluate_hessian``),
-        keeps this operator's compiled form fixed for the life of the
-        Problem, exactly like the non-u dependencies already routed through
-        ``self._value_placeholders``.
+        Unlike the linear case, dF/du genuinely depends on u's current value
+        here (F is nonlinear in u), so it needs a coefficient slot for that --
+        but that slot need not be ``self._u`` itself (which the live
+        SNES/forward path owns): a dedicated placeholder, refreshed from a
+        block's own checkpointed output before each adjoint/TLM/Hessian solve
+        (see ``NonlinearProblemBlock.prepare_evaluate_adj``/
+        ``prepare_evaluate_tlm``/``prepare_evaluate_hessian``), keeps this
+        operator's compiled form fixed for the life of the Problem, exactly
+        like the non-u dependencies already routed through
+        ``self._value_placeholders``. Shared, verbatim, by the adjoint
+        operator (which just adjoints it) and the TLM operator (used as-is),
+        mirroring ``LinearProblem._get_or_build_dFdu_template``.
         """
-        if self._adjoint_solver is None:
+        if self._dFdu_template is None:
             if not isinstance(self._rhs, ufl.Form):
                 raise NotImplementedError("Blocked systems not implemented yet.")
-            self._adjoint_u_placeholder = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
-            replace_map: dict = {**self._value_placeholders, self._u: self._adjoint_u_placeholder}
-            rhs_for_adjoint = ufl.replace(self._rhs, replace_map)
-            dFdu_adj = ufl.adjoint(ufl.derivative(rhs_for_adjoint, self._adjoint_u_placeholder))
+            self._state_placeholder = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
+            replace_map: dict = {**self._value_placeholders, self._u: self._state_placeholder}
+            self._dFdu_template = ufl.replace(self._lhs, replace_map)  # type: ignore[arg-type]
+        return self._dFdu_template
+
+    def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
+        """Build (once) and return the adjoint solver shared by every block this Problem records."""
+        if self._adjoint_solver is None:
+            dFdu_adj = ufl.adjoint(self._get_or_build_dFdu_template())
             self._adjoint_solver = LinearAdjointProblem(
                 dFdu_adj,  # type: ignore[arg-type]
                 self._rhs,  # type: ignore[arg-type]
@@ -609,6 +762,182 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
                 entity_maps=self._entity_maps,
             )  # type: ignore[misc]
         return self._adjoint_solver
+
+    def _get_or_build_tlm_solver(self) -> LinearAdjointProblem:
+        """Build (once) and return the TLM solver shared by every block this Problem records.
+
+        dF/du is used here as-is (unlike the adjoint operator, which adjoints
+        it), mirroring ``LinearProblem._get_or_build_tlm_solver``.
+        """
+        if self._tlm_solver is None:
+            self._tlm_solver = LinearAdjointProblem(
+                self._get_or_build_dFdu_template(),  # type: ignore[arg-type]
+                self._rhs,  # type: ignore[arg-type]
+                bcs=self._bcs,
+                P=self._preconditioner,  # type: ignore[arg-type]
+                form_compiler_options=self._form_compiler_options,
+                jit_options=self._jit_options,
+                petsc_options=self._tlm_options,
+                petsc_options_prefix=f"{self._petsc_options_prefix}tlm_",
+                kind=self._kind,  # type: ignore[arg-type]
+                entity_maps=self._entity_maps,
+            )  # type: ignore[misc]
+        return self._tlm_solver
+
+    def _get_or_build_tlm_rhs_templates(
+        self,
+    ) -> tuple[
+        dict[dolfinx.fem.Function, typing.Any],
+        dict[dolfinx.fem.Function, dolfinx.fem.Function],
+        dolfinx.fem.Function,
+    ]:
+        """Build (once) and return the per-dependency TLM right-hand-side templates.
+
+        One compiled one-form is built per dependency, using a dedicated
+        "direction" placeholder for that dependency
+        (``_tlm_seed_placeholders``) rather than a single combined form summed
+        over every dependency, for the same reason as
+        ``LinearProblem._get_or_build_tlm_rhs_templates``: which dependencies
+        actually have a tangent-linear value varies from call to call, and
+        evaluating an inactive dependency's term with a zeroed seed instead of
+        skipping it outright risks ``0 * inf = NaN`` if that dependency's
+        derivative is singular where it is currently valued (e.g. a `1/c`
+        term with `c` legitimately zero somewhere in the domain).
+        """
+        if self._tlm_rhs_templates is None:
+            self._get_or_build_dFdu_template()  # ensures self._state_placeholder exists
+            assert self._state_placeholder is not None
+            assert isinstance(self._rhs, ufl.Form)
+            replace_map: dict = {**self._value_placeholders, self._u: self._state_placeholder}
+            F_template = ufl.replace(self._rhs, replace_map)
+            test_func = F_template.arguments()[0]
+
+            templates: dict[dolfinx.fem.Function, typing.Any] = {}
+            for c, c_placeholder in self._value_placeholders.items():
+                seed = dolfinx.fem.Function(c.function_space)
+                dFdm_c = ufl.algorithms.expand_derivatives(-ufl.derivative(F_template, c_placeholder, seed))
+                if dFdm_c == 0 or dFdm_c.empty():
+                    dFdm_c = ufl.ZeroBaseForm((test_func,))
+                templates[c] = dolfinx.fem.form(
+                    dFdm_c,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+                self._tlm_seed_placeholders[c] = seed
+            self._tlm_rhs_templates = templates
+        return self._tlm_rhs_templates, self._tlm_seed_placeholders, self._state_placeholder  # type: ignore[return-value]
+
+    def _get_or_build_hessian_templates(
+        self,
+    ) -> tuple[typing.Optional[dolfinx.fem.Form], dict, dict, dict]:
+        """Build (once) and return the per-dependency Hessian templates used by
+        ``NonlinearProblemBlock.prepare_evaluate_hessian``'s SOA right-hand side
+        and ``evaluate_hessian_component``'s own Hessian-action output.
+
+        Four values are returned:
+
+        - ``soa_self_template``: the SOA right-hand-side's contribution from
+          dF/du's own second derivative w.r.t. u (``d2Fdu2``) -- genuinely
+          nonzero here since F is nonlinear in u (contrast
+          ``LinearProblem._get_or_build_hessian_templates``, where this term
+          is always zero and skipped entirely) -- or ``None`` if it happens
+          to vanish structurally. Always assembled when not ``None``.
+        - ``soa_cross_templates[c]``: the SOA right-hand-side's contribution
+          from dependency ``c``'s tangent-linear direction, a 1-form in the
+          state's own test function.
+        - ``fixed_templates[c]``: the part of dependency ``c``'s own
+          Hessian-action output that does not depend on any *other*
+          dependency's tangent-linear value (``dL2dm + d2Fdudm``) -- always
+          assembled.
+        - ``cross_templates[(c, c2)]``: dependency ``c``'s Hessian-action
+          contribution from *another* dependency ``c2``'s tangent-linear
+          direction (``d2Fdm2``).
+
+        Mirrors ``LinearProblem._get_or_build_hessian_templates`` exactly for
+        the cross-dependency terms (same per-dependency-template rationale,
+        including the ``0 * inf = NaN`` hazard of a combined, zeroed-seed
+        form), with one addition: the SOA "self" term, which for a linear
+        problem is always zero and so needs no template at all.
+        """
+        if self._hessian_templates is None:
+            dFdu_template = self._get_or_build_dFdu_template()
+            dFdu_adj_template = ufl.adjoint(dFdu_template)
+            assert self._state_placeholder is not None
+            state_placeholder = self._state_placeholder
+            assert isinstance(self._rhs, ufl.Form)
+
+            self._adjoint_solution_placeholder = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
+            self._second_adjoint_solution_placeholder = dolfinx.fem.Function(
+                self._u.function_space  # type: ignore[union-attr]
+            )
+            self._hessian_u_seed = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
+
+            d2Fdu2_template = ufl.algorithms.expand_derivatives(
+                ufl.derivative(dFdu_template, state_placeholder, self._hessian_u_seed)
+            )
+            soa_self_template = None
+            if not d2Fdu2_template.empty():
+                soa_self_form = ufl.action(ufl.adjoint(d2Fdu2_template), self._adjoint_solution_placeholder)
+                soa_self_template = dolfinx.fem.form(
+                    soa_self_form,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+
+            dFdu_adj_applied = ufl.action(dFdu_adj_template, self._adjoint_solution_placeholder)
+
+            _, seed_placeholders, _ = self._get_or_build_tlm_rhs_templates()
+            replace_map: dict = {**self._value_placeholders, self._u: state_placeholder}
+            F_template = ufl.replace(self._rhs, replace_map)
+            L1 = ufl.action(F_template, self._adjoint_solution_placeholder)
+            L2 = ufl.action(F_template, self._second_adjoint_solution_placeholder)
+
+            soa_cross_templates: dict = {}
+            fixed_templates: dict = {}
+            cross_templates: dict = {}
+            for c, c_placeholder in self._value_placeholders.items():
+                seed = seed_placeholders[c]
+
+                soa_form = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_adj_applied, c_placeholder, seed))
+                if not (soa_form == 0 or soa_form.empty()):
+                    soa_cross_templates[c] = dolfinx.fem.form(
+                        soa_form,
+                        jit_options=self._jit_options,
+                        form_compiler_options=self._form_compiler_options,
+                        entity_maps=self._entity_maps,
+                    )
+
+                dc = ufl.TestFunction(c.function_space)
+                dL1dm = ufl.derivative(L1, c_placeholder, dc)
+                dL2dm = ufl.derivative(L2, c_placeholder, dc)
+                d2Fdudm = ufl.algorithms.expand_derivatives(
+                    ufl.derivative(dL1dm, state_placeholder, self._hessian_u_seed)
+                )
+                fixed_form = ufl.algorithms.expand_derivatives(dL2dm + d2Fdudm)
+                if fixed_form == 0 or fixed_form.empty():
+                    fixed_form = ufl.ZeroBaseForm((dc,))
+                fixed_templates[c] = dolfinx.fem.form(
+                    fixed_form,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+
+                for c2, c2_placeholder in self._value_placeholders.items():
+                    seed2 = seed_placeholders[c2]
+                    cross_form = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, c2_placeholder, seed2))
+                    if cross_form == 0 or cross_form.empty():
+                        continue
+                    cross_templates[(c, c2)] = dolfinx.fem.form(
+                        cross_form,
+                        jit_options=self._jit_options,
+                        form_compiler_options=self._form_compiler_options,
+                        entity_maps=self._entity_maps,
+                    )
+            self._hessian_templates = (soa_self_template, soa_cross_templates, fixed_templates, cross_templates)
+        return self._hessian_templates  # type: ignore[return-value]
 
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
@@ -626,7 +955,6 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
                 jit_options=self._jit_options,
                 entity_maps=self._entity_maps,
                 ad_block_tag=self.ad_block_tag,
-                tlm_petsc_options=self._tlm_options,
                 problem=self,
             )  # type: ignore[misc]
             tape = pyadjoint.get_working_tape()

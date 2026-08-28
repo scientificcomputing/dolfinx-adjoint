@@ -11,7 +11,6 @@ import ufl
 from dolfinx.fem.function import Function as _Function
 
 from ..compat import compute_form_adjoint
-from ..petsc_utils import solve_linear_problem
 from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
@@ -698,52 +697,40 @@ class LinearProblemBlock(pyadjoint.Block):
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
 
-        # Using the equation Form we derive dF/du, d^2F/du^2 * du/dm * direction.
-        dFdu_form = self._compute_residual_derivative()
-
-        # For linear forms d2Fdu2 is zero, but we include it for completeness.
-
-        unknowns = [output.saved_output for output in self.get_outputs()]
-        summed_form = sum_form(dFdu_form)
-        d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
-
-        # bdy = self._should_compute_boundary_adjoint(relevant_dependencies)
-
-        # Assemble right hand side of second order adjoint equation
-        # Note this term should always be zero for linear problems, but we include it for completeness.
-        if not d2Fdu2.empty():
-            raise RuntimeError(f"This term {d2Fdu2:s} should be zero for linear problems.")
-        b_form = d2Fdu2 if d2Fdu2.empty() else ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
-        dFdu_adj = self._compute_adjoint(sum_form(dFdu_form))
-        for bo in self.get_dependencies():
-            c = bo.output
-            c_rep = bo.saved_output
-            tlm_input = bo.tlm_value
-            if tlm_input is None:
-                continue
-            if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
-                raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
-            else:
-                summed_form = sum_form(dFdu_adj)
-                dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
-                b_form += ufl.derivative(dFdu_adj_applied, c_rep, tlm_input)
-
         if len(outputs) == 1:
+            # Scalar problem: use the cached per-dependency Hessian templates
+            # (see LinearProblem._get_or_build_hessian_templates) instead of
+            # rebuilding and recompiling the SOA right-hand side symbolically
+            # on every call.
+            _, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
+            soa_templates, _, _ = problem._get_or_build_hessian_templates()
+
+            state_placeholder.x.array[:] = outputs[0].saved_output.x.array[:]  # type: ignore[union-attr]
+            state_placeholder.x.scatter_forward()  # type: ignore[union-attr]
+            problem._adjoint_solution_placeholder.x.array[:] = self._adjoint_solutions.x.array[:]  # type: ignore[union-attr]
+            problem._adjoint_solution_placeholder.x.scatter_forward()  # type: ignore[union-attr]
+            problem._hessian_u_seed.x.array[:] = tlm_output[0].x.array[:]  # type: ignore[union-attr]
+            problem._hessian_u_seed.x.scatter_forward()  # type: ignore[union-attr]
+
             b = adjoint_solver._b
             with b.localForm() as b_loc:
                 b_loc.set(0.0)
-            form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form)
-            if not form_i.empty():
-                compiled_soa_rhs = dolfinx.fem.form(
-                    form_i,
-                    jit_options=self._jit_options,
-                    form_compiler_options=self._form_compiler_options,
-                    entity_maps=self._entity_maps,
-                )
-                dolfinx.fem.petsc.assemble_vector(b, compiled_soa_rhs)
-                b.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
-
-                b.scale(-1)
+            for block_variable in self.get_dependencies():
+                tlm_input = block_variable.tlm_value
+                if tlm_input is None:
+                    continue
+                c = block_variable.output
+                if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
+                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+                template = soa_templates.get(c)
+                if template is None:
+                    continue
+                seed = seed_placeholders[c]
+                seed.x.array[:] = tlm_input.x.array[:]
+                seed.x.scatter_forward()
+                dolfinx.fem.petsc.assemble_vector(b, template)
+            dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+            b.scale(-1)
 
             with b.localForm() as b_loc:
                 b_loc.array[:] += hessian_inputs[0].array[:]
@@ -751,6 +738,35 @@ class LinearProblemBlock(pyadjoint.Block):
             adjoint_solver._b = b
 
         else:
+            # Blocked problem: Hessian cross-term templating is not
+            # implemented for this case (see the module-level plan notes);
+            # this keeps the pre-templating, per-call ufl.replace + recompile
+            # path, with the shared adjoint solver applying only the
+            # ownership-move.
+            dFdu_form = self._compute_residual_derivative()
+            unknowns = [output.saved_output for output in self.get_outputs()]
+            summed_form = sum_form(dFdu_form)
+            d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
+
+            # Assemble right hand side of second order adjoint equation
+            # Note this term should always be zero for linear problems, but we include it for completeness.
+            if not d2Fdu2.empty():
+                raise RuntimeError(f"This term {d2Fdu2:s} should be zero for linear problems.")
+            b_form = d2Fdu2
+            dFdu_adj = self._compute_adjoint(sum_form(dFdu_form))
+            for bo in self.get_dependencies():
+                c = bo.output
+                c_rep = bo.saved_output
+                tlm_input = bo.tlm_value
+                if tlm_input is None:
+                    continue
+                if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
+                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+                else:
+                    summed_form = sum_form(dFdu_adj)
+                    dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
+                    b_form += ufl.derivative(dFdu_adj_applied, c_rep, tlm_input)
+
             bs = []
             b_form = ufl.extract_blocks(b_form)
             for i, hess_input in enumerate(hessian_inputs):
@@ -795,6 +811,11 @@ class LinearProblemBlock(pyadjoint.Block):
                 adj_sol.x.array[:] = sol.x.array[:]
         else:
             self._second_adjoint_solutions.x.array[:] = adjoint_solver.u.x.array[:]
+            if len(outputs) == 1:
+                problem._second_adjoint_solution_placeholder.x.array[:] = (  # type: ignore[union-attr]
+                    self._second_adjoint_solutions.x.array[:]
+                )
+                problem._second_adjoint_solution_placeholder.x.scatter_forward()  # type: ignore[union-attr]
 
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
 
@@ -835,6 +856,50 @@ class LinearProblemBlock(pyadjoint.Block):
             assert isinstance(c, dolfinx.fem.Function)
             W = c.function_space
 
+        if len(outputs) == 1:
+            # Scalar problem: use the cached per-dependency Hessian templates
+            # (see LinearProblem._get_or_build_hessian_templates) instead of
+            # rebuilding and recompiling the Hessian-action output
+            # symbolically on every call. All the placeholders these
+            # templates reference (the dependency values, the state, and both
+            # adjoint solutions) were already refreshed by
+            # prepare_evaluate_hessian above; only the per-dependency
+            # "direction" seeds need setting here, and only for dependencies
+            # that actually have a tangent-linear value this call -- see
+            # LinearProblem._get_or_build_hessian_templates for why an
+            # inactive dependency's cross term must be skipped entirely
+            # rather than evaluated with a zeroed direction.
+            problem = self._problem()
+            _, fixed_templates, cross_templates = problem._get_or_build_hessian_templates()
+            _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
+
+            fixed_template = fixed_templates[c]
+            hessian_output = _create_vector(fixed_template, W)
+            hessian_output.array[:] = 0.0
+            assemble_compiled_form(fixed_template, hessian_output)
+
+            for _, bv in relevant_dependencies:
+                c2 = bv.output
+                if isinstance(c2, dolfinx.fem.DirichletBC):
+                    continue
+                tlm_input = bv.tlm_value
+                if tlm_input is None:
+                    continue
+                template = cross_templates.get((c, c2))
+                if template is None:
+                    continue
+                seed2 = seed_placeholders[c2]
+                seed2.x.array[:] = tlm_input.x.array[:]
+                seed2.x.scatter_forward()
+                assemble_compiled_form(template, hessian_output)
+
+            hessian_output.array[:] *= -1.0
+            return hessian_output
+
+        # Blocked problem: Hessian cross-term templating is not implemented
+        # for this case (see the module-level plan notes); this keeps the
+        # pre-templating, per-call ufl.replace + recompile path.
+        #
         # We are trying to compute (dF/dm)^T lambda_1
         # and (dF_dm)^T lambda_ 2. However, standard approach of UFL
         # does not work for MixedFunctionSpaces, as the control space is not
@@ -914,7 +979,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
         ad_block_tag: str | None = None,
-        tlm_petsc_options: dict | None = None,
         problem: "NonlinearProblem" = ...,
     ) -> None: ...
 
@@ -930,7 +994,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
         ad_block_tag: str | None = None,
-        tlm_petsc_options: dict | None = None,
         problem: "NonlinearProblem" = ...,
     ) -> None: ...
 
@@ -945,7 +1008,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
         ad_block_tag: str | None = None,
-        tlm_petsc_options: dict | None = None,
         problem: "NonlinearProblem" = None,  # type: ignore[assignment]
     ) -> None:
 
@@ -953,7 +1015,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         # See LinearProblemBlock.__init__ for the rationale for holding a
         # plain (strong) reference here.
         self._problem_obj = problem
-        self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
         self._preconditioner = P
 
@@ -1170,70 +1231,74 @@ class NonlinearProblemBlock(pyadjoint.Block):
 
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
-    ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
-        F_form = self._compute_residual()
+    ) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
+        # The TLM solver -- and the compiled LHS it solves with, shared
+        # verbatim with dF/du (see NonlinearProblem._get_or_build_dFdu_template)
+        # -- are shared across every block this Problem records; likewise the
+        # per-dependency TLM right-hand-side templates (see
+        # NonlinearProblem._get_or_build_tlm_rhs_templates) are each compiled
+        # once. Refresh this block's own checkpointed values into the
+        # placeholders and re-establish this block's own bcs on every call,
+        # since another block may have used the same solver in between -- but
+        # never rebuild or recompile any of these forms.
+        problem = self._problem()
+        tlm_solver = problem._get_or_build_tlm_solver()
+        tlm_solver.bcs = self._bcs
+        templates, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
 
-        dFdu_compiled = dolfinx.fem.form(
-            self._compute_residual_derivative(),  # type: ignore[arg-type]
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        return F_form, dFdu_compiled  # type: ignore[return-value]
+        for block_variable in self.get_dependencies():
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
+        out_bv = self.get_outputs()[0]
+        state_placeholder.x.array[:] = out_bv.saved_output.x.array[:]
+        state_placeholder.x.scatter_forward()
 
-    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None) -> dolfinx.fem.Function:
-        """Solve the TLM equation for the block variable.
-
-        .. math::
-
-            \frac{\\partial F}{\\partial u} \frac{\\partial u}{\\partial m} = \frac{\\partial F}{\\partial m}
-
-        """
-        F, dFdu = prepared
-
-        V = self.get_outputs()[idx].output.function_space
-
-        # FIXME: DirichletBC not block variable yet. Required later on. Currently all bcs should be homogenized
-        bcs = []
-        for bc in self._bcs:
-            bcs.append(bc)
-
-        dFdm = ufl.ZeroBaseForm((ufl.TestFunction(V),))
+        # Assemble RHS vector using the shared solver's cached vector,
+        # accumulating only the dependencies that actually have a
+        # tangent-linear value this call -- see
+        # NonlinearProblem._get_or_build_tlm_rhs_templates for why an
+        # inactive dependency's term must be skipped entirely rather than
+        # evaluated with a zeroed direction.
+        b_petsc = tlm_solver._b
+        with b_petsc.localForm() as b_loc:
+            b_loc.set(0.0)
         for block_variable in self.get_dependencies():
             tlm_value = block_variable.tlm_value
-            c_rep = block_variable.saved_output
             if tlm_value is None:
                 continue
-            dFdm += ufl.derivative(-F, c_rep, tlm_value)
+            template = templates.get(block_variable.output)
+            if template is None:
+                continue
+            seed = seed_placeholders[block_variable.output]
+            seed.x.array[:] = tlm_value.x.array[:]
+            seed.x.scatter_forward()
+            dolfinx.fem.petsc.assemble_vector(b_petsc, template)
+        dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
 
-        if isinstance(dFdm, float):
-            v = dFdu.arguments()[0]
-            dFdm = ufl.ZeroBaseForm((v,))
-
-        dFdm = ufl.algorithms.expand_derivatives(dFdm)
-        dFdm_compiled = dolfinx.fem.form(
-            dFdm,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        dudm = dolfinx.fem.Function(V, name="du_dm_tlm_linearblock")
-        A_tlm = dolfinx.fem.petsc.assemble_matrix(dFdu, bcs=bcs)
-        A_tlm.assemble()
-        b_tlm = dolfinx.fem.create_vector(dolfinx.fem.extract_function_spaces(dFdm_compiled))  # type: ignore[arg-type]
-        b_tlm.array[:] = 0.0
-        dolfinx.fem.petsc.assemble_vector(b_tlm.petsc_vec, dFdm_compiled)
-
-        if bcs is not None:
-            # This system should never be "blocked"
-            dolfinx.fem.petsc.apply_lifting(b_tlm.petsc_vec, [dFdu], bcs=[bcs], alpha=0)
-            dolfinx.la.petsc._ghost_update(b_tlm.petsc_vec, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore [arg-type]
-            for bc in bcs:
-                bc.set(b_tlm.array, alpha=0)
+        # Homogeneous boundary conditions are applied to b_petsc by
+        # tlm_solver.solve() itself (it homogenizes using tlm_solver.bcs,
+        # already re-established above), so there is no need to duplicate
+        # that here.
+        tlm_solver.solve()
+        if isinstance(self._tlm_solutions, list):
+            for tlm_sol, sol in zip(self._tlm_solutions, tlm_solver.u):
+                tlm_sol.x.array[:] = sol.x.array[:]
         else:
-            dolfinx.la.petsc._ghost_update(b_tlm, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore [arg-type]
-        solve_linear_problem(A_tlm, dudm.x, b_tlm, petsc_options=self._tlm_petsc_options)
-        return dudm
+            assert isinstance(self._tlm_solutions, dolfinx.fem.Function)
+            self._tlm_solutions.x.array[:] = tlm_solver.u.x.array[:]
+
+        return self._tlm_solutions
+
+    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None) -> dolfinx.fem.Function:
+        # The system was solved natively in prepare_evaluate_tlm.
+        # Return the corresponding requested sub-function.
+        if isinstance(self._tlm_solutions, list):
+            return self._tlm_solutions[idx]
+        else:
+            assert isinstance(self._tlm_solutions, dolfinx.fem.Function)
+            return self._tlm_solutions
 
     def prepare_evaluate_adj(
         self,
@@ -1262,8 +1327,8 @@ class NonlinearProblemBlock(pyadjoint.Block):
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
         out_bv = self.get_outputs()[0]
-        problem._adjoint_u_placeholder.x.array[:] = out_bv.saved_output.x.array[:]
-        problem._adjoint_u_placeholder.x.scatter_forward()
+        problem._state_placeholder.x.array[:] = out_bv.saved_output.x.array[:]  # type: ignore[union-attr]
+        problem._state_placeholder.x.scatter_forward()  # type: ignore[union-attr]
 
         # F_form is still needed by evaluate_adj_component (to build each
         # dependency's own sensitivity form), but the adjoint LHS itself is
@@ -1346,44 +1411,48 @@ class NonlinearProblemBlock(pyadjoint.Block):
             if placeholder is not None:
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
-        problem._adjoint_u_placeholder.x.array[:] = outputs[0].saved_output.x.array[:]
-        problem._adjoint_u_placeholder.x.scatter_forward()
+        problem._state_placeholder.x.array[:] = outputs[0].saved_output.x.array[:]  # type: ignore[union-attr]
+        problem._state_placeholder.x.scatter_forward()  # type: ignore[union-attr]
 
-        # Using the equation Form we derive dF/du, d^2F/du^2 * du/dm * direction.
-        dFdu_form = self._compute_residual_derivative()
         assert len(outputs) == 1, "Hessian computation only implemented for single output blocks."
         assert len(tlm_output) == 1, "Hessian computation only implemented for single TLM output blocks."
-        d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_form, outputs[0].saved_output, tlm_output[0]))
-
-        # bdy = self._should_compute_boundary_adjoint(relevant_dependencies)
         assert len(hessian_inputs) == 1, "Hessian computation only implemented for single hessian input blocks."
 
-        # Assemble right hand side of second order adjoint equation
-        b_form = d2Fdu2 if d2Fdu2.empty() else ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
-        dFdu_adj = ufl.action(ufl.adjoint(dFdu_form), self._adjoint_solutions)
-        for bo in self.get_dependencies():
-            c = bo.output
-            c_rep = bo.saved_output
-            tlm_input = bo.tlm_value
-            if tlm_input is None:
-                continue
-            if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
-                raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
-            else:
-                b_form += ufl.derivative(dFdu_adj, c_rep, tlm_input)
+        # The SOA solver -- and the compiled LHS it solves with, shared
+        # verbatim with the first-order adjoint equation -- is shared across
+        # every block this Problem records; likewise the SOA right-hand-side
+        # templates (see NonlinearProblem._get_or_build_hessian_templates)
+        # are each compiled once. Refresh the placeholders they reference and
+        # never rebuild or recompile any of these forms.
+        soa_self_template, soa_cross_templates, _, _ = problem._get_or_build_hessian_templates()
+        _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
+
+        problem._adjoint_solution_placeholder.x.array[:] = self._adjoint_solutions.x.array[:]  # type: ignore[union-attr]
+        problem._adjoint_solution_placeholder.x.scatter_forward()  # type: ignore[union-attr]
+        problem._hessian_u_seed.x.array[:] = tlm_output[0].x.array[:]  # type: ignore[union-attr]
+        problem._hessian_u_seed.x.scatter_forward()  # type: ignore[union-attr]
+
         b = adjoint_solver._b
         with b.localForm() as b_loc:
             b_loc.set(0.0)
-        if not ufl.algorithms.apply_derivatives.apply_derivatives(b_form).empty():
-            compiled_soa_rhs = dolfinx.fem.form(
-                b_form,
-                jit_options=self._jit_options,
-                form_compiler_options=self._form_compiler_options,
-                entity_maps=self._entity_maps,
-            )
-            dolfinx.fem.petsc.assemble_vector(b, compiled_soa_rhs)
-            b.ghostUpdate(PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore [arg-type]
-            b.scale(-1)
+        if soa_self_template is not None:
+            dolfinx.fem.petsc.assemble_vector(b, soa_self_template)
+        for block_variable in self.get_dependencies():
+            tlm_input = block_variable.tlm_value
+            if tlm_input is None:
+                continue
+            c = block_variable.output
+            if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
+                raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+            template = soa_cross_templates.get(c)
+            if template is None:
+                continue
+            seed = seed_placeholders[c]
+            seed.x.array[:] = tlm_input.x.array[:]
+            seed.x.scatter_forward()
+            dolfinx.fem.petsc.assemble_vector(b, template)
+        dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+        b.scale(-1)
         with b.localForm() as b_loc, hessian_inputs[0].petsc_vec.localForm() as hess_loc:
             b_loc.array[:] += hess_loc.array[:]
 
@@ -1401,6 +1470,10 @@ class NonlinearProblemBlock(pyadjoint.Block):
                 adj_sol.x.array[:] = sol.x.array[:]
         else:
             self._second_adjoint_solutions.x.array[:] = adjoint_solver.u.x.array[:]
+            problem._second_adjoint_solution_placeholder.x.array[:] = (  # type: ignore[union-attr]
+                self._second_adjoint_solutions.x.array[:]
+            )
+            problem._second_adjoint_solution_placeholder.x.scatter_forward()  # type: ignore[union-attr]
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
 
     def evaluate_hessian_component(
@@ -1415,11 +1488,12 @@ class NonlinearProblemBlock(pyadjoint.Block):
     ):
         c = block_variable.output
 
-        F_form, adj_sol, adj_sol2 = prepared
-
+        # prepared (F_form, adj_sol, adj_sol2) is unused here: every quantity
+        # this method needs is already baked into the cached Hessian
+        # templates below, refreshed from those same values by
+        # prepare_evaluate_hessian.
         outputs = self.get_outputs()
         assert len(outputs) == 1, "Hessian computation only implemented for single output blocks."
-        tlm_output = outputs[0].tlm_value
 
         c_rep = block_variable.saved_output
 
@@ -1441,54 +1515,40 @@ class NonlinearProblemBlock(pyadjoint.Block):
             assert isinstance(c, dolfinx.fem.Function)
             W = c.function_space
 
-        dc = ufl.TestFunction(W)
-        form_adj = ufl.action(F_form, adj_sol)
-        form_adj2 = ufl.action(F_form, adj_sol2)
-        if isinstance(c, dolfinx.mesh.Mesh):
-            raise NotImplementedError("Hessian computation for Mesh control not implemented yet.")
-            # dFdm_adj = ufl.derivative(form_adj, X, dc)
-            # dFdm_adj2 = ufl.derivative(form_adj2, X, dc)
-        else:
-            # Assume Function
-            dFdm_adj = ufl.derivative(form_adj, c_rep, dc)
-            dFdm_adj2 = ufl.derivative(form_adj2, c_rep, dc)
+        # Use the cached per-dependency Hessian templates (see
+        # NonlinearProblem._get_or_build_hessian_templates) instead of
+        # rebuilding and recompiling the Hessian-action output symbolically
+        # on every call. All the placeholders these templates reference (the
+        # dependency values, the state, and both adjoint solutions) were
+        # already refreshed by prepare_evaluate_hessian above; only the
+        # per-dependency "direction" seeds need setting here, and only for
+        # dependencies that actually have a tangent-linear value this call --
+        # see NonlinearProblem._get_or_build_hessian_templates for why an
+        # inactive dependency's cross term must be skipped entirely rather
+        # than evaluated with a zeroed direction.
+        problem = self._problem()
+        _, _, fixed_templates, cross_templates = problem._get_or_build_hessian_templates()
+        _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
 
-        # TODO: Old comment claims this might break on split. Confirm if true or not.
-        d2Fdudm = ufl.algorithms.expand_derivatives(ufl.derivative(dFdm_adj, outputs[0].saved_output, tlm_output))
+        fixed_template = fixed_templates[c]
+        hessian_output = _create_vector(fixed_template, W)
+        hessian_output.array[:] = 0.0
+        assemble_compiled_form(fixed_template, hessian_output)
 
-        d2Fdm2 = 0
-        # We need to add terms from every other dependency
-        # i.e. the terms d^2F/dm_1dm_2
         for _, bv in relevant_dependencies:
             c2 = bv.output
-            c2_rep = bv.saved_output
-
             if isinstance(c2, dolfinx.fem.DirichletBC):
                 continue
             tlm_input = bv.tlm_value
             if tlm_input is None:
                 continue
-
-            if c2 == self._u and not self.linear:
+            template = cross_templates.get((c, c2))
+            if template is None:
                 continue
+            seed2 = seed_placeholders[c2]
+            seed2.x.array[:] = tlm_input.x.array[:]
+            seed2.x.scatter_forward()
+            assemble_compiled_form(template, hessian_output)
 
-            # TODO: If tlm_input is a Sum, this crashes in some instances?
-            if isinstance(c2_rep, dolfinx.mesh.Mesh):
-                X = ufl.SpatialCoordinate(c2_rep)
-                d2Fdm2 += ufl.algorithms.expand_derivatives(ufl.derivative(dFdm_adj, X, tlm_input))
-            else:
-                d2Fdm2 += ufl.algorithms.expand_derivatives(ufl.derivative(dFdm_adj, c2_rep, tlm_input))
-
-        hessian_form = ufl.algorithms.expand_derivatives(d2Fdm2 + dFdm_adj2 + d2Fdudm)
-
-        compiled_hessian = dolfinx.fem.form(
-            hessian_form,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        hessian_output = _create_vector(compiled_hessian, hessian_form.arguments()[0].ufl_function_space())
-        hessian_output.array[:] = 0.0
-        assemble_compiled_form(compiled_hessian, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output

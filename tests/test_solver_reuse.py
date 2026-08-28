@@ -292,7 +292,7 @@ def test_linear_adjoint_lhs_compiled_once():
 def test_nonlinear_adjoint_lhs_compiled_once():
     """As above, but for NonlinearProblem: adjoint(dF/du) does depend on u's
     current value here, but that dependency is routed through a dedicated
-    placeholder (``NonlinearProblem._adjoint_u_placeholder``), refreshed per
+    placeholder (``NonlinearProblem._state_placeholder``), refreshed per
     call, so the compiled LHS itself is still built exactly once.
     """
     pyadjoint.get_working_tape().clear_tape()
@@ -471,3 +471,68 @@ def test_tlm_skips_inactive_dependency_with_singular_derivative():
     assert np.isfinite(hessian_action.x.array).all(), (
         "Hessian action contains NaN/Inf from the inactive singular dependency"
     )
+
+
+def test_nonlinear_tlm_rhs_templates_compiled_once():
+    """As ``test_tlm_rhs_templates_compiled_once``, but for NonlinearProblem:
+    the TLM solver (``NonlinearProblem._get_or_build_tlm_solver``) and each
+    dependency's TLM right-hand-side template
+    (``NonlinearProblem._get_or_build_tlm_rhs_templates``) must be compiled
+    exactly once and never rebuilt, including across repeated ``hessian()``
+    calls at different control values (a Hessian evaluation always drives a
+    TLM sweep first).
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    f = Function(V, name="control")
+    f.interpolate(lambda x: 2.0 + np.sin(x[0]))
+
+    u1 = Function(V, name="state")
+    u1.interpolate(lambda x: np.ones_like(x[0]))
+    v1 = ufl.TestFunction(V)
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
+    bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
+
+    options = {
+        "snes_error_if_not_converged": True,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    problem.solve()
+
+    d = pyadjoint.AdjFloat(0.2)
+    J = assemble_scalar((u1 - d) ** 3 * ufl.dx)
+    control = pyadjoint.Control(f)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    dm = Function(V)
+    dm.interpolate(lambda x: np.sin(x[0] * np.pi))
+    Jh.hessian(dm)
+
+    tlm_solver = problem._get_or_build_tlm_solver()
+    compiled_tlm_lhs = tlm_solver._a
+    assert compiled_tlm_lhs is not None
+
+    templates, _, _ = problem._get_or_build_tlm_rhs_templates()
+    compiled_ids = {c: id(form) for c, form in templates.items()}
+    assert compiled_ids, "no TLM RHS templates were built"
+
+    f2 = Function(V)
+    f2.interpolate(lambda x: 3.0 + np.cos(x[0]))
+    Jh(f2)
+    Jh.hessian(dm)
+
+    assert tlm_solver._a is compiled_tlm_lhs, "TLM LHS was rebuilt after evaluating at a new point"
+    templates_after, _, _ = problem._get_or_build_tlm_rhs_templates()
+    for c, form in templates_after.items():
+        assert id(form) == compiled_ids[c], f"TLM RHS template for {c.name} was rebuilt"
