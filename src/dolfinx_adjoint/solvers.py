@@ -18,6 +18,25 @@ def resolve_u(u: _Function | None, L: ufl.Form) -> _Function: ...
 def resolve_u(u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]) -> typing.Sequence[_Function]: ...
 
 
+def _collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set:
+    """Return the set of UFL coefficients appearing anywhere in ``form``.
+
+    ``form`` may be a single form or an arbitrarily nested sequence of forms
+    (entries may be ``None``, e.g. a zero block in a blocked system). Plain set
+    union rather than ``sum_form``: unlike summing, this never requires the
+    sub-forms' arguments to be mutually compatible (e.g. carry matching
+    ``part()`` tags), which blocked NonlinearProblem forms are not.
+    """
+    if form is None:
+        return set()
+    if isinstance(form, ufl.Form):
+        return set(form.coefficients())
+    coefficients: set = set()
+    for f in form:
+        coefficients |= _collect_coefficients(f)
+    return coefficients
+
+
 def resolve_u(
     u: _Function | typing.Sequence[_Function] | None, L: ufl.Form | typing.Sequence[ufl.Form]
 ) -> _Function | typing.Sequence[_Function]:
@@ -436,11 +455,47 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
         self._petsc_options_prefix = petsc_options_prefix
         self._kind = kind
 
-        # Initialize linear solver
+        # The SNES built by super().__init__() below binds to the exact
+        # compiled F/J/P Form objects passed to it, forever: its residual and
+        # Jacobian callbacks close over those objects in a context dict set up
+        # once (see dolfinx.fem.petsc.NonlinearProblem.__init__'s
+        # jacobian_ctx/function_ctx), so reassigning self._F/self._J later --
+        # the trick LinearProblem.solve() uses to switch between "live" and
+        # "recompute" forms -- would have no effect on what the SNES actually
+        # assembles. The only way to make the SNES see a different value for a
+        # coefficient is to mutate the exact Function object its compiled
+        # forms reference.
+        #
+        # To keep that mutation from ever touching an object the user (or a
+        # Taylor test perturbing a control directly) holds a live reference
+        # to, every non-u coefficient is routed through a dedicated
+        # placeholder Function from the very start: the SNES is built against
+        # F/J/P with every such coefficient replaced by its placeholder, and
+        # the placeholders are (re)populated -- from the user's own current
+        # values for an ordinary solve() (see solve() below), or from a
+        # block's checkpointed/candidate values for a recompute (see
+        # NonlinearProblemBlock.prepare_recompute_component) -- before every
+        # solve, never the other way around.
+        u_list = self._u if isinstance(self._u, list) else [self._u]
+        coefficients = _collect_coefficients(F) - set(u_list)
+        if J is not None:
+            coefficients |= _collect_coefficients(J) - set(u_list)
+        self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
+            c: dolfinx.fem.Function(c.function_space) for c in coefficients
+        }
+
+        def _replace(form):
+            if form is None:
+                return None
+            if isinstance(form, ufl.Form):
+                return ufl.replace(form, self._value_placeholders)
+            return [_replace(f) for f in form]
+
+        # Initialize nonlinear solver
         super().__init__(
-            F=F,  # type: ignore[arg-type]
-            J=J,  # type: ignore[arg-type]
-            P=P,  # type: ignore[arg-type]
+            F=_replace(F),  # type: ignore[arg-type]
+            J=_replace(J),  # type: ignore[arg-type]
+            P=_replace(P),  # type: ignore[arg-type]
             bcs=self._bcs,
             u=self._u,  # type: ignore[arg-type]
             kind=kind,  # type: ignore[arg-type]
@@ -497,6 +552,14 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
             )  # type: ignore[misc]
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
+
+        # Refresh the SNES-facing placeholder coefficients from the user's
+        # own, current values before an ordinary solve: a prior recompute
+        # (see NonlinearProblemBlock.prepare_recompute_component) may have
+        # left them holding a checkpointed/candidate value instead.
+        for original, placeholder in self._value_placeholders.items():
+            placeholder.x.array[:] = original.x.array[:]
+            placeholder.x.scatter_forward()
 
         out = dolfinx.fem.petsc.NonlinearProblem.solve(self)
         if annotate:

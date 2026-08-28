@@ -15,7 +15,7 @@ import numpy as np
 import pyadjoint
 import ufl
 
-from dolfinx_adjoint import Function, LinearProblem, assemble_scalar, assign
+from dolfinx_adjoint import Function, LinearProblem, NonlinearProblem, assemble_scalar, assign
 
 
 def _run_heat_steps(num_steps: int, monkeypatch) -> int:
@@ -154,6 +154,64 @@ def test_recompute_does_not_corrupt_original_control():
     min_rate = pyadjoint.taylor_test(Jh, m, dm, dJdm=0)
 
     assert np.allclose(m.x.array, m_original), (
+        "the original control object was mutated by recompute; it must stay pristine"
+    )
+    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+
+
+def test_nonlinear_recompute_does_not_corrupt_original_control():
+    """As above, but for NonlinearProblem.
+
+    NonlinearProblemBlock has always mutated its dependency coefficients in
+    place during recompute (SNES's residual/Jacobian callbacks are bound to
+    fixed compiled Form objects, so there is no equivalent of swapping in a
+    differently-compiled form the way LinearProblemBlock historically did).
+    Fixed by routing every non-``u`` coefficient through a dedicated
+    placeholder from the moment the SNES is built (see
+    ``NonlinearProblem._value_placeholders``), so recompute writes into the
+    placeholder instead of the user's own object.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 7)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    f = Function(V, name="control")
+    f.interpolate(lambda x: 2.0 + np.sin(x[0]))
+    f_original = f.x.array.copy()
+
+    u1 = Function(V, name="state")
+    u1.interpolate(lambda x: np.ones_like(x[0]))
+    v1 = ufl.TestFunction(V)
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
+    bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
+
+    options = {
+        "snes_error_if_not_converged": True,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    problem.solve()
+
+    d = pyadjoint.AdjFloat(0.2)
+    J = assemble_scalar((u1 - d) ** 3 * ufl.dx)
+    control = pyadjoint.Control(f)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    dm = Function(V)
+    dm.interpolate(lambda x: 2 * np.sin(x[0] * np.pi))
+
+    # Passing `f` itself (not a copy) as the expansion point.
+    min_rate = pyadjoint.taylor_test(Jh, f, dm, dJdm=0)
+
+    assert np.allclose(f.x.array, f_original), (
         "the original control object was mutated by recompute; it must stay pristine"
     )
     assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"

@@ -1030,18 +1030,24 @@ class NonlinearProblemBlock(pyadjoint.Block):
     def prepare_recompute_component(self, inputs, relevant_outputs):
         """Prepare for recomputing the block with different control inputs."""
 
-        # As opposed to the linear problem, we need to update the coefficients in place,
-        # as the nonlinear problem snes.setContext doesn't reflect in place updates on the solver.
+        # The SNES the shared forward solver (self._problem()) owns is bound,
+        # forever, to a fixed set of placeholder coefficients rather than the
+        # user's own dependency objects (see
+        # NonlinearProblem._value_placeholders): writing this call's
+        # candidate/checkpointed values into the placeholders -- never into
+        # block_variable.output itself -- is what makes the SNES see them,
+        # without ever mutating an object the user (or a Taylor test
+        # perturbing a control directly) holds a live reference to.
+        problem = self._problem()
         for block_variable in self.get_dependencies():
-            coeff = block_variable.output
-            if isinstance(coeff, dolfinx.fem.Function):
-                coeff.x.array[:] = block_variable.saved_output.x.array[:]
-                coeff.x.scatter_forward()
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
 
         # Re-establish this block's own bcs on the shared forward solver (the
         # Problem itself -- see _problem()), since another block may have used
         # it with different bcs in between.
-        problem = self._problem()
         problem.bcs = self._bcs
 
         # Warm-start original unknown objects in place
