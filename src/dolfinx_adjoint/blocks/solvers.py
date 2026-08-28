@@ -1155,15 +1155,16 @@ class NonlinearProblemBlock(pyadjoint.Block):
 
     def recompute_component(
         self, inputs: typing.Iterable[Function], block_variable, idx: int, prepared: None
-    ) -> typing.Union[dolfinx.fem.Function, typing.Iterable[dolfinx.fem.Function]]:
+    ) -> Function:
         """Recompute the block with the prepared linear problem."""
         with pyadjoint.tape.stop_annotating():
             self._forward_solver.solve()
-
         if isinstance(self._forward_solver._u, list):
-            return self._forward_solver._u[idx]._ad_copy()
+            output = self._forward_solver._u[idx]
         else:
-            return self._forward_solver._u._ad_copy()
+            output = self._forward_solver._u
+        assert isinstance(output, Function)
+        return output
 
     def _should_compute_boundary_adjoint(
         self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
