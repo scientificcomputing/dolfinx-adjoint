@@ -317,9 +317,6 @@ def test_recompute_does_not_alias_state_across_timesteps(mesh_1D):
         if schedule is not None:
             tape.enable_checkpointing(schedule)
 
-        m = Function(V, name="control")
-        m.interpolate(lambda x: 1.0 + x[0])
-
         controls = []
         for i in range(5):
             c = Function(V, name=f"control_{i}")

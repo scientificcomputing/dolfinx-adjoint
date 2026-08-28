@@ -54,7 +54,10 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     A DirichletBC reads this Function's array directly through its C++ binding, not through UFL
     form substitution, so FunctionAssignBlock.recompute_component must keep mutating the exact
-    same object in place for a tagged Function instead of returning an isolated snapshot.
+    same object in place for a tagged Function instead of returning an isolated snapshot. This
+    trades away checkpoint-aliasing safety in exchange for BC identity, so a Function that is
+    both BC-backing and reassigned as ordinary time-stepping state on every tape timestep is not
+    currently supported.
     """
 
     def __init__(

@@ -233,15 +233,15 @@ class FunctionAssignBlock(Block):
             prepared = inputs[0]
 
         output = block_variable.saved_output
-        if isinstance(output, dolfinx.fem.Function) and not output._ad_bc_backing:
+        if isinstance(output, _Function) and not output._ad_bc_backing:
             # This target is reused across every timestep's assign() call, so
             # block_variable.saved_output is the same Python object for every one of them.
             # Mutating it in place would silently overwrite an earlier timestep's checkpoint
             # with this one's value the next time this block is recomputed under a checkpoint
             # schedule; return an isolated snapshot instead.
             output = output._ad_new_like()
-        # Otherwise (a DirichletBC-backing Function, or any non-Function output) return the
-        # exact object instance to maintain C++ memory bindings, updating it in-place.
+        # Otherwise (a Function tagged _ad_bc_backing) return the exact object instance to
+        # maintain C++ memory bindings, updating it in-place.
         if isinstance(prepared, dolfinx.fem.Function):
             output.x.array[:] = prepared.x.array[:]
         elif isinstance(prepared, (float, int)):

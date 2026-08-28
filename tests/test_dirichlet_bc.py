@@ -145,6 +145,7 @@ def test_time_dependent_bc_replay():
 
 
 def test_dirichletbc_tags_its_value_function():
+    pyadjoint.get_working_tape().clear_tape()
     mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
     V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
     bc_func = Function(V, name="bc_func")
