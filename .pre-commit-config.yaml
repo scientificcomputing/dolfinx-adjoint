@@ -27,5 +27,6 @@ repos:
     rev: v2.3.0
     hooks:
       - id: mypy
+        language: system
         files: ^src/|^tests/
         args: ["--config-file", "pyproject.toml"]

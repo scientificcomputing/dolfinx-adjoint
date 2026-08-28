@@ -464,7 +464,7 @@ class LinearProblemBlock(pyadjoint.Block):
 
         # 3. Hot-swap solver forms
         self._forward_solver._a = compiled_lhs
-        self._forward_solver._L = compiled_rhs
+        self._forward_solver._L = compiled_rhs  # type: ignore[assignment]
         self._forward_solver._preconditioner = compiled_preconditioner
         self._forward_solver.bcs = self._bcs
         self._forward_solver._u = self._u
@@ -698,6 +698,7 @@ class LinearProblemBlock(pyadjoint.Block):
             for adj_sol, sol in zip(self._adjoint_solutions, self._adjoint_solver.u):
                 adj_sol.x.array[:] = sol.x.array[:]
         else:
+            assert isinstance(self._adjoint_solutions, dolfinx.fem.Function)
             self._adjoint_solutions.x.array[:] = self._adjoint_solver.u.x.array[:]
         return F_form, replacement_map
 
@@ -728,7 +729,7 @@ class LinearProblemBlock(pyadjoint.Block):
         dFdm = -ufl.derivative(sum_res, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
-            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))  # type: ignore[arg-type]
+            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))  # type: ignore[call-overload]
 
         dFdm_adj = ufl.adjoint(dFdm)
         sensitivity = ufl.action(dFdm_adj, self._adjoint_solutions)
@@ -1358,6 +1359,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             for adj_sol, sol in zip(self._adjoint_solutions, self._adjoint_solver.u):
                 adj_sol.x.array[:] = sol.x.array[:]
         else:
+            assert isinstance(self._adjoint_solutions, dolfinx.fem.Function)
             self._adjoint_solutions.x.array[:] = self._adjoint_solver.u.x.array[:]
         return F_form
 
