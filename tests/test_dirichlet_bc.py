@@ -118,8 +118,14 @@ def test_time_dependent_bc_replay():
 
     # Use native dolfinx here! PyAdjoint traces the bc_func inside it.
     bc = dirichletbc(bc_func, boundary_dofs)
-
-    problem = LinearProblem(a, L, bcs=[bc], u=uh)
+    petsc_options = {
+        "ksp_monitor": None,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
 
     J = 0.0
 
