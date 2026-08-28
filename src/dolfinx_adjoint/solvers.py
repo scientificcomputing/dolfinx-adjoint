@@ -12,12 +12,6 @@ from .petsc_utils import LinearAdjointProblem
 from .types import Function
 
 
-@typing.overload
-def resolve_u(u: _Function | None, L: ufl.Form) -> _Function: ...
-@typing.overload
-def resolve_u(u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]) -> typing.Sequence[_Function]: ...
-
-
 def _collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set:
     """Return the set of UFL coefficients appearing anywhere in ``form``.
 
@@ -35,6 +29,12 @@ def _collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set:
     for f in form:
         coefficients |= _collect_coefficients(f)
     return coefficients
+
+
+@typing.overload
+def resolve_u(u: _Function | None, L: ufl.Form) -> _Function: ...
+@typing.overload
+def resolve_u(u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]) -> typing.Sequence[_Function]: ...
 
 
 def resolve_u(
@@ -160,13 +160,41 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self._petsc_options_prefix = petsc_options_prefix
         self._kind = kind
 
+        # The forward solver's compiled forms reference dedicated placeholder
+        # coefficients rather than the user's own dependency objects --
+        # exactly like NonlinearProblem, so both classes share the same
+        # data-handling story: a solve always means "refresh the
+        # placeholders' values, then call the solver", never "recompile a
+        # form" or "mutate the user's own coefficient in place". solve()
+        # (below) refreshes them from the user's own current values;
+        # LinearProblemBlock.prepare_recompute_component refreshes them from
+        # a block's checkpointed/candidate values instead. Neither ever
+        # writes into the user's own coefficient objects, so a Taylor test
+        # that perturbs the original control directly
+        # (`pyadjoint.taylor_test(Jh, m, dm)`) always sees a pristine `m`.
+        u_list = self._u if isinstance(self._u, list) else [self._u]
+        coefficients = _collect_coefficients(a) | _collect_coefficients(L)
+        if P is not None:
+            coefficients |= _collect_coefficients(P)
+        coefficients -= set(u_list)
+        self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
+            c: dolfinx.fem.Function(c.function_space) for c in coefficients
+        }
+
+        def _replace(form):
+            if form is None:
+                return None
+            if isinstance(form, ufl.Form):
+                return ufl.replace(form, self._value_placeholders)
+            return [_replace(f) for f in form]
+
         # Initialize linear solver
         super().__init__(
-            a=a,  # type: ignore[arg-type]
-            L=L,  # type: ignore[arg-type]
+            a=_replace(a),  # type: ignore[arg-type]
+            L=_replace(L),  # type: ignore[arg-type]
             bcs=bcs,
             u=self._u,  # type: ignore[arg-type]
-            P=P,  # type: ignore[arg-type]
+            P=_replace(P),  # type: ignore[arg-type]
             kind=kind,  # type: ignore[arg-type]
             petsc_options_prefix=petsc_options_prefix,
             petsc_options=petsc_options,
@@ -179,31 +207,6 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         # forward solver actually resolved to (kind=None can auto-resolve to
         # "nest" for blocked problems).
         self._kind = "nest" if self.A.getType() == "nest" else kind
-
-        # The "live" compiled forms, referencing the user's own coefficient
-        # objects directly -- used for every ordinary .solve() call. Snapshot
-        # them once so solve() can always restore them, even after a
-        # recompute (see _get_or_build_recompute_forms) has pointed self._a/
-        # self._L/self._preconditioner at the placeholder-based recompute
-        # forms in between.
-        self._live_a = self._a
-        self._live_L = self._L
-        self._live_preconditioner = self._preconditioner
-
-        # Recompute forms: built lazily (see _get_or_build_recompute_forms),
-        # compiled once against dedicated placeholder coefficients rather than
-        # the user's own dependency objects. Blocks replaying this Problem
-        # with a checkpointed/candidate value (e.g. during a Taylor test or an
-        # optimisation iteration) write into these placeholders instead of the
-        # user's own Functions: mutating the user's own control object in
-        # place would corrupt it for any later use of that same object (e.g.
-        # a Taylor test that perturbs the original control directly, as
-        # `pyadjoint.taylor_test(Jh, m, dm)` does), silently invalidating
-        # every subsequent perturbation computed relative to it.
-        self._recompute_value_placeholders: typing.Optional[dict] = None
-        self._recompute_a = None
-        self._recompute_L = None
-        self._recompute_preconditioner = None
 
         # Adjoint and tangent-linear solvers: built lazily (on first use, see
         # _get_or_build_adjoint_solver/_get_or_build_tlm_solver below) and shared
@@ -220,10 +223,24 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         self._tlm_solver: typing.Optional[LinearAdjointProblem] = None
 
     def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
-        """Build (once) and return the adjoint solver shared by every block this Problem records."""
+        """Build (once) and return the adjoint solver shared by every block this Problem records.
+
+        adjoint(dF/du) does not actually depend on the state u for a linear
+        problem: F(u, v) = a(u, v) - L(v) is linear in u, so its derivative
+        doesn't reference u's value at all, only whatever *other*
+        coefficients a itself depends on. Building it here from the
+        placeholder-substituted ``a`` (the same placeholders the forward
+        solver's compiled form already uses, see ``_value_placeholders``)
+        rather than the original ``a`` means this operator is compiled
+        exactly once, ever, for the life of this Problem: every block only
+        ever needs to refresh the placeholders' values (see
+        ``LinearProblemBlock.prepare_evaluate_adj``/``prepare_evaluate_hessian``),
+        never rebuild or recompile this form.
+        """
         if self._adjoint_solver is None:
+            lhs_for_adjoint = ufl.replace(sum_form(self._lhs), self._value_placeholders)  # type: ignore[arg-type]
             self._adjoint_solver = LinearAdjointProblem(
-                LinearProblemBlock._compute_adjoint(sum_form(self._lhs)),  # type: ignore[arg-type]
+                LinearProblemBlock._compute_adjoint(lhs_for_adjoint),  # type: ignore[arg-type]
                 self._rhs,  # type: ignore[arg-type]
                 bcs=self.bcs,
                 P=self._preconditioner,  # type: ignore[arg-type]
@@ -260,68 +277,6 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             )  # type: ignore[misc]
         return self._tlm_solver
 
-    def _get_or_build_recompute_forms(self) -> tuple[dict, typing.Any, typing.Any, typing.Any]:
-        """Build (once) and return the placeholder-based forms used to replay this
-        Problem's forward solve with different dependency values.
-
-        Returns a ``(value_placeholders, compiled_a, compiled_L, compiled_preconditioner)``
-        tuple. ``value_placeholders`` maps each of this Problem's dependency
-        coefficients (as they appear in ``a``/``L``) to a dedicated, plain
-        ``dolfinx.fem.Function`` that the compiled forms reference instead.
-        Blocks write a checkpointed/candidate value into the placeholder
-        before replaying (see ``LinearProblemBlock.prepare_recompute_component``),
-        leaving the user's own coefficient objects untouched.
-        """
-        if self._recompute_value_placeholders is None:
-            coefficients: set = set()
-            lhs_summed = sum_form(self._lhs)  # type: ignore[arg-type]
-            rhs_summed = sum_form(self._rhs)  # type: ignore[arg-type]
-            if lhs_summed is not None:
-                coefficients.update(lhs_summed.coefficients())
-            if rhs_summed is not None:
-                coefficients.update(rhs_summed.coefficients())
-            placeholders = {c: dolfinx.fem.Function(c.function_space) for c in coefficients}
-
-            def _replace(form):
-                if form is None:
-                    return None
-                if isinstance(form, ufl.Form):
-                    return ufl.replace(form, placeholders)
-                return [_replace(f) for f in form]
-
-            recompute_lhs = _replace(self._lhs)
-            recompute_rhs = _replace(self._rhs)
-            recompute_preconditioner = _replace(self._preconditioner) if self._preconditioner is not None else None
-            self._recompute_value_placeholders = placeholders
-            self._recompute_a = dolfinx.fem.form(
-                recompute_lhs,
-                jit_options=self._jit_options,
-                form_compiler_options=self._form_compiler_options,
-                entity_maps=self._entity_maps,
-            )
-            self._recompute_L = dolfinx.fem.form(
-                recompute_rhs,
-                jit_options=self._jit_options,
-                form_compiler_options=self._form_compiler_options,
-                entity_maps=self._entity_maps,
-            )
-            self._recompute_preconditioner = (
-                dolfinx.fem.form(
-                    recompute_preconditioner,
-                    jit_options=self._jit_options,
-                    form_compiler_options=self._form_compiler_options,
-                    entity_maps=self._entity_maps,
-                )
-                if recompute_preconditioner is not None
-                else None
-            )
-        return (
-            self._recompute_value_placeholders,
-            self._recompute_a,
-            self._recompute_L,
-            self._recompute_preconditioner,
-        )
-
     def solve(self, annotate: bool = True) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
         """
         Solve the linear problem and return the solution.
@@ -343,14 +298,14 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
 
-        # A prior recompute (see LinearProblemBlock.prepare_recompute_component)
-        # may have pointed self._a/self._L/self._preconditioner at the
-        # placeholder-based recompute forms; always restore the "live" forms
-        # -- which reference the user's own, current coefficient values
-        # directly -- before an ordinary solve.
-        self._a = self._live_a  # type: ignore[assignment]
-        self._L = self._live_L  # type: ignore[assignment]
-        self._preconditioner = self._live_preconditioner
+        # Refresh the forward solver's placeholder coefficients from the
+        # user's own, current values before an ordinary solve: a prior
+        # recompute (see LinearProblemBlock.prepare_recompute_component) may
+        # have left them holding a checkpointed/candidate value instead.
+        for original, placeholder in self._value_placeholders.items():
+            placeholder.x.array[:] = original.x.array[:]
+            placeholder.x.scatter_forward()
+
         out = dolfinx.fem.petsc.LinearProblem.solve(self)
         if annotate:
             if isinstance(out, Function):
@@ -512,11 +467,26 @@ class NonlinearProblem(dolfinx.fem.petsc.NonlinearProblem):
         self._adjoint_solver: typing.Optional[LinearAdjointProblem] = None
 
     def _get_or_build_adjoint_solver(self) -> LinearAdjointProblem:
-        """Build (once) and return the adjoint solver shared by every block this Problem records."""
+        """Build (once) and return the adjoint solver shared by every block this Problem records.
+
+        Unlike the linear case, adjoint(dF/du) genuinely depends on u's
+        current value here (F is nonlinear in u), so it needs a coefficient
+        slot for "u at this evaluation point" -- but that slot need not be
+        ``self._u`` itself (which the live SNES/forward path owns): a
+        dedicated placeholder, refreshed from a block's own checkpointed
+        output before each adjoint/Hessian solve (see
+        ``NonlinearProblemBlock.prepare_evaluate_adj``/``prepare_evaluate_hessian``),
+        keeps this operator's compiled form fixed for the life of the
+        Problem, exactly like the non-u dependencies already routed through
+        ``self._value_placeholders``.
+        """
         if self._adjoint_solver is None:
             if not isinstance(self._rhs, ufl.Form):
                 raise NotImplementedError("Blocked systems not implemented yet.")
-            dFdu_adj = ufl.adjoint(ufl.derivative(self._rhs, self._u))
+            self._adjoint_u_placeholder = dolfinx.fem.Function(self._u.function_space)  # type: ignore[union-attr]
+            replace_map: dict = {**self._value_placeholders, self._u: self._adjoint_u_placeholder}
+            rhs_for_adjoint = ufl.replace(self._rhs, replace_map)
+            dFdu_adj = ufl.adjoint(ufl.derivative(rhs_for_adjoint, self._adjoint_u_placeholder))
             self._adjoint_solver = LinearAdjointProblem(
                 dFdu_adj,  # type: ignore[arg-type]
                 self._rhs,  # type: ignore[arg-type]

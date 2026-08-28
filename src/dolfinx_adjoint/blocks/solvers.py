@@ -349,32 +349,24 @@ class LinearProblemBlock(pyadjoint.Block):
     ) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
         """Prepare for recomputing the block with different control inputs."""
 
-        # Write this call's candidate/checkpointed dependency values into the
-        # Problem's dedicated recompute placeholders (built once, compiled
-        # once -- see LinearProblem._get_or_build_recompute_forms), rather
-        # than building a fresh ufl.replace'd copy of the forms and
-        # recompiling it via FFCx on every call. Crucially, this never
-        # mutates the user's own coefficient objects: a Taylor test commonly
-        # perturbs the original control object directly
-        # (`pyadjoint.taylor_test(Jh, m, dm)`), and that perturbation must
-        # always be computed relative to the *pristine* original value, not
-        # whatever a previous recompute happened to leave in it.
+        # The forward solver (self._problem()) is bound, forever, to compiled
+        # forms referencing dedicated placeholder coefficients rather than the
+        # user's own dependency objects (see LinearProblem._value_placeholders,
+        # which mirrors NonlinearProblem's): writing this call's
+        # candidate/checkpointed values into the placeholders -- never into
+        # block_variable.output itself -- is what the next solve sees,
+        # without ever mutating an object the user (or a Taylor test
+        # perturbing a control directly) holds a live reference to.
         problem = self._problem()
-        placeholders, recompute_a, recompute_L, recompute_preconditioner = problem._get_or_build_recompute_forms()
         for block_variable in self.get_dependencies():
-            placeholder = placeholders.get(block_variable.output)
+            placeholder = problem._value_placeholders.get(block_variable.output)
             if placeholder is not None:
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
 
-        # Point the shared forward solver (the Problem itself -- see
-        # _problem()) at the recompute forms and re-establish this block's
-        # own bcs, since another block may have used it (in "live" or
-        # "recompute" mode, with different bcs) in between. solve() always
-        # restores the "live" forms before an ordinary .solve() call.
-        problem._a = recompute_a  # type: ignore[assignment]
-        problem._L = recompute_L  # type: ignore[assignment]
-        problem._preconditioner = recompute_preconditioner
+        # Re-establish this block's own bcs on the shared forward solver (the
+        # Problem itself -- see _problem()), since another block may have
+        # used it with different bcs in between.
         problem.bcs = self._bcs
         problem._u = self._u
 
@@ -569,12 +561,26 @@ class LinearProblemBlock(pyadjoint.Block):
     ) -> tuple[ufl.Form, dict[Function, Function]]:
         """Prepare the block for evaluating the adjoint."""
 
-        # The adjoint solver is shared across every block this Problem records
-        # (built once, lazily, on first adjoint evaluation) -- re-establish
-        # this block's own bcs on every call, since another block may have
-        # used the same solver in between.
-        adjoint_solver = self._problem()._get_or_build_adjoint_solver()
+        # The adjoint solver -- and the compiled LHS it solves with -- are
+        # shared across every block this Problem records: adjoint(dF/du) does
+        # not actually depend on the state u for a linear problem (F is
+        # linear in u, so its derivative doesn't reference u's value at all),
+        # so once every *other* dependency is routed through a placeholder
+        # (see LinearProblem._value_placeholders), that operator is fixed for
+        # the life of the Problem and was compiled once, in
+        # LinearProblem._get_or_build_adjoint_solver. Refresh this block's own
+        # checkpointed values into the placeholders and re-establish this
+        # block's own bcs on every call, since another block may have used
+        # the same solver in between -- but never rebuild or recompile the
+        # form itself.
+        problem = self._problem()
+        adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
+        for block_variable in self.get_dependencies():
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
 
         # Extract dJ/du[v] from the adjoint inputs.
         if len(adj_inputs) == 1:
@@ -600,21 +606,11 @@ class LinearProblemBlock(pyadjoint.Block):
             dolfinx.la.petsc.assign(arrs, dJdu)
             dJdu.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)  # type: ignore[arg-type]
 
-        # Compute (dF/du[v])* for the linear problem.
+        # F_form/replacement_map are still needed by evaluate_adj_component
+        # (to build each dependency's own sensitivity form), but the adjoint
+        # LHS itself is already correct on adjoint_solver -- no rebuild, no
+        # recompile.
         F_form, replacement_map = self._compute_residual()
-        dFdu = self._compute_residual_derivative()
-        summed = sum_form(dFdu)
-        dFdu_adj = compute_form_adjoint(summed)
-        dFdu_adj = ufl.algorithms.apply_derivatives.apply_derivatives(ufl.algorithms.expand_derivatives(dFdu_adj))
-        assert dFdu_adj.empty() is False, "Adjoint of dF/du[v] is empty. Check if the problem is linear."
-        # Solve adjoint problem
-        compiled_dFdu = dolfinx.fem.form(
-            ufl.extract_blocks(dFdu_adj),  # type: ignore[arg-type]
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        adjoint_solver._a = compiled_dFdu
         adjoint_solver.solve()
         if isinstance(self._adjoint_solutions, list):
             for adj_sol, sol in zip(self._adjoint_solutions, adjoint_solver.u):
@@ -674,11 +670,22 @@ class LinearProblemBlock(pyadjoint.Block):
         if (hessian_inputs is None) or (len(tlm_output) == 0):
             return
 
-        # The adjoint solver is shared across every block this Problem records
-        # -- re-establish this block's own bcs on every call, since another
-        # block may have used the same solver in between.
-        adjoint_solver = self._problem()._get_or_build_adjoint_solver()
+        # The adjoint solver -- and the compiled LHS it solves with, shared
+        # verbatim with the first-order adjoint equation (see
+        # LinearProblem._get_or_build_adjoint_solver) -- are shared across
+        # every block this Problem records. Refresh this block's own
+        # checkpointed values into the placeholders and re-establish this
+        # block's own bcs on every call, since another block may have used
+        # the same solver in between -- but never rebuild or recompile the
+        # LHS itself.
+        problem = self._problem()
+        adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
+        for block_variable in self.get_dependencies():
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
 
         # Using the equation Form we derive dF/du, d^2F/du^2 * du/dm * direction.
         dFdu_form = self._compute_residual_derivative()
@@ -767,16 +774,10 @@ class LinearProblemBlock(pyadjoint.Block):
             dolfinx.la.petsc.assign(local_arrays, b)
             b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
 
-        # Compile SOA LHS
-        dFdu_adj = dolfinx.fem.form(
-            self._compute_adjoint(sum_form(dFdu_form)),
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-
-        # Solve adjoint problem
-        adjoint_solver._a = dFdu_adj
+        # The SOA (second-order-adjoint) equation shares its LHS verbatim with
+        # the first-order adjoint equation (both are adjoint(dF/du), computed
+        # from dFdu_form above) -- already correct and permanent on
+        # adjoint_solver, so no rebuild or recompile needed here either.
         adjoint_solver.solve()
         if isinstance(self._second_adjoint_solutions, list):
             for adj_sol, sol in zip(self._second_adjoint_solutions, adjoint_solver.u):
@@ -1231,17 +1232,32 @@ class NonlinearProblemBlock(pyadjoint.Block):
     ) -> typing.Union[ufl.Form, typing.Iterable[ufl.Form]]:
         """Prepare the block for evaluating the adjoint."""
 
-        # The adjoint solver is shared across every block this Problem records
-        # (built once, lazily, on first adjoint evaluation) -- re-establish
-        # this block's own bcs on every call, since another block may have
-        # used the same solver in between.
-        adjoint_solver = self._problem()._get_or_build_adjoint_solver()
+        # The adjoint solver -- and the compiled LHS it solves with -- are
+        # shared across every block this Problem records: once every non-u
+        # dependency is routed through its placeholder and "u at this
+        # evaluation point" through its own dedicated placeholder (see
+        # NonlinearProblem._get_or_build_adjoint_solver), that operator is
+        # fixed for the life of the Problem and was compiled once. Refresh
+        # this block's own checkpointed values into the placeholders and
+        # re-establish this block's own bcs on every call, since another
+        # block may have used the same solver in between -- but never
+        # rebuild or recompile the LHS itself.
+        problem = self._problem()
+        adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
+        for block_variable in self.get_dependencies():
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
+        out_bv = self.get_outputs()[0]
+        problem._adjoint_u_placeholder.x.array[:] = out_bv.saved_output.x.array[:]
+        problem._adjoint_u_placeholder.x.scatter_forward()
 
-        # Compute (dF/du[v])* for the linear problem.
+        # F_form is still needed by evaluate_adj_component (to build each
+        # dependency's own sensitivity form), but the adjoint LHS itself is
+        # already correct on adjoint_solver -- no rebuild, no recompile.
         F_form = self._compute_residual()
-        dFdu = self._compute_residual_derivative()
-        dFdu_adj = self._compute_adjoint(dFdu)
         # Extract dJ/du[v] from the adjoint inputs.
         assert len(adj_inputs) == 1
         adj_rhs = adj_inputs[0]
@@ -1249,14 +1265,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
         with dJdu.localForm() as dJdu_loc, adj_rhs.petsc_vec.localForm() as adj_rhs_loc:
             dJdu_loc.array[:] = adj_rhs_loc.array[:]
 
-        # Solve adjoint problem
-        compiled_dFdu = dolfinx.fem.form(
-            dFdu_adj,  # type: ignore[arg-type]
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-        adjoint_solver._a = compiled_dFdu
         adjoint_solver.solve()
         if isinstance(self._adjoint_solutions, list):
             for adj_sol, sol in zip(self._adjoint_solutions, adjoint_solver.u):
@@ -1311,11 +1319,24 @@ class NonlinearProblemBlock(pyadjoint.Block):
         if (hessian_inputs is None) or (len(tlm_output) == 0):
             return
 
-        # The adjoint solver is shared across every block this Problem records
-        # -- re-establish this block's own bcs on every call, since another
-        # block may have used the same solver in between.
-        adjoint_solver = self._problem()._get_or_build_adjoint_solver()
+        # The adjoint solver -- and the compiled LHS it solves with, shared
+        # verbatim with the first-order adjoint equation (both are
+        # adjoint(dF/du), see NonlinearProblem._get_or_build_adjoint_solver)
+        # -- are shared across every block this Problem records. Refresh this
+        # block's own checkpointed values into the placeholders and
+        # re-establish this block's own bcs on every call, since another
+        # block may have used the same solver in between -- but never
+        # rebuild or recompile the LHS itself.
+        problem = self._problem()
+        adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
+        for block_variable in self.get_dependencies():
+            placeholder = problem._value_placeholders.get(block_variable.output)
+            if placeholder is not None:
+                placeholder.x.array[:] = block_variable.saved_output.x.array[:]
+                placeholder.x.scatter_forward()
+        problem._adjoint_u_placeholder.x.array[:] = outputs[0].saved_output.x.array[:]
+        problem._adjoint_u_placeholder.x.scatter_forward()
 
         # Using the equation Form we derive dF/du, d^2F/du^2 * du/dm * direction.
         dFdu_form = self._compute_residual_derivative()
@@ -1355,17 +1376,13 @@ class NonlinearProblemBlock(pyadjoint.Block):
         with b.localForm() as b_loc, hessian_inputs[0].petsc_vec.localForm() as hess_loc:
             b_loc.array[:] += hess_loc.array[:]
 
-        # Compile SOA LHS
-        dFdu_adj = dolfinx.fem.form(
-            ufl.adjoint(dFdu_form),
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-
+        # The SOA (second-order-adjoint) equation shares its LHS verbatim
+        # with the first-order adjoint equation (both are
+        # adjoint(dF/du) -- already correct and permanent on adjoint_solver,
+        # so no rebuild or recompile needed here either.
+        #
         # Redirect the shared solver's scratch solution storage at this
         # block's own second-adjoint buffer for the duration of this solve.
-        adjoint_solver._a = dFdu_adj
         adjoint_solver._u = self._second_adjoint_solutions
         adjoint_solver.solve()
         if isinstance(self._second_adjoint_solutions, list):

@@ -85,10 +85,10 @@ def test_recompute_form_count_independent_of_step_count(monkeypatch):
     """Replaying more timesteps on the same LinearProblem must not compile more forms.
 
     The recompute-time placeholder forms (see
-    ``LinearProblem._get_or_build_recompute_forms``) are compiled once per Problem,
-    the first time any of its blocks replays -- not once per block/timestep. So the
-    number of ``dolfinx.fem.form`` calls triggered by replaying the whole tape must
-    be the same whether the tape has 3 timesteps or 8.
+    ``LinearProblem._value_placeholders``) are compiled exactly once, when the
+    Problem is constructed -- not once per block/timestep, and not again on
+    replay. So the number of ``dolfinx.fem.form`` calls triggered by replaying
+    the whole tape must be the same whether the tape has 3 timesteps or 8.
     """
     count_short = _run_heat_steps(3, monkeypatch)
     count_long = _run_heat_steps(8, monkeypatch)
@@ -162,14 +162,17 @@ def test_recompute_does_not_corrupt_original_control():
 def test_nonlinear_recompute_does_not_corrupt_original_control():
     """As above, but for NonlinearProblem.
 
-    NonlinearProblemBlock has always mutated its dependency coefficients in
-    place during recompute (SNES's residual/Jacobian callbacks are bound to
-    fixed compiled Form objects, so there is no equivalent of swapping in a
-    differently-compiled form the way LinearProblemBlock historically did).
-    Fixed by routing every non-``u`` coefficient through a dedicated
-    placeholder from the moment the SNES is built (see
-    ``NonlinearProblem._value_placeholders``), so recompute writes into the
-    placeholder instead of the user's own object.
+    NonlinearProblem's SNES binds its residual/Jacobian callbacks to fixed
+    compiled Form objects at construction time, so there is no way to later
+    swap in a differently-compiled form the way a KSP-based solve can; the
+    only way to make the SNES see a different coefficient value is to mutate
+    the exact object its compiled forms reference. Every non-``u`` coefficient
+    is therefore routed through a dedicated placeholder from the moment the
+    SNES is built (``NonlinearProblem._value_placeholders``), and
+    ``LinearProblem`` now uses the identical mechanism -- both classes always
+    solve by refreshing placeholder values and calling an unchanging,
+    already-compiled solver, never by mutating the user's own coefficient or
+    recompiling a form.
     """
     pyadjoint.get_working_tape().clear_tape()
 
@@ -215,3 +218,130 @@ def test_nonlinear_recompute_does_not_corrupt_original_control():
         "the original control object was mutated by recompute; it must stay pristine"
     )
     assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+
+
+def test_linear_adjoint_lhs_compiled_once():
+    """adjoint(dF/du) does not depend on the state for a linear problem, so it
+    should be compiled exactly once per Problem (in
+    ``LinearProblem._get_or_build_adjoint_solver``) and never rebuilt --
+    including across repeated ``derivative()``/``hessian()`` calls at
+    different control values, which is exactly the scenario
+    (``test_tlm_update.py``'s "warm up at another point" tests) that would
+    catch a stale operator being silently reused with the wrong coefficient
+    values.
+
+    The control ``m`` sits inside the bilinear form itself (not just the
+    right-hand side), so the adjoint operator actually depends on it -- a
+    control that only appeared in ``L`` wouldn't exercise this at all.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2 + x[1] ** 2)
+
+    f = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0))
+    a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = f * v * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    petsc_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
+    problem.solve()
+
+    d = Function(V)
+    d.interpolate(lambda x: np.sin(np.pi * x[0]))
+    J = assemble_scalar(0.5 * ufl.inner(uh - d, uh - d) * ufl.dx)
+    control = pyadjoint.Control(m)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    adjoint_solver = problem._get_or_build_adjoint_solver()
+    compiled_lhs = adjoint_solver._a
+    assert compiled_lhs is not None
+
+    Jh.derivative()
+    assert adjoint_solver._a is compiled_lhs, "adjoint LHS was rebuilt by derivative()"
+
+    m2 = Function(V)
+    m2.interpolate(lambda x: 2.0 + np.sin(x[0]))
+    Jh(m2)
+    Jh.derivative()
+    assert adjoint_solver._a is compiled_lhs, "adjoint LHS was rebuilt after evaluating at a new point"
+
+    dm = Function(V)
+    dm.interpolate(lambda x: np.cos(x[0] * np.pi))
+    Jh.hessian(dm)
+    assert adjoint_solver._a is compiled_lhs, "the SOA (Hessian) solve rebuilt the shared adjoint LHS"
+
+
+def test_nonlinear_adjoint_lhs_compiled_once():
+    """As above, but for NonlinearProblem: adjoint(dF/du) does depend on u's
+    current value here, but that dependency is routed through a dedicated
+    placeholder (``NonlinearProblem._adjoint_u_placeholder``), refreshed per
+    call, so the compiled LHS itself is still built exactly once.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    f = Function(V, name="control")
+    f.interpolate(lambda x: 2.0 + np.sin(x[0]))
+
+    u1 = Function(V, name="state")
+    u1.interpolate(lambda x: np.ones_like(x[0]))
+    v1 = ufl.TestFunction(V)
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
+    bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
+
+    options = {
+        "snes_error_if_not_converged": True,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    problem.solve()
+
+    d = pyadjoint.AdjFloat(0.2)
+    J = assemble_scalar((u1 - d) ** 3 * ufl.dx)
+    control = pyadjoint.Control(f)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    adjoint_solver = problem._get_or_build_adjoint_solver()
+    compiled_lhs = adjoint_solver._a
+    assert compiled_lhs is not None
+
+    Jh.derivative()
+    assert adjoint_solver._a is compiled_lhs, "adjoint LHS was rebuilt by derivative()"
+
+    f2 = Function(V)
+    f2.interpolate(lambda x: 3.0 + np.cos(x[0]))
+    Jh(f2)
+    Jh.derivative()
+    assert adjoint_solver._a is compiled_lhs, "adjoint LHS was rebuilt after evaluating at a new point"
+
+    dm = Function(V)
+    dm.interpolate(lambda x: np.sin(x[0] * np.pi))
+    Jh.hessian(dm)
+    assert adjoint_solver._a is compiled_lhs, "the SOA (Hessian) solve rebuilt the shared adjoint LHS"
