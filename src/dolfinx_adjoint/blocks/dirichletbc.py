@@ -4,6 +4,23 @@ import numpy.typing as npt
 from pyadjoint.block import Block
 
 
+def sync_bc_values(bcs, dependencies) -> None:
+    """Refresh each BC's live backing Function from its value at this recorded position.
+
+    A DirichletBC's C++ binding reads bc.g's array directly, by reference, not through the tape,
+    so it has to be refreshed by hand before every solve that is not the original one. This must
+    read from the calling block's own pinned dependencies (dependencies, i.e. self.get_dependencies())
+    rather than bc.g.block_variable directly: that property always points at bc.g's most recently
+    created BlockVariable, which -- once the full tape has been recorded -- is simply the last
+    timestep's, regardless of which point in the replay this call is for.
+    """
+    values = {dep.output: dep.saved_output for dep in dependencies}
+    for bc in bcs:
+        value = values.get(bc.g)
+        if value is not None:
+            bc.g.x.array[:] = value.x.array[:]
+
+
 class DirichletBCBlock(Block):
     """A block representing a DirichletBC in the adjoint framework.
 

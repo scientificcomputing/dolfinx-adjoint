@@ -176,6 +176,86 @@ def test_gradient_matches_uncheckpointed(n_steps, snapshots):
         np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
 
 
+def _tape_heat_equation_with_time_dependent_bc(n_steps, schedule=None):
+    """Tape a heat equation whose Dirichlet value is reassigned every timestep.
+
+    Unlike test_dirichlet_bc.py::test_time_dependent_bc_replay, which only exercises a full
+    unscheduled Jhat(m) replay, this enables a real Revolve schedule -- the case sync_bc_values
+    exists for. The control (`f`, a source term) is separate from the reassigned Dirichlet value
+    (`bc_func`) precisely so this can compare gradients: DirichletBCBlock does not implement
+    adjoint sensitivity with respect to a BC's own value, so a gradient test needs the control to
+    sit somewhere else. If bc_func's live value is ever stale during a recompute, uh -- and
+    therefore J and its gradient with respect to f's controls -- will be numerically wrong for
+    that step, and the comparison below will catch it.
+    """
+    tape = pyadjoint.Tape()
+    pyadjoint.set_working_tape(tape)
+    if schedule is not None:
+        tape.enable_checkpointing(schedule)
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    dt = 0.1
+    nu = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0e-2))
+
+    controls = []
+    for i in range(n_steps):
+        c = dolfinx_adjoint.Function(V, name=f"control_{i}")
+        c.interpolate(lambda x, i=i: 0.5 + 0.1 * (i + 1) * x[0])
+        controls.append(c)
+
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    f = dolfinx_adjoint.Function(V, name="source")
+    u_prev = dolfinx_adjoint.Function(V, name="previous")
+    uh = dolfinx_adjoint.Function(V, name="solution")
+
+    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
+    a, L = ufl.system(F)
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+
+    bc_func = dolfinx_adjoint.Function(V, name="bc_value")
+    bc = dolfinx_adjoint.dirichletbc(bc_func, boundary_dofs)
+
+    problem = dolfinx_adjoint.LinearProblem(
+        a,
+        L,
+        u=uh,
+        bcs=[bc],
+        petsc_options=_PETSC_OPTIONS,
+        adjoint_petsc_options=_PETSC_OPTIONS,
+    )
+
+    J = dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+    for i in tape.timestepper(iter(range(n_steps))):
+        dolfinx_adjoint.assign(controls[i], f)
+        dolfinx_adjoint.assign(0.1 * (i + 1), bc_func)
+        problem.solve()
+        dolfinx_adjoint.assign(uh, u_prev)
+        J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+
+    rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    return rf, controls
+
+
+def test_bc_gradient_matches_uncheckpointed():
+    """A time-dependent Dirichlet BC's presence does not change other controls' gradients
+    under a checkpoint schedule."""
+    n_steps, snapshots = 6, 2
+    rf_plain, controls_plain = _tape_heat_equation_with_time_dependent_bc(n_steps)
+    expected = _gradient(rf_plain, controls_plain)
+
+    rf_ckpt, controls_ckpt = _tape_heat_equation_with_time_dependent_bc(n_steps, Revolve(n_steps, snapshots))
+    actual = _gradient(rf_ckpt, controls_ckpt)
+
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
 @pytest.mark.parametrize("n_steps, snapshots", [(6, 2), (10, 3)])
 def test_taylor_test_under_checkpointing(n_steps, snapshots):
     """The checkpointed gradient is the actual derivative, not merely a reproducible one."""

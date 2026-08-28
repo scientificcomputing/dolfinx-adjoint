@@ -56,8 +56,6 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
 
         super().__init__(cpp_bc, **bc_kwargs)
 
-        g._ad_bc_backing = True
-
         annotate = kwargs.pop("annotate", True)
         annotate = annotate and pyadjoint.annotate_tape()
 

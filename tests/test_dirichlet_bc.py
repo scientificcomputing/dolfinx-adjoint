@@ -142,22 +142,3 @@ def test_time_dependent_bc_replay():
     J_replay = Jhat(m)
 
     assert np.isclose(J_replay, J_forward, atol=1e-10, rtol=1e-10)
-
-
-def test_dirichletbc_tags_its_value_function():
-    pyadjoint.get_working_tape().clear_tape()
-    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
-    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
-    bc_func = Function(V, name="bc_func")
-    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
-    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
-    dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets)
-
-    assert bc_func._ad_bc_backing is False
-
-    dirichletbc(bc_func, dofs)
-
-    assert bc_func._ad_bc_backing is True
-
-    other = Function(V, name="unrelated")
-    assert other._ad_bc_backing is False

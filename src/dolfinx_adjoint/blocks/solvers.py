@@ -14,6 +14,7 @@ from ..compat import compute_form_adjoint
 from ..petsc_utils import LinearAdjointProblem, solve_linear_problem
 from ..types import Function
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
+from .dirichletbc import sync_bc_values
 
 type NestedMutableSequence[T] = T | typing.MutableSequence["NestedMutableSequence[T]"]
 type NestedSequence[T] = T | typing.Sequence["NestedSequence[T]"]
@@ -298,6 +299,8 @@ class LinearProblemBlock(pyadjoint.Block):
             for bc in self._bcs:
                 if hasattr(bc, "block_variable"):
                     self.add_dependency(bc, no_duplicates=True)
+                    if hasattr(bc.g, "block_variable"):
+                        self.add_dependency(bc.g, no_duplicates=True)
 
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.LinearProblem(
@@ -466,6 +469,7 @@ class LinearProblemBlock(pyadjoint.Block):
         self._forward_solver._a = compiled_lhs  # type: ignore[assignment]
         self._forward_solver._L = compiled_rhs  # type: ignore[assignment]
         self._forward_solver._preconditioner = compiled_preconditioner
+        sync_bc_values(self._bcs, self.get_dependencies())
         self._forward_solver.bcs = self._bcs
         self._forward_solver._u = self._u
 
@@ -1064,6 +1068,9 @@ class NonlinearProblemBlock(pyadjoint.Block):
         self._petsc_options = petsc_options if petsc_options is not None else {}
         self._petsc_options_prefix = petsc_options_prefix
         self._bcs = bcs if bcs is not None else []
+        for bc in self._bcs:
+            if hasattr(bc, "block_variable") and hasattr(bc.g, "block_variable"):
+                self.add_dependency(bc.g, no_duplicates=True)
         # Solver for recomputing the linear problem
         self._forward_solver = dolfinx.fem.petsc.NonlinearProblem(
             J=J,  # type: ignore[arg-type]
