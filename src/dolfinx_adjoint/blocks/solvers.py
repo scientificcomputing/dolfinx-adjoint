@@ -31,12 +31,12 @@ def assign_mixed_parts(
     *form_structs: NestedSequence[ufl.Form],
 ) -> NestedSequence[ufl.Form] | tuple[NestedSequence[ufl.Form], ...]:
     """
-    Recursively assigns mixed-space `part` indices to UFL Test and Trial functions
-    within nested iterables of forms.
+    Recursively assigns mixed-space `part` indices to {py:class}`ufl.Argument`
+    (test and trial functions), within nested iterables of forms.
 
-    When solving monolithic block systems in FEniCSx, the UFL arguments must be tagged
-    with a `.part()` index corresponding to their block position. For a block matrix
-    (list of lists), the TestFunction corresponds to the row index, and the
+    When solving monolithic block systems in FEniCSx, the UFL arguments must have the
+    method {py:meth}`ufl.Argument.part` return the index corresponding to their block position.
+    For a block matrix (list of lists), the TestFunction corresponds to the row index, and the
     TrialFunction corresponds to the column index.
 
     This utility traverses arbitrary nested structures (e.g., a 2D list for the LHS
@@ -54,15 +54,10 @@ def assign_mixed_parts(
         Returns a single structure if one was passed, otherwise returns a tuple.
 
     Note:
-        The replacement arguments are drawn from ``ufl.TestFunctions``/``ufl.TrialFunctions``
-        of a single ``ufl.MixedFunctionSpace`` built from the row/column function spaces
-        discovered while walking the structure, rather than hand-constructed
-        via ``ufl.Argument(..., part=...)``: this is exactly what a user who
-        builds the block system directly on a ``ufl.MixedFunctionSpace`` (and
-        then calls ``ufl.extract_blocks``) already gets, so a form assembled
-        this way and one assembled from a plain ``[[a00, ...], ...]`` nested
-        list end up as the same UFL objects -- one code path handles both,
-        rather than two subtly different ones.
+        The replacement arguments are drawn from {py:func}`ufl.TestFunctions`
+        and {py:func}`ufl.TrialFunctions` of a single
+        {py:class}`ufl.MixedFunctionSpace` built from the row/column function spaces
+        discovered while walking the structure.
     """
     spaces: dict[int, ufl.functionspace.AbstractFunctionSpace] = {}
 
@@ -75,16 +70,17 @@ def assign_mixed_parts(
         if isinstance(obj, ufl.Form):
             for arg in obj.arguments():
                 if arg.part() is None:
+                    # The argument number corresponds to the index of the row/column
+                    # in the nested structure
                     num = arg.number()
-                    # Because num is 0 for TestFunctions and 1 for TrialFunctions,
-                    # it maps perfectly to our nested dimension indices!
-                    # If num < len(indices), we have traversed deep enough to assign it.
                     if num < len(indices):
                         spaces.setdefault(indices[num], arg.ufl_function_space())
         elif isinstance(obj, typing.Iterable):
             for i, item in enumerate(obj):
                 if item is not None:
                     _discover_spaces(item, indices + (i,))
+        else:
+            raise TypeError(f"Expected ufl.Form or iterable, got {type(obj)}")
 
     for struct in form_structs:
         _discover_spaces(struct, ())
