@@ -127,12 +127,6 @@ def assign_mixed_parts(
     return replaced if len(replaced) > 1 else replaced[0]
 
 
-def to_list(data):
-    if isinstance(data, (tuple, list)):
-        return [to_list(item) for item in data]
-    return data
-
-
 def get_sorted_arguments(arguments: typing.Iterable[ufl.Argument], number: int) -> typing.Iterable[ufl.Argument]:
     """Extract all arguments of a given number, sorted by part."""
     return sorted(filter(lambda x: x.number() == number, arguments), key=lambda a: a.part())
