@@ -229,20 +229,14 @@ class LinearProblemBlock(pyadjoint.Block):
     ) -> None:
 
         assert problem is not None, "problem must be provided."
-        # A plain (strong) reference is deliberate: constructing a LinearProblem
-        # as a throwaway local (solve it, then only ever touch the resulting
-        # ReducedFunctional) is a common, already-tested pattern, and this
-        # block -- kept alive by the tape -- must keep the Problem (and hence
-        # its shared solvers) alive for exactly as long as the block itself is
-        # reachable, mirroring the lifetime the old per-block-owned solver had.
-        # A plain LinearProblemBlock is not itself cyclic garbage (verified:
-        # dropping the Problem and the tape releases it via ordinary
-        # refcounting, no gc.collect() required), so this does not reintroduce
-        # the MPI collective-destruction hazard documented in
-        # dolfinx-adjoint-knowledge's mpi-collective-destruction-hazard note --
-        # that hazard is specifically about pyadjoint's checkpoint-schedule
-        # bookkeeping (an unmerged, not-yet-present feature) making the *tape*
-        # cyclic, and would need revisiting if/when that lands.
+        # Strong reference, deliberately: a throwaway LinearProblem (solve it,
+        # then only touch the ReducedFunctional) is a common pattern, so the
+        # block must keep the Problem -- and its shared solvers -- alive for
+        # as long as the block itself is reachable. Not cyclic garbage on its
+        # own (verified), so this doesn't reintroduce the MPI
+        # collective-destruction hazard from dolfinx-adjoint-knowledge's
+        # mpi-collective-destruction-hazard note -- that needs an unmerged
+        # checkpoint schedule making the *tape* cyclic.
         self._problem_obj = problem
         super().__init__(ad_block_tag=ad_block_tag)
 

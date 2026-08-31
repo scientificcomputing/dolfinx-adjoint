@@ -237,12 +237,15 @@ class LinearProblem(dolfinx.fem.petsc.LinearProblem):
         # Adjoint and tangent-linear solvers: built lazily (on first use, see
         # _get_or_build_adjoint_solver/_get_or_build_tlm_solver below) and shared
         # by every LinearProblemBlock this Problem records, rather than one per
-        # block/solve() call. Blocks only ever hold a weak reference back to this
-        # Problem (see LinearProblemBlock._problem), so dropping this Problem
-        # releases the forward, adjoint and TLM solvers' PETSc objects
-        # deterministically instead of leaving that to pyadjoint's tape/cyclic-GC
-        # schedule -- see the "mpi-collective-destruction-hazard" note in the
-        # dolfinx-adjoint-knowledge repository for why that matters. Laziness
+        # block/solve() call. Each block holds a plain (strong) reference back
+        # to this Problem (see LinearProblemBlock._problem/__init__ for why a
+        # strong reference is safe here and doesn't reintroduce the MPI
+        # collective-destruction hazard documented in
+        # dolfinx-adjoint-knowledge's mpi-collective-destruction-hazard note),
+        # so this Problem -- and hence its solvers' PETSc objects -- is
+        # released deterministically via ordinary refcounting once every block
+        # referencing it is unreachable (e.g. after clearing the tape), rather
+        # than being left to pyadjoint's tape/cyclic-GC schedule. Laziness
         # keeps pure forward (non-annotated) use from paying for a symbolic
         # adjoint form it never needs.
         self._adjoint_solver: typing.Optional[LinearAdjointProblem] = None
