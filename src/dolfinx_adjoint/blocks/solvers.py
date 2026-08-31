@@ -528,11 +528,6 @@ class LinearProblemBlock(pyadjoint.Block):
             dolfinx.fem.petsc.assemble_vector(b_petsc, template)
         dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[arg-type]
 
-        # Homogeneous boundary conditions are applied to b_petsc by
-        # tlm_solver.solve() itself (it homogenizes using tlm_solver.bcs,
-        # already re-established above), so there is no need to duplicate
-        # that here.
-
         # 4. Solve the full monolithic TLM system. The solver's own solution
         # storage is shared across every block, so copy the result out into
         # this block's own buffer immediately (mirroring how the adjoint path
@@ -1271,10 +1266,6 @@ class NonlinearProblemBlock(pyadjoint.Block):
             dolfinx.fem.petsc.assemble_vector(b_petsc, template)
         dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[arg-type]
 
-        # Homogeneous boundary conditions are applied to b_petsc by
-        # tlm_solver.solve() itself (it homogenizes using tlm_solver.bcs,
-        # already re-established above), so there is no need to duplicate
-        # that here.
         tlm_solver.solve()
         if isinstance(self._tlm_solutions, list):
             for tlm_sol, sol in zip(self._tlm_solutions, tlm_solver.u):
