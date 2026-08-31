@@ -57,10 +57,10 @@ def error_norm(
     u_ex: ufl.core.expr.Expr,
     u: ufl.core.expr.Expr,
     norm_type=typing.Literal["L2", "H1"],
-    jit_options: typing.Optional[dict] = None,
-    form_compiler_options: typing.Optional[dict] = None,
-    entity_map: typing.Optional[dict[dolfinx.mesh.Mesh, npt.NDArray[numpy.int32]]] = None,
-    ad_block_tag: typing.Optional[str] = None,
+    jit_options: dict | None = None,
+    form_compiler_options: dict | None = None,
+    entity_map: dict[dolfinx.mesh.Mesh, npt.NDArray[numpy.int32]] | None = None,
+    ad_block_tag: str | None = None,
     annotate: bool = True,
 ) -> float:
     """Compute the error norm between the exact solution and the computed solution.

@@ -18,7 +18,7 @@ import pytest
 import ufl
 
 from dolfinx_adjoint import Function, assemble_scalar
-from dolfinx_adjoint.solvers import LinearProblem
+from dolfinx_adjoint.solvers import LinearProblem, NonlinearProblem
 
 direct_solve = {
     "ksp_type": "preonly",
@@ -112,6 +112,110 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
         Jh(m1)
         Jh.derivative()
         Jh.hessian(h)
+
+    Jh(m2)
+    dJdm = Jh.derivative()._ad_dot(h)
+    Hm = Jh.hessian(h)._ad_dot(h)
+
+    min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+
+def _navier_stokes(mesh):
+    """``_viscous_stokes`` with a ``u . grad(u)`` convective term added, making the residual
+    genuinely nonlinear in the state -- a ``NonlinearProblem`` sibling of ``_viscous_stokes``,
+    exercising the blocked (multi-output) Hessian path for ``NonlinearProblem``, which used to
+    raise ``NotImplementedError`` unconditionally and is now the same shared code
+    ``LinearProblemBlock`` already used for its own blocked Hessian.
+    """
+    el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
+    el_p = basix.ufl.element("P", mesh.basix_cell(), 1)
+    V = dolfinx.fem.functionspace(mesh, el_u)
+    Q = dolfinx.fem.functionspace(mesh, el_p)
+    Z = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    dx = ufl.Measure("dx", domain=mesh)
+
+    mu = Function(Z, name="viscosity")
+    mu.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+
+    uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
+    v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
+
+    # A moderate, non-conservative body force: large enough that the Taylor remainders stay
+    # clear of round-off, small enough that the Newton solve below converges reliably (the
+    # convective term is quadratic in the state, so scaling it up the way _viscous_stokes
+    # scales its linear counterpart would make the residual far stiffer).
+    x = ufl.SpatialCoordinate(mesh)
+    f = 10.0 * ufl.as_vector((ufl.sin(ufl.pi * x[1]), ufl.cos(ufl.pi * x[0])))
+
+    F0 = (
+        ufl.inner(mu * ufl.grad(uh), ufl.grad(v)) * dx
+        + ufl.inner(ufl.dot(ufl.grad(uh), uh), v) * dx
+        + ufl.inner(ph, ufl.div(v)) * dx
+        - ufl.inner(f, v) * dx
+    )
+    F1 = ufl.inner(q, ufl.div(uh)) * dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets)
+    zero = dolfinx.fem.Constant(mesh, np.zeros(mesh.geometry.dim, dtype=dolfinx.default_scalar_type))
+    bc = dolfinx.fem.dirichletbc(zero, dofs, V)
+
+    forward_options = {
+        "snes_type": "newtonls",
+        "snes_error_if_not_converged": True,
+        # A warm-started recompute (see NonlinearProblemBlock._refresh_dFdu_state /
+        # *ProblemBlockBase.prepare_recompute_component) starts SNES already at (or
+        # extremely close to) a converged point when the control hasn't moved.  With
+        # only the default rtol, SNES keeps trying to shrink a residual that is
+        # already at floating-point noise, and the resulting near-singular Newton
+        # step can make backtracking line search report DIVERGED_LINE_SEARCH.  An
+        # explicit absolute tolerance lets it recognize "already converged" and
+        # exit immediately instead.
+        "snes_atol": 1e-9,
+        "snes_rtol": 1e-9,
+        "snes_stol": 1e-12,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = NonlinearProblem(
+        [F0, F1],
+        u=[uh, ph],
+        bcs=[bc],
+        # A prefix distinct from the default ("dxa_nonlinear_problem_"): PETSc's options
+        # database is process-global and keyed by prefix, and this fixture's snes_atol/rtol/stol
+        # (needed for the warm-started recompute above) must not leak into -- or collide with --
+        # another NonlinearProblem elsewhere in the suite that happens to use the default prefix.
+        petsc_options_prefix="dxa_navier_stokes_test_",
+        petsc_options=forward_options,
+        adjoint_petsc_options=direct_solve,
+        tlm_petsc_options=direct_solve,
+    )
+    problem.solve()
+
+    # Quartic in the state and with no constant offset, for the same round-off-avoidance
+    # reason as _viscous_stokes's objective.
+    J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
+    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), Z
+
+
+def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh_2D):
+    """``test_hessian_is_independent_of_previous_evaluation_points``'s ``NonlinearProblem``
+    sibling: the same second-order Taylor test, but on a genuinely nonlinear, blocked
+    (multi-output) residual, exercising the blocked Hessian path
+    ``_ProblemBlockBase._evaluate_hessian_blocked_rhs``/``_evaluate_hessian_component_blocked``
+    for ``NonlinearProblem`` for the first time -- previously this path only ever ran for
+    ``LinearProblem``.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    Jh, Z = _navier_stokes(mesh_2D)
+
+    m2 = Function(Z)
+    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    h = Function(Z)
+    h.interpolate(lambda x: 1.0 + 0.3 * np.sin(3 * x[0]))
 
     Jh(m2)
     dJdm = Jh.derivative()._ad_dot(h)
