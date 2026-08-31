@@ -486,7 +486,7 @@ class LinearProblemBlock(pyadjoint.Block):
 
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
-    ) -> tuple[typing.Union[list[ufl.Form], ufl.Form], dolfinx.fem.Form]:
+    ) -> typing.Sequence[Function] | dolfinx.fem.Function:
 
         # The TLM solver -- and the compiled LHS it solves with, shared
         # verbatim with dF/du (see LinearProblem._get_or_build_dFdu_template)
@@ -532,7 +532,7 @@ class LinearProblemBlock(pyadjoint.Block):
             seed.x.array[:] = tlm_value.x.array[:]
             seed.x.scatter_forward()
             dolfinx.fem.petsc.assemble_vector(b_petsc, template)
-        dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+        dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[arg-type]
 
         # Homogeneous boundary conditions are applied to b_petsc by
         # tlm_solver.solve() itself (it homogenizes using tlm_solver.bcs,
@@ -1275,7 +1275,7 @@ class NonlinearProblemBlock(pyadjoint.Block):
             seed.x.array[:] = tlm_value.x.array[:]
             seed.x.scatter_forward()
             dolfinx.fem.petsc.assemble_vector(b_petsc, template)
-        dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)
+        dolfinx.la.petsc._ghost_update(b_petsc, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[arg-type]
 
         # Homogeneous boundary conditions are applied to b_petsc by
         # tlm_solver.solve() itself (it homogenizes using tlm_solver.bcs,
