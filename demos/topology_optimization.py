@@ -68,6 +68,7 @@ import time
 from mpi4py import MPI
 
 import dolfinx
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas
 import pyadjoint
@@ -145,19 +146,30 @@ def build_mesh_and_bcs(nx: int, ny: int, nz: int, corner_load: bool):
     return msh, left_facets, ds, np.array(traction, dtype=dolfinx.default_scalar_type)
 
 
-# ## Per-iteration density visualization
+# ## Per-iteration density visualization and compliance history
 #
 # We record the density field once per outer optimizer iteration into a GIF, using the
 # pyvista pattern from `dolfinx-tutorial/chapter2/amr.py`. Since a SIMP density field
 # lives in a `("DG", 0)` space, its dof array maps 1-to-1 onto the local cell
 # numbering, so it can be attached directly as `cell_data` on a grid built from the
-# mesh itself (not from the function space).
+# mesh itself (not from the function space). The same callback also records the pure
+# compliance (not the volume-penalized objective) at each iteration, for the
+# compliance-vs-iteration convergence plot Mosaic's own results page shows.
+#
+# `scipy.optimize.minimize` reports only the penalized objective
+# (`intermediate_result.fun`), so the pure compliance is recovered arithmetically:
+# since every cell of this structured box mesh has equal volume, the volume fraction is
+# exactly `rho.x.array.mean()`, so `compliance = fun - penalty_weight*(vol_frac - v_frac)**2`
+# recovers it with no extra PDE solve.
 
 
-def make_gif_writer(msh: dolfinx.mesh.Mesh, rho: dolfinx_adjoint.Function, gif_path: str):
-    """Return (plotter, callback) that appends one frame per optimizer iteration."""
+def make_iteration_tracker(
+    msh: dolfinx.mesh.Mesh, rho: dolfinx_adjoint.Function, gif_path: str, initial_compliance: float
+):
+    """Return (plotter, callback, compliance_history) tracking one optimizer run."""
     plotter = pyvista.Plotter(off_screen=True)
     plotter.open_gif(gif_path, fps=10)
+    compliance_history = [initial_compliance]
 
     def write_frame():
         grid = pyvista.UnstructuredGrid(*dolfinx.plot.vtk_mesh(msh))
@@ -167,13 +179,15 @@ def make_gif_writer(msh: dolfinx.mesh.Mesh, rho: dolfinx_adjoint.Function, gif_p
         plotter.write_frame()
         plotter.remove_actor(actor)
 
-    def gif_callback(intermediate_result):
+    def callback(intermediate_result):
         rho.x.array[:] = intermediate_result.x
         rho.x.scatter_forward()
         write_frame()
+        vol_frac = float(rho.x.array.mean())
+        compliance_history.append(intermediate_result.fun - penalty_weight * (vol_frac - v_frac) ** 2)
 
     write_frame()  # record the initial, uniform density as frame 0
-    return plotter, gif_callback
+    return plotter, callback, compliance_history
 
 
 # ## Forward model, gradient verification and optimization
@@ -306,7 +320,9 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
     # (which has no bounds support), so we drive `scipy.optimize.minimize` directly
     # from a `pyadjoint.reduced_functional_numpy.ReducedFunctionalNumPy` — the same public class
     # `pyadjoint.minimize` itself wraps every call in.
-    plotter, gif_callback = make_gif_writer(msh, rho, f"topopt_{case_name}.gif")
+    plotter, callback, compliance_history = make_iteration_tracker(
+        msh, rho, f"topopt_{case_name}.gif", float(compliance)
+    )
 
     rf_np = pyadjoint.reduced_functional_numpy.ReducedFunctionalNumPy(Jhat)
     m0 = rf_np.get_controls()
@@ -319,7 +335,7 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
         hessp=lambda m, p: rf_np.hessian(p),
         method="trust-constr",
         bounds=scipy.optimize.Bounds(x_min, 1.0),
-        callback=gif_callback,
+        callback=callback,
         options={"maxiter": 200, "verbose": 2},
     )
     optim_time = time.perf_counter() - t_optim_start
@@ -355,6 +371,7 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
         "recompute_time": recompute_time,
         "derivative_time": derivative_time,
         "optim_time": optim_time,
+        "compliance_history": compliance_history,
     }
 
 
@@ -369,4 +386,19 @@ results = [run_topopt(corner_load=True), run_topopt(corner_load=False)]
 
 summary = pandas.DataFrame(results).set_index("case")
 print("\n=== Summary ===")
-print(summary)
+print(summary.drop(columns="compliance_history"))
+
+# ## Compliance convergence
+#
+# A compliance-vs-iteration plot, as shown on Mosaic's own results page.
+
+fig, ax = plt.subplots()
+for result in results:
+    ax.plot(result["compliance_history"], marker="o", markersize=3, label=result["case"])
+ax.set_xlabel("Iteration")
+ax.set_ylabel("Compliance $C = \\mathbf{F}^\\top \\mathbf{u}$")
+ax.set_title("SIMP topology optimization: compliance convergence")
+ax.legend()
+fig.savefig("topopt_compliance_convergence.png", dpi=150, bbox_inches="tight")
+if not pyvista.OFF_SCREEN:
+    plt.show()
