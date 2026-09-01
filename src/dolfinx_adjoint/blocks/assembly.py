@@ -11,7 +11,7 @@ from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
 
 
 def assemble_compiled_form(
-    form: dolfinx.fem.Form, tensor: typing.Optional[typing.Union[dolfinx.la.Vector, _SpecialVector | float]] = None
+    form: dolfinx.fem.Form, tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None
 ) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
     """Assemble a compiled form and optionally apply Dirichlet boundary condition.
 
@@ -54,10 +54,10 @@ class AssembleBlock(Block):
     def __init__(
         self,
         form: ufl.Form,
-        ad_block_tag: typing.Optional[str] = None,
-        jit_options: typing.Optional[dict] = None,
-        form_compiler_options: typing.Optional[dict] = None,
-        entity_maps: typing.Optional[typing.Sequence[dolfinx.mesh.EntityMap]] = None,
+        ad_block_tag: str | None = None,
+        jit_options: dict | None = None,
+        form_compiler_options: dict | None = None,
+        entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
     ):
         super(AssembleBlock, self).__init__(ad_block_tag=ad_block_tag)
 
@@ -87,10 +87,10 @@ class AssembleBlock(Block):
         self,
         adj_input: typing.Union[float, dolfinx.la.Vector],
         arity_form: int,
-        form: typing.Optional[ufl.Form] = None,
-        c_rep: typing.Optional[typing.Union[ufl.Coefficient, ufl.Constant]] = None,
-        space: typing.Optional[dolfinx.fem.FunctionSpace] = None,
-        dform: typing.Optional[dolfinx.fem.Form] = None,
+        form: ufl.Form | None = None,
+        c_rep: typing.Union[ufl.Coefficient, ufl.Constant] | None = None,
+        space: dolfinx.fem.FunctionSpace | None = None,
+        dform: dolfinx.fem.Form | None = None,
     ):
         """This computes the action of the adjoint of the derivative of `form` wrt `c_rep` on `adj_input`.
 

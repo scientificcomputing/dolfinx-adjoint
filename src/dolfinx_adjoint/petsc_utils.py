@@ -11,8 +11,8 @@ def solve_linear_problem(
     A: PETSc.Mat,  # type: ignore [name-defined]
     x: dolfinx.la.Vector,
     b: dolfinx.la.Vector,
-    petsc_options: typing.Optional[dict] = None,
-    P: typing.Optional[PETSc.Mat] = None,  # type: ignore [name-defined]
+    petsc_options: dict | None = None,
+    P: PETSc.Mat | None = None,  # type: ignore [name-defined]
 ):
     """Solve a linear problem :math:`Ax = b`.
 
@@ -57,13 +57,29 @@ def solve_linear_problem(
     x.scatter_forward()
 
 
-class LinearAdjointProblem(dolfinx.fem.petsc.LinearProblem):
-    """Linear problem helper class that homogenizes the boundary conditions, meaning that no lifting is applied."""
+class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
+    """Linear problem helper class that homogenizes the boundary conditions, meaning that no lifting is applied.
+
+    Used for both the adjoint and the tangent-linear solve -- neither is "the adjoint problem"
+    specifically, they are both just a linear solve against a zero-lifted right-hand side, so the
+    name no longer singles out one of the two callers.
+    """
 
     def solve(
         self,
     ) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
-        """Solve the problem."""
+        """Solve the problem.
+
+        Unlike the base class, ``self.b`` is never (re-)assembled from the compiled
+        right-hand-side form here. This solver is shared, and reused verbatim, across every
+        block a Problem records (see dolfinx-adjoint-knowledge's solver-reuse note), so the
+        caller (see ``_ProblemBlockBase.prepare_evaluate_adj``/``prepare_evaluate_hessian``/
+        ``prepare_evaluate_tlm``) has already assembled its own right-hand side directly into
+        ``self.b`` before calling ``solve()``. The only thing this method does to ``self.b`` is
+        modify it in place -- zeroing every Dirichlet-BC dof (``alpha=0.0``) -- rather than
+        lifting, since a caller's right-hand side is never the original problem's own Dirichlet
+        data.
+        """
 
         # Assemble lhs
         self._A.zeroEntries()
