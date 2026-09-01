@@ -341,7 +341,8 @@ class _ProblemBase(abc.ABC):
             # callers wanting a single summed form (Hessian templating,
             # scalar-only) apply ufl_utils.sum_form() themselves.
             self._dFdu_adj_template = compute_adjoint(
-                self._get_or_build_dFdu_template()  # type: ignore[arg-type]
+                self._get_or_build_dFdu_template(),  # type: ignore[arg-type]
+                blocked=isinstance(self._u, list),
             )
         return self._dFdu_adj_template
 

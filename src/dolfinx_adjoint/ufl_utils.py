@@ -181,18 +181,30 @@ def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
         raise TypeError(f"Cannot sum form of type {type(form)}")
 
 
-def compute_adjoint(form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
+def compute_adjoint(form: ufl.Form, blocked: bool = True) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
     """Compute the adjoint of a (possibly blocked) bilinear form.
 
     Args:
         form: A bilinear form :math:`a(u, v)`. Blocked forms should be summed with
-        {py:func}`sum_form` before passing to this function.
+            {py:func}`sum_form` before passing to this function.
+        blocked: Whether ``form``'s arguments come from a genuine blocked/mixed
+            problem (multiple ``Argument``s with distinct ``part()`` tags). When
+            ``False``, ``ufl.extract_blocks`` is skipped entirely: a plain scalar
+            or vector-*shaped* (non-mixed) argument still reports multiple
+            "parts" to UFL, so ``extract_blocks`` would otherwise decompose the
+            single bilinear form into spurious blocks that each still reference
+            the original, full-space ``Argument`` -- producing a system sized
+            for several redundant copies of the space once assembled.
 
     Returns:
-        The transposed form :math:`a(v, u)`, decomposed back into blocks (via
-        ``ufl.extract_blocks``) -- a no-op decomposition for a scalar form.
+        The transposed form :math:`a(v, u)`: a single ``ufl.Form`` when
+        ``blocked=False``, else decomposed back into blocks via
+        ``ufl.extract_blocks`` (a no-op decomposition for a scalar form).
     """
-    return ufl.extract_blocks(compute_form_adjoint(form))
+    adjoint_form = compute_form_adjoint(form)
+    if not blocked:
+        return adjoint_form
+    return ufl.extract_blocks(adjoint_form)
 
 
 def recursive_replace(form: ufl.Form | typing.Sequence | None, placeholders: dict) -> ufl.Form | typing.Sequence | None:
