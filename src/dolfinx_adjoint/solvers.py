@@ -132,6 +132,8 @@ def _pad_blocks_by_part(form: ufl.form.BaseForm, test_funcs: typing.Sequence[ufl
     if form.empty():
         return padded
     for block in ufl.extract_blocks(form):
+        if block is None:
+            continue
         args = block.arguments()
         assert len(args) == 1, "Expected a single test function in the block."
         padded[args[0].part()] = block
@@ -381,7 +383,7 @@ class _ProblemBase(abc.ABC):
             # *ProblemBlock.prepare_evaluate_tlm in blocks/solvers.py), avoids
             # that entirely.
             for c, c_placeholder in self._value_placeholders.items():
-                seed = dolfinx.fem.Function(c.function_space)
+                seed = dolfinx.fem.Function(c.function_space, name=f"{c.name}_tlm_seed")
                 dFdm_c = ufl.algorithms.expand_derivatives(-ufl.derivative(F_template, c_placeholder, seed))
                 if isinstance(self._u, list):
                     dFdm_c = _pad_blocks_by_part(dFdm_c, test_funcs)
@@ -426,9 +428,15 @@ class _ProblemBase(abc.ABC):
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
                 test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
-                self._adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
-                self._second_adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
-                self._hessian_u_seed = [dolfinx.fem.Function(s.function_space) for s in state_list]
+                self._adjoint_solution_placeholder = [
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_adjoint") for s in state_list
+                ]
+                self._second_adjoint_solution_placeholder = [
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_second_adjoint") for s in state_list
+                ]
+                self._hessian_u_seed = [
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_hessian_u_seed") for s in state_list
+                ]
                 state_arg: typing.Any = state_list
 
                 # soa_self = adjoint(d2F/du2) . adjoint_solution -- the SOA
@@ -460,9 +468,15 @@ class _ProblemBase(abc.ABC):
                 ]
             else:
                 assert isinstance(state_placeholder, dolfinx.fem.Function)
-                self._adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
-                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
-                self._hessian_u_seed = dolfinx.fem.Function(state_placeholder.function_space)
+                self._adjoint_solution_placeholder = dolfinx.fem.Function(
+                    state_placeholder.function_space, name=f"{state_placeholder.name}_adjoint"
+                )
+                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(
+                    state_placeholder.function_space, name=f"{state_placeholder.name}_second_adjoint"
+                )
+                self._hessian_u_seed = dolfinx.fem.Function(
+                    state_placeholder.function_space, name=f"{state_placeholder.name}_hessian_u_seed"
+                )
                 state_arg = state_placeholder
 
                 soa_self = _build_soa_self_template(
