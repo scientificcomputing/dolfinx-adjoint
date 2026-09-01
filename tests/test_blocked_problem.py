@@ -230,3 +230,17 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     dHddu = hessian._ad_dot(e)
     min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
     assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+    # A second, independent evaluation point/direction: a cached-but-unrefreshed
+    # adjoint/TLM/Hessian operator (see tests/test_tlm_update.py) could pass the
+    # check above yet still be silently wrong here.
+    mu2 = Function(Z)
+    mu2.interpolate(lambda x: 2.0 + np.sin(x[1]))
+    h2 = Function(Z)
+    h2.interpolate(lambda x: 0.5 * np.cos(4 * x[0]))
+    Jh(mu2)
+    dJdm = Jh.derivative()._ad_dot(h2)
+    hessian = Jh.hessian(h2)
+    dHddu = hessian._ad_dot(h2)
+    min_rate = pyadjoint.taylor_test(Jh, mu2, h2, dJdm=dJdm, Hm=dHddu)
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"

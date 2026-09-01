@@ -156,7 +156,7 @@ bc = dolfinx.fem.dirichletbc(zero, exterior_dofs, V)
 # the `dolfinx.fem.petsc.LinearProblem` class.
 #
 # ```{note}
-# When creating the :py:func:`dolfinx_adjoint.LinearProblem`, we can specify the solver options that
+# When creating the :py:class:`dolfinx_adjoint.LinearProblem`, we can specify the solver options that
 # are passed on to the underlying PETSc Krylov subspace solver.
 # This is also the place to pass in solver options for the first and second order adjoint equations
 # and the tangent linear model (TLM) equation.
@@ -182,7 +182,7 @@ problem.solve()
 
 # ```{note}
 # Note that we can pass in solver options for the adjoint equation via the keyword argument
-# `adjoint_petsc_options`. As we a solving a linear, symmetric problem, i,e, a self-adjoint problem,
+# `adjoint_petsc_options`. As we are solving a linear, symmetric problem, i.e. a self-adjoint problem,
 # we use the same options for both the forward and adjoint problems.
 # ```
 
