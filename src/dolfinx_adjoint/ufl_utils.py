@@ -8,6 +8,66 @@ from .compat import compute_form_adjoint
 from .typing_utils import NestedSequence
 
 
+def recursive_space_discovery(
+    obj: NestedSequence[ufl.Form], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
+) -> None:
+    """Recursively discover, for each row/column index, the function space of the
+    (as yet unassigned) argument occupying that position.
+
+    `indices` will be `(row,)` for vectors and `(row, col)` for matrices.
+
+    Arguments:
+        obj: A UFL form or nested iterable of forms.
+        indices: The current row/column indices in the nested structure.
+        spaces: A dictionary mapping row/column indices to discovered function spaces.
+            This dictionary is updated in-place as the function traverses the structure.
+    """
+    if isinstance(obj, ufl.Form):
+        for arg in obj.arguments():
+            if arg.part() is None:
+                # The argument number corresponds to the index of the row/column
+                # in the nested structure
+                num = arg.number()
+                if num < len(indices):
+                    spaces.setdefault(indices[num], arg.ufl_function_space())
+    elif isinstance(obj, typing.Iterable):
+        for i, item in enumerate(obj):
+            if item is not None:
+                recursive_space_discovery(item, indices + (i,), spaces)
+    else:
+        raise TypeError(f"Expected ufl.Form or iterable, got {type(obj)}")
+
+
+def build_argument_replacement_map(
+    obj: NestedSequence[ufl.Form],
+    indices: tuple[int, ...],
+    test_functions: typing.Sequence[ufl.TestFunction],
+    trial_functions: typing.Sequence[ufl.TrialFunction],
+    replace_map: dict[ufl.Argument, ufl.Argument],
+) -> None:
+    """
+    Recursively build a mapping from ufl arguments that does not have a `part`-index
+    to their replacements in a {py:class}`ufl.MixedFunctionSpace`.
+
+    Arguments:
+        obj: A UFL form or nested iterable of forms.
+        indices: The current row/column indices in the nested structure.
+        test_functions: A sequence of test functions used for replacement.
+        trial_functions: A sequence of trial functions used for replacement.
+        replace_map: A dictionary mapping old arguments to new arguments.
+    """
+    if isinstance(obj, ufl.Form):
+        for arg in obj.arguments():
+            if arg.part() is None and arg not in replace_map:
+                num = arg.number()
+                if num < len(indices):
+                    replace_map[arg] = (test_functions if num == 0 else trial_functions)[indices[num]]
+    elif isinstance(obj, typing.Iterable):
+        for i, item in enumerate(obj):
+            if item is not None:
+                build_argument_replacement_map(item, indices + (i,), test_functions, trial_functions, replace_map)
+
+
 @typing.overload
 def assign_mixed_parts[T: NestedSequence[ufl.Form]](form1: T, /) -> T: ...
 @typing.overload
@@ -36,9 +96,9 @@ def assign_mixed_parts(
             share the same replacement map, preventing mismatched compilation.
 
     Returns:
-        The modified form structures with identical nesting and sequence types, where
-        all unassigned TestFunction and TrialFunction arguments have been mapped.
-        Returns a single structure if one was passed, otherwise returns a tuple.
+        The modified form structures with identical nesting, where all unassigned
+        TestFunction and TrialFunction arguments have been mapped. Returns a single
+        structure if one was passed, otherwise returns a tuple.
 
     Note:
         The replacement arguments are drawn from {py:func}`ufl.TestFunctions`
@@ -47,30 +107,8 @@ def assign_mixed_parts(
         discovered while walking the structure.
     """
     spaces: dict[int, ufl.functionspace.AbstractFunctionSpace] = {}
-
-    def _discover_spaces(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
-        """Recursively discover, for each row/column index, the function space of the
-        (as yet unassigned) argument occupying that position.
-
-        `indices` will be `(row,)` for vectors and `(row, col)` for matrices.
-        """
-        if isinstance(obj, ufl.Form):
-            for arg in obj.arguments():
-                if arg.part() is None:
-                    # The argument number corresponds to the index of the row/column
-                    # in the nested structure
-                    num = arg.number()
-                    if num < len(indices):
-                        spaces.setdefault(indices[num], arg.ufl_function_space())
-        elif isinstance(obj, typing.Iterable):
-            for i, item in enumerate(obj):
-                if item is not None:
-                    _discover_spaces(item, indices + (i,))
-        else:
-            raise TypeError(f"Expected ufl.Form or iterable, got {type(obj)}")
-
     for struct in form_structs:
-        _discover_spaces(struct, ())
+        recursive_space_discovery(struct, (), spaces)
 
     # If no replacements are needed, exit early to save computation
     if not spaces:
@@ -81,36 +119,12 @@ def assign_mixed_parts(
     test_functions = ufl.TestFunctions(mixed_space)
     trial_functions = ufl.TrialFunctions(mixed_space)
 
-    replace_map = {}
-
-    def _build_map(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
-        if isinstance(obj, ufl.Form):
-            for arg in obj.arguments():
-                if arg.part() is None and arg not in replace_map:
-                    num = arg.number()
-                    if num < len(indices):
-                        replace_map[arg] = (test_functions if num == 0 else trial_functions)[indices[num]]
-        elif isinstance(obj, typing.Iterable):
-            for i, item in enumerate(obj):
-                if item is not None:
-                    _build_map(item, indices + (i,))
-
+    replace_map: dict[ufl.Argument, ufl.Argument] = {}
     for struct in form_structs:
-        _build_map(struct, ())
-
-    def _replace(obj: typing.Any) -> typing.Any:
-        """
-        Recursively rebuild the structure using the populated replace_map,
-        strictly preserving original sequence types (lists vs. tuples).
-        """
-        if isinstance(obj, ufl.Form):
-            return ufl.replace(obj, replace_map)
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(_replace(item) for item in obj)
-        return obj
+        build_argument_replacement_map(struct, (), test_functions, trial_functions, replace_map)
 
     # Apply the replacements and unpack if necessary
-    replaced = tuple(_replace(struct) for struct in form_structs)
+    replaced = tuple(recursive_replace(struct, replace_map) for struct in form_structs)
     return replaced if len(replaced) > 1 else replaced[0]
 
 
@@ -119,7 +133,7 @@ def get_sorted_arguments(arguments: typing.Iterable[ufl.Argument], number: int) 
     return sorted(filter(lambda x: x.number() == number, arguments), key=lambda a: a.part())
 
 
-def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set:
+def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[ufl.Coefficient]:
     """Return the set of UFL coefficients appearing anywhere in ``form``.
 
     ``form`` may be a single form or an arbitrarily nested sequence of forms
