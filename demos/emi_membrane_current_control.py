@@ -14,7 +14,7 @@
 # {py:mod}`the primal single-domain EMI example <ucs.emi.emi_primal_single>` and
 # {py:mod}`the primal mixed-domain EMI example <ucs.emi.emi_primal_mixed>`
 # of [FEniCS in the Wild](https://github.com/scientificcomputing/fenics-in-the-wild),
-# see {cite}`Kuchta2021emi` Ch. 5.2 for the underlying finite element formulation.
+# see {cite}`emi-Kuchta2021emi` Ch. 5.2 for the underlying finite element formulation.
 #
 # Rather than solving for the membrane current $I_m$ as an unknown (as in the primal
 # mixed-domain example), here $I_m$ is the *control*: it is added on top of the passive,
@@ -478,7 +478,9 @@ else:
 
 # ## References
 # ```{bibliography}
-# :filter: cited and ({"demos/emi_membrane_current_control"} >= docnames)
+# :filter: cited
+# :labelprefix:
+# :keyprefix: emi-
 # ```
 
 # + tags=["hide-input"]
