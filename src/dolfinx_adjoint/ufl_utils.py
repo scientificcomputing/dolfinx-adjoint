@@ -184,14 +184,9 @@ def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
 def compute_adjoint(form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
     """Compute the adjoint of a (possibly blocked) bilinear form.
 
-    A module-level function, not a method: it needs no ``Block``/``Problem`` state,
-    just ``form`` itself, so both ``_ProblemBlockBase`` (``blocks/solvers.py``) and
-    ``_ProblemBase`` (``solvers.py``) can call it directly rather than one reaching
-    into a "private" method defined on the other.
-
     Args:
-        form: A bilinear form :math:`a(u, v)`, either a single ``ufl.Form`` or a
-            blocked (nested list) system.
+        form: A bilinear form :math:`a(u, v)`. Blocked forms should be summed with
+        {py:func}`sum_form` before passing to this function.
 
     Returns:
         The transposed form :math:`a(v, u)`, decomposed back into blocks (via
@@ -202,21 +197,6 @@ def compute_adjoint(form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]
 
 def recursive_replace(form: ufl.Form | typing.Sequence | None, placeholders: dict) -> ufl.Form | typing.Sequence | None:
     """Recursively apply {py:func}`ufl.replace` to a (possibly nested) form structure.
-
-    A module-level function, not a nested closure: a nested function that
-    recurses by calling itself by name captures *itself* as a free variable,
-    which makes the function object (and, via ``self`` if the closure also
-    needs it) part of a reference cycle -- collected only by the cyclic
-    garbage collector, at a moment that differs between MPI ranks, not by
-    ordinary refcounting. That is exactly the hazard ``Problem`` owning its
-    solvers (rather than each {py:class}`~pyadjoint.Block`) exists to avoid: a
-    self-referential ``_replace`` closure inside a
-    {py:class}`~dolfinx_adjoint.LinearProblem`/{py:class}`~dolfinx_adjoint.NonlinearProblem`
-    ``__init__`` would keep the ``Problem`` itself -- and its PETSc solvers -- alive as
-    cyclic garbage. Taking ``placeholders`` as a plain argument instead of
-    capturing ``self`` sidesteps this entirely: a module-level function
-    referring to itself by name is looked up through the module's namespace,
-    not a closure cell, so no cycle is created.
 
     Args:
         form: A single form, ``None``, or an arbitrarily nested sequence of
