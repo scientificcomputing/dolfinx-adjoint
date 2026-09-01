@@ -1,4 +1,3 @@
-import typing
 
 import dolfinx
 import numpy as np
