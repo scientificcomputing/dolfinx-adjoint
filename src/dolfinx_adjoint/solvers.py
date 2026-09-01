@@ -21,26 +21,25 @@ from .ufl_utils import (
     sum_form,
 )
 
-# Backs each Problem's default PETSc options prefix (see LinearProblem/NonlinearProblem
-# __init__). A plain incrementing counter, not id(self)/uuid.uuid4()/time.time(): those
-# can differ across MPI ranks for the same logical Problem (memory layout, clock skew),
-# and PETSc's options-database handling around SNESSetFromOptions/KSPSetFromOptions is
-# collective, so every rank must resolve the same prefix for the same Problem. A counter
-# incremented once per Problem construction is deterministic and identical on every rank,
-# since construction happens in lock-step in a well-formed SPMD program.
+# A counter incremented once per Problem construction is deterministic
+# and identical on every rank, since construction happens in lock-step
+# in a well-formed SPMD program.
 _PROBLEM_PREFIX_COUNTER = itertools.count()
 
 
 @typing.overload
-def resolve_u(u: _Function | None, L: ufl.Form) -> _Function: ...
+def find_or_create_then_overload(u: _Function | None, L: ufl.Form) -> _Function: ...
 @typing.overload
-def resolve_u(u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]) -> typing.Sequence[_Function]: ...
+def find_or_create_then_overload(
+    u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]
+) -> typing.Sequence[_Function]: ...
 
 
-def resolve_u(
+def find_or_create_then_overload(
     u: _Function | typing.Sequence[_Function] | None, L: ufl.Form | typing.Sequence[ufl.Form]
 ) -> _Function | typing.Sequence[_Function]:
-    """Resolve the unknown {py:class}`~dolfinx_adjoint.Function` ``u`` for a `*Problem`.
+    """Find or create, then overload the unknown
+    {py:class}`~dolfinx_adjoint.Function` ``u`` for a `*Problem`.
 
     If ``u`` was not supplied by the caller, a fresh {py:class}`~dolfinx_adjoint.Function`
     is created per block, using the function space of the corresponding
@@ -176,21 +175,18 @@ def _build_soa_self_template(
 class _ProblemBase(abc.ABC):
     """Shared lazy adjoint/TLM solver machinery for
     {py:class}`~dolfinx_adjoint.LinearProblem`/{py:class}`~dolfinx_adjoint.NonlinearProblem`.
-
-    A plain mixin -- it does not inherit from any ``dolfinx.fem.petsc`` class,
-    so ``LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem)`` (and
-    the {py:class}`~dolfinx_adjoint.NonlinearProblem` equivalent) has an
-    unambiguous MRO for ``solve()``: each subclass keeps defining its own
-    ``solve()``, delegating the shared middle to
-    {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._record_and_solve` below via
-    the {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._make_block`/
-    {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._dolfinx_solve` hooks it implements.
-
-    Every attribute referenced here is set by the concrete subclass's own
-    ``__init__`` (either directly, or inherited from the ``dolfinx.fem.petsc``
-    base it also derives from) before any of these methods run.
     """
 
+    # A plain mixin -- not a subclass of any dolfinx.fem.petsc class -- so
+    # LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem) (and the
+    # NonlinearProblem equivalent) gets an unambiguous MRO for solve(): each
+    # subclass keeps defining its own solve(), delegating the shared middle to
+    # _record_and_solve() below via the _make_block()/_dolfinx_solve() hooks it
+    # implements.
+
+    # Every attribute below is set by the concrete subclass's own __init__
+    # (either directly, or inherited from the dolfinx.fem.petsc base it also
+    # derives from) before any method on this class runs.
     ad_block_tag: str | None
     bcs: typing.Sequence[dolfinx.fem.DirichletBC]
     _u: _Function | typing.Sequence[_Function]
@@ -207,18 +203,10 @@ class _ProblemBase(abc.ABC):
 
     @property
     def value_placeholders(self) -> dict[dolfinx.fem.Function, dolfinx.fem.Function]:
-        """Map from each non-``u`` dependency the compiled forward/adjoint/TLM/Hessian
-        forms were built against to its dedicated placeholder coefficient.
-
-        Public so
-        {py:class}`*ProblemBlock<dolfinx_adjoint.blocks.solvers._ProblemBlockBase>`
-        methods (a different module) can refresh a dependency's placeholder value
-        ahead of a solve/replay without reaching into this Problem's own private
-        state.
-
-        Returns:
-            The placeholder dictionary, keyed by the user's original dependency.
-        """
+        """Map from each non-``u`` dependency to its dedicated placeholder coefficient."""
+        # Public so *ProblemBlock (blocks/solvers.py) can refresh a dependency's
+        # placeholder value ahead of a solve/replay without reaching into this
+        # Problem's private state.
         return self._value_placeholders
 
     @property
@@ -226,76 +214,52 @@ class _ProblemBase(abc.ABC):
         """The dedicated "state" placeholder(s) standing in for ``u`` in every
         compiled template built from the residual (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_residual_template`).
-
-        Returns:
-            A single {py:class}`~dolfinx_adjoint.Function` for a scalar problem, or one
-            per output block for a blocked problem.
+        A single Function for a scalar problem, or one per output block for a
+        blocked problem.
         """
         assert self._residual_state_placeholder is not None
         return self._residual_state_placeholder
 
     @property
     def adjoint_solution_placeholder(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
-        """The placeholder(s) standing in for the first-order adjoint solution in the
-        cached Hessian templates (see {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
-
-        Returns:
-            A single {py:class}`~dolfinx_adjoint.Function` for a scalar problem, or one
-            per output block for a blocked problem. ``None`` until the Hessian templates have been built.
+        """The placeholder(s) for the first-order adjoint solution in the cached
+        Hessian templates (see
+        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
         """
         assert self._adjoint_solution_placeholder is not None
         return self._adjoint_solution_placeholder
 
     @property
     def second_adjoint_solution_placeholder(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
-        """The placeholder(s) standing in for the second-order adjoint (SOA) solution
-        in the cached Hessian templates (see
+        """The placeholder(s) for the second-order adjoint (SOA) solution in the
+        cached Hessian templates (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
-
-        Returns:
-            A single {py:class}`~dolfinx_adjoint.Function` for a scalar problem, or one
-            per output block for a blocked problem.
         """
         assert self._second_adjoint_solution_placeholder is not None
         return self._second_adjoint_solution_placeholder
 
     @property
     def hessian_u_seed(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
-        """The placeholder(s) standing in for the state's own tangent-linear direction
-        in the cached Hessian self-term (see
+        """The placeholder(s) for the state's own tangent-linear direction in the
+        cached Hessian self-term (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
-
-        Returns:
-            A single {py:class}`~dolfinx_adjoint.Function` for a scalar problem, or one
-            per output block for a blocked problem.
         """
         assert self._hessian_u_seed is not None
         return self._hessian_u_seed
 
     def _init_adjoint_state(self) -> None:
-        """Initialize the lazily-built adjoint/TLM solver state.
-
-        Called once, at the end of ``__init__``, after the base
-        ``dolfinx.fem.petsc`` solver has been constructed. Built lazily (on
-        first use, see
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_adjoint_solver`/
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_tlm_solver`/
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`)
-        and shared by every block this Problem records, rather than one per
-        block/solve() call. Each block holds only a ``weakref`` back to this
-        Problem (see
-        {py:meth}`*ProblemBlock.get_reference_problem<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.get_reference_problem>`),
-        not a strong reference: a throwaway Problem (solve it, then only touch
-        the resulting {py:class}`~pyadjoint.ReducedFunctional`) must not be
-        kept alive for as long as its blocks remain reachable on the tape. If
-        this Problem is collected while a block still needs it, that block
-        rebuilds an equivalent one on demand
-        ({py:meth}`*ProblemBlock._rebuild_problem<dolfinx_adjoint.blocks.solvers._ProblemBlockBase._rebuild_problem>`,
-        with a {py:class}`UserWarning` since it is a costly fallback) rather
-        than silently failing. Laziness keeps pure forward (non-annotated)
-        use from paying for a symbolic
-        adjoint form it never needs.
-        """
+        """Initialize the lazily-built adjoint/TLM solver state."""
+        # Called once, at the end of __init__, after the base dolfinx.fem.petsc
+        # solver is constructed. Everything below is built lazily, on first use
+        # (see _get_or_build_adjoint_solver/_get_or_build_tlm_solver/
+        # _get_or_build_hessian_templates), so pure forward (non-annotated) use
+        # never pays for a symbolic adjoint form it doesn't need.
+        #
+        # Shared by every block this Problem records rather than rebuilt per
+        # block/solve() call. Each block holds only a weakref back here, not a
+        # strong reference -- see *ProblemBlock.get_reference_problem
+        # (blocks/solvers.py) for why, and how a block copes if this Problem is
+        # collected before it's done needing it.
         self._adjoint_solver: HomogeneousBCLinearProblem | None = None
         self._tlm_solver: HomogeneousBCLinearProblem | None = None
         self._residual_template: ufl.Form | None = None
@@ -315,42 +279,33 @@ class _ProblemBase(abc.ABC):
     def _get_or_build_residual_template(
         self,
     ) -> tuple[ufl.Form, dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]]:
-        """Build (once) and return F with every coefficient replaced by its placeholder, and u
-        replaced by a dedicated "state" placeholder standing in for "u at this evaluation point".
+        """Build (once) and return F with every coefficient replaced by its placeholder,
+        and u replaced by a dedicated "state" placeholder for "u at this evaluation point".
 
-        The one genuinely irreducible difference between the two Problem kinds -- LinearProblem
-        builds it from ``a``/``L`` via {py:func}`ufl.action`, NonlinearProblem already has ``F``
-        directly -- everything built on top of it below (``dF/du``, the TLM right-hand side, the
-        Hessian templates) is derived from this one template by the same shared symbolic
-        differentiation, since that costs nothing extra at compile time: there is no reason to
-        keep a separate "dF/du is just a, never differentiated" shortcut for LinearProblem.
-        Each subclass overrides this.
+        Each subclass overrides this -- the one genuinely irreducible difference
+        between the two Problem kinds (LinearProblem builds it from ``a``/``L``
+        via {py:func}`ufl.action`; NonlinearProblem already has ``F`` directly).
+        Everything derived below (``dF/du``, TLM right-hand side, Hessian
+        templates) shares this one template, via the same symbolic
+        differentiation for both kinds.
 
         Returns:
             A ``(F_template, state_placeholder)`` pair: the residual with every
-            coefficient (including ``u``) substituted by its dedicated
-            placeholder, and that state placeholder itself (a single
-            {py:class}`~dolfinx_adjoint.Function`, or one per output block for a
-            blocked problem).
+            coefficient (including ``u``) substituted by its placeholder, and
+            that state placeholder itself (single, or one per output block for
+            a blocked problem).
         """
 
     def _get_or_build_dFdu_template(self) -> ufl.Form | typing.Sequence:
-        """Build (once) and return dF/du, evaluated at the residual template's state placeholder.
-
-        Shared by both classes: derived from
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_residual_template`
-        by symbolic differentiation, which is free at compile time, rather than
-        special-cased per class. This is the shared basis for the adjoint operator
-        ({py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_adjoint_solver`,
-        which just adjoints it) and the TLM operator
-        ({py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_tlm_solver`,
-        used as-is): built once, for the life of this Problem, so neither ever
-        needs to rebuild or recompile it -- only refresh the placeholders' values
-        (see
-        {py:meth}`*ProblemBlock.prepare_evaluate_adj<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_adj>`/
-        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian`/
-        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_tlm`).
-        """
+        """Build (once) and return dF/du, evaluated at the residual template's state placeholder."""
+        # Shared by both classes: derived from _get_or_build_residual_template by
+        # symbolic differentiation (free at compile time) rather than
+        # special-cased per class. Basis for the adjoint operator
+        # (_get_or_build_adjoint_solver, which just adjoints it) and the TLM
+        # operator (_get_or_build_tlm_solver, used as-is). Built once for the
+        # life of this Problem -- callers only ever refresh the placeholders'
+        # values afterwards (see *ProblemBlock.prepare_evaluate_adj/
+        # prepare_evaluate_hessian/prepare_evaluate_tlm in blocks/solvers.py).
         if self._dFdu_template is None:
             F_template, state_placeholder = self._get_or_build_residual_template()
             if isinstance(self._u, list):
@@ -370,26 +325,21 @@ class _ProblemBase(abc.ABC):
         return self._dFdu_template
 
     def _get_or_build_dFdu_adj_template(self) -> ufl.Form | typing.Sequence:
-        """Build (once) and return adjoint(dF/du), shared by the adjoint solver
-        ({py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_adjoint_solver`)
-        and, for scalar problems, the Hessian SOA right-hand-side's
-        cross-dependency templates
-        ({py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
+        """Build (once) and return adjoint(dF/du).
 
-        The same computation for both classes:
-        {py:func}`~dolfinx_adjoint.ufl_utils.compute_adjoint` swaps argument
-        numbers while preserving mixed-space {py:meth}`ufl.Argument.part` tags
-        (via {py:func}`~dolfinx_adjoint.compat.compute_form_adjoint`) and
-        decomposes the result back into blocks (via
-        {py:func}`ufl.extract_blocks`) -- a no-op decomposition for a scalar,
-        non-blocked form. Kept exactly as that returns it (a nested list of
-        forms for a blocked problem) since that structure is what
-        {py:class}`~dolfinx_adjoint.petsc_utils.HomogeneousBCLinearProblem`/
-        {py:class}`dolfinx.fem.petsc.LinearProblem` needs for block matrix
-        assembly; callers that need a single summed form (Hessian templating,
-        scalar-only) apply {py:func}`~dolfinx_adjoint.ufl_utils.sum_form` themselves.
+        Shared by the adjoint solver (`_get_or_build_adjoint_solver`) and, for
+        scalar problems, the Hessian SOA right-hand side's cross-dependency
+        templates (`_get_or_build_hessian_templates`).
         """
         if self._dFdu_adj_template is None:
+            # compute_adjoint() (ufl_utils.py) swaps argument numbers while
+            # preserving mixed-space ufl.Argument.part tags, then decomposes back
+            # into blocks via ufl.extract_blocks -- a no-op for a scalar form.
+            # Kept exactly as that returns it (a nested list of forms for a
+            # blocked problem), since that's the shape HomogeneousBCLinearProblem/
+            # dolfinx.fem.petsc.LinearProblem need for block matrix assembly;
+            # callers wanting a single summed form (Hessian templating,
+            # scalar-only) apply ufl_utils.sum_form() themselves.
             self._dFdu_adj_template = compute_adjoint(
                 self._get_or_build_dFdu_template()  # type: ignore[arg-type]
             )
@@ -402,29 +352,12 @@ class _ProblemBase(abc.ABC):
         dict[dolfinx.fem.Function, dolfinx.fem.Function],
         dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
     ]:
-        """Build (once) and return the per-dependency TLM right-hand-side templates.
-
-        Shared by both classes: built purely from the residual template
-        ({py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_residual_template`),
-        since ``dF/dm`` genuinely depends on the state for either a linear or
-        nonlinear residual -- differentiating w.r.t. a coefficient embedded in
-        the residual while holding ``u`` fixed leaves ``u`` in the result even
-        when the residual is linear in ``u`` itself.
-
-        One compiled one-form is built per dependency, using a dedicated "direction"
-        placeholder for that dependency (``_tlm_seed_placeholders``) rather than a single
-        combined form summed over every dependency: summing symbolically would require
-        deciding, once and for all, which dependencies contribute, but which ones actually have
-        a tangent-linear value varies from call to call. Refreshing an unused dependency's seed
-        to zero and evaluating its term anyway is not a safe substitute for skipping it: if that
-        dependency appears in a way that is singular at its current value (e.g. a `1/c` term,
-        with `c` legitimately zero somewhere in the domain), the assembled contribution would be
-        `0 * inf = NaN` there even though the *seed* is zero, silently corrupting the sum.
-        Keeping every dependency's contribution as its own compiled form, only ever assembled
-        when that dependency actually has a tangent-linear value (see
-        {py:meth}`*ProblemBlock.prepare_evaluate_tlm<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_tlm>`),
-        avoids that entirely.
-        """
+        """Build (once) and return the per-dependency TLM right-hand-side templates."""
+        # Shared by both classes: built purely from the residual template
+        # (_get_or_build_residual_template), since dF/dm genuinely depends on the
+        # state for either a linear or nonlinear residual -- differentiating
+        # w.r.t. a coefficient embedded in the residual while holding u fixed
+        # leaves u in the result even when the residual is linear in u itself.
         F_template, state_placeholder = self._get_or_build_residual_template()
         if self._tlm_rhs_templates is None:
             if isinstance(self._u, list):
@@ -433,6 +366,20 @@ class _ProblemBase(abc.ABC):
                 test_funcs = [F_template.arguments()[0]]
 
             templates: dict[dolfinx.fem.Function, typing.Any] = {}
+            # One compiled one-form per dependency, using a dedicated "direction"
+            # placeholder (below, cached in _tlm_seed_placeholders) rather than a
+            # single form summed over every dependency: summing symbolically
+            # would require deciding, once and for all, which dependencies
+            # contribute, but that varies from call to call. Zeroing an unused
+            # dependency's seed and evaluating its term anyway isn't a safe
+            # substitute for skipping it -- if that dependency appears somewhere
+            # singular at its current value (e.g. a 1/c term with c legitimately
+            # zero somewhere), the assembled contribution is 0 * inf = NaN there
+            # even though the seed is zero, silently corrupting the sum. Keeping
+            # each dependency as its own compiled form, only ever assembled when
+            # it actually has a tangent-linear value (see
+            # *ProblemBlock.prepare_evaluate_tlm in blocks/solvers.py), avoids
+            # that entirely.
             for c, c_placeholder in self._value_placeholders.items():
                 seed = dolfinx.fem.Function(c.function_space)
                 dFdm_c = ufl.algorithms.expand_derivatives(-ufl.derivative(F_template, c_placeholder, seed))
@@ -452,45 +399,14 @@ class _ProblemBase(abc.ABC):
         return self._tlm_rhs_templates, self._tlm_seed_placeholders, state_placeholder
 
     def _get_or_build_hessian_templates(self) -> HessianTemplates:
-        """Build (once) and return the per-dependency Hessian templates used by
-        {py:meth}`*ProblemBlock.prepare_evaluate_hessian<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian>`'s
-        SOA right-hand side and
-        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_hessian_component`'s
-        own Hessian-action output.
+        """Build (once) and return the per-dependency Hessian templates.
 
-        Shared by both classes and by both scalar and blocked problems -- built
-        purely from
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_residual_template`/
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_dFdu_template`/
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_dFdu_adj_template`/
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_tlm_rhs_templates`,
-        all themselves shared. ``soa_self`` (see
-        {py:func}`~dolfinx_adjoint.solvers._build_soa_self_template`) comes out a
-        {py:class}`ufl.ZeroBaseForm` for {py:class}`~dolfinx_adjoint.LinearProblem`
-        (``dF/du`` doesn't depend on ``u``) and generally nonzero for
-        {py:class}`~dolfinx_adjoint.NonlinearProblem`, as a *result* of running the
-        same code, not a per-class branch.
-
-        ``fixed``/``cross`` are one-forms over a *control's own* test space
-        (``c.function_space``), so their shape doesn't depend on how many output
-        blocks ``u`` has -- {py:func}`ufl.action` already reduces the (possibly
-        part-tagged, blocked) state/adjoint-solution arguments away before
-        ``fixed``/``cross`` are built. Only ``soa_self``/``soa_cross`` feed the
-        (possibly blocked) SOA right-hand-side vector, so for a blocked problem
-        they become a list of one compiled form per output row (padded via
-        {py:func}`~dolfinx_adjoint.solvers._pad_blocks_by_part` for any row a
-        differentiation happened to eliminate entirely) instead of a single form.
-
-        Each of ``soa_cross``/``fixed``/``cross`` is kept as its own compiled
-        one-form (or list of one-forms), using a dedicated "direction" placeholder
-        (the same ``_tlm_seed_placeholders`` the TLM right-hand side already uses
-        -- safe to share, since the TLM forward sweep has always finished
-        computing every tangent-linear value before the reverse (adjoint/Hessian)
-        sweep that needs these runs), for the same reason as
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_tlm_rhs_templates`:
-        summing every dependency's cross-term contribution into one combined form
-        and zeroing an inactive dependency's seed has the same ``0 * inf = NaN``
-        hazard there does.
+        Feeds *ProblemBlock.prepare_evaluate_hessian's SOA right-hand side and
+        evaluate_hessian_component's Hessian-action output (blocks/solvers.py).
+        Shared by both classes and by scalar and blocked problems, built
+        entirely from the other cached templates (`_get_or_build_residual_template`,
+        `_get_or_build_dFdu_template`, `_get_or_build_dFdu_adj_template`,
+        `_get_or_build_tlm_rhs_templates`).
         """
         if self._hessian_templates is None:
             _, seed_placeholders, state_placeholder = self._get_or_build_tlm_rhs_templates()
@@ -503,6 +419,10 @@ class _ProblemBase(abc.ABC):
             blocked = isinstance(self._u, list)
             soa_self: dolfinx.fem.Form | list[dolfinx.fem.Form]
             if blocked:
+                # One placeholder Function per output block, mirroring how
+                # _get_or_build_hessian_templates's scalar branch below uses a
+                # single one -- these back the adjoint_solution_placeholder/
+                # second_adjoint_solution_placeholder/hessian_u_seed properties.
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
                 test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
@@ -511,6 +431,13 @@ class _ProblemBase(abc.ABC):
                 self._hessian_u_seed = [dolfinx.fem.Function(s.function_space) for s in state_list]
                 state_arg: typing.Any = state_list
 
+                # soa_self = adjoint(d2F/du2) . adjoint_solution -- the SOA
+                # right-hand side's contribution from dF/du's own second
+                # derivative w.r.t. u. d2Fdu2 is structurally zero whenever the
+                # residual is linear in u (dF/du doesn't reference u), so this
+                # comes out a ufl.ZeroBaseForm for LinearProblem as a *result*
+                # of running the same code, not a per-class branch (see
+                # _build_soa_self_template, used below for the scalar case).
                 d2Fdu2 = ufl.algorithms.expand_derivatives(
                     ufl.derivative(dFdu_template, state_list, self._hessian_u_seed)
                 )
@@ -518,6 +445,10 @@ class _ProblemBase(abc.ABC):
                     soa_self_form = d2Fdu2
                 else:
                     soa_self_form = ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solution_placeholder)
+                # soa_self feeds the (blocked) SOA right-hand-side vector, so it
+                # becomes a list of one compiled form per output row here,
+                # padded via _pad_blocks_by_part for any row a differentiation
+                # happened to eliminate entirely.
                 soa_self = [
                     dolfinx.fem.form(
                         form_i,
@@ -544,6 +475,12 @@ class _ProblemBase(abc.ABC):
                     entity_maps=self._entity_maps,
                 )
 
+            # dFdu_adj_applied/L1/L2 are shared building blocks for every
+            # dependency's soa_cross/fixed/cross templates below: dFdu_adj_applied
+            # is dF/du^T applied to the first-order adjoint solution (the base
+            # for each dependency's soa_cross term), L1/L2 are the residual
+            # applied to the first/second-order adjoint solutions respectively
+            # (the base for each dependency's fixed/cross terms).
             dFdu_adj_applied = ufl.action(dFdu_adj_template, self._adjoint_solution_placeholder)
             L1 = ufl.action(F_template, self._adjoint_solution_placeholder)
             L2 = ufl.action(F_template, self._second_adjoint_solution_placeholder)
@@ -551,9 +488,20 @@ class _ProblemBase(abc.ABC):
             soa_cross_templates: dict = {}
             fixed_templates: dict = {}
             cross_templates: dict = {}
+            # fixed/cross live on each control's own test space, so their shape
+            # is unaffected by blocking. soa_self/soa_cross do feed the
+            # (possibly blocked) SOA right-hand side, so for a blocked problem
+            # each becomes a list of one compiled form per output row (padded
+            # via _pad_blocks_by_part for any row a differentiation eliminated).
+            #
+            # Each cross-term below uses its own dedicated seed_placeholders
+            # direction placeholder rather than one combined form, for the same
+            # 0 * inf = NaN reason as _get_or_build_tlm_rhs_templates.
             for c, c_placeholder in self._value_placeholders.items():
                 seed = seed_placeholders[c]
 
+                # soa_cross[c]: the SOA right-hand side's contribution from c's
+                # own tangent-linear direction, via dFdu_adj_applied.
                 soa_form = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_adj_applied, c_placeholder, seed))
                 if not (soa_form == 0 or soa_form.empty()):
                     if blocked:
@@ -574,6 +522,10 @@ class _ProblemBase(abc.ABC):
                             entity_maps=self._entity_maps,
                         )
 
+                # fixed[c]: c's own Hessian-action contribution that does not
+                # depend on any *other* dependency's tangent-linear value --
+                # the second-order-adjoint term (dL2dm, from L2) plus the
+                # mixed state/control second derivative (d2Fdudm, from L1).
                 dc = ufl.TestFunction(c.function_space)
                 dL1dm = ufl.derivative(L1, c_placeholder, dc)
                 dL2dm = ufl.derivative(L2, c_placeholder, dc)
@@ -588,6 +540,8 @@ class _ProblemBase(abc.ABC):
                     entity_maps=self._entity_maps,
                 )
 
+                # cross[(c, c2)]: c's Hessian-action contribution from another
+                # dependency c2's tangent-linear direction, reusing dL1dm.
                 for c2, c2_placeholder in self._value_placeholders.items():
                     seed2 = seed_placeholders[c2]
                     cross_form = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, c2_placeholder, seed2))
@@ -620,27 +574,23 @@ class _ProblemBase(abc.ABC):
         return self._adjoint_solver
 
     def _get_or_build_tlm_solver(self) -> HomogeneousBCLinearProblem:
-        """Build (once) and return the TLM solver shared by every block this Problem records.
-
-        No explicit ``u=`` is passed: like the adjoint solver, this gets its own
-        scratch solution Function from the base class, and callers copy the
-        result out (see
-        {py:meth}`*ProblemBlock.prepare_evaluate_tlm<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_tlm>`)
-        rather than relying on solver-owned storage identity, since that storage
-        is now shared across every block instead of private to one.
-
-        Unlike the adjoint operator (which decomposes dF/du back into blocks
-        itself, inside {py:func}`~dolfinx_adjoint.compat.compute_form_adjoint`/
-        {py:func}`~dolfinx_adjoint.ufl_utils.compute_adjoint`), dF/du
-        is used here as-is, so for a blocked problem it must be decomposed
-        with {py:func}`ufl.extract_blocks` before compiling: a summed multi-part
-        form is a perfectly good UFL object to keep substituting into and
-        differentiating, but it is not, on its own, a compilable one -- the
-        parts must be split apart first.
-        """
+        """Build (once) and return the TLM solver shared by every block this Problem records."""
+        # No explicit u= is passed: like the adjoint solver, this gets its own
+        # scratch solution Function from the base class, and callers copy the
+        # result out (see *ProblemBlock.prepare_evaluate_tlm, blocks/solvers.py)
+        # rather than relying on solver-owned storage identity, since that
+        # storage is now shared across every block instead of private to one.
         if self._tlm_solver is None:
             dFdu_template = self._get_or_build_dFdu_template()  # type: ignore[attr-defined]
             if isinstance(self._u, list):
+                # Unlike the adjoint operator (which decomposes dF/du back into
+                # blocks itself, inside compat.compute_form_adjoint/
+                # ufl_utils.compute_adjoint), dF/du is used here as-is, so for a
+                # blocked problem it must be decomposed with ufl.extract_blocks
+                # before compiling: a summed multi-part form is a perfectly good
+                # UFL object to keep substituting into and differentiating, but
+                # not, on its own, a compilable one -- the parts must be split
+                # apart first.
                 dFdu_template = ufl.extract_blocks(dFdu_template)
             self._tlm_solver = HomogeneousBCLinearProblem(
                 dFdu_template,
@@ -661,12 +611,10 @@ class _ProblemBase(abc.ABC):
         """Construct the tape block this Problem records for its forward solve.
 
         Each subclass overrides this to instantiate its own Block kind
-        ({py:class}`~dolfinx_adjoint.blocks.solvers.LinearProblemBlock`/
-        {py:class}`~dolfinx_adjoint.blocks.solvers.NonlinearProblemBlock`,
-        constructor kwargs differing the same way the two Problem kinds' own
-        constructors do), passing ``self`` so the Block can reach back into
-        this Problem's shared solvers (see
-        {py:meth}`*ProblemBlock.get_reference_problem<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.get_reference_problem>`).
+        (LinearProblemBlock/NonlinearProblemBlock, blocks/solvers.py; constructor
+        kwargs differ the same way the two Problem kinds' own constructors do),
+        passing ``self`` so the Block can reach back into this Problem's shared
+        solvers (see *ProblemBlock.get_reference_problem).
 
         Returns:
             A newly constructed, not-yet-recorded Block for this solve.
@@ -677,34 +625,23 @@ class _ProblemBase(abc.ABC):
         """Perform the actual forward solve, via the base ``dolfinx.fem.petsc`` class.
 
         Each subclass overrides this to call its own base class's ``solve()``
-        directly ({py:meth}`dolfinx.fem.petsc.LinearProblem.solve` /
-        {py:meth}`NonlinearProblem.solve<dolfinx.fem.petsc.NonlinearProblem.solve>`)
-        rather than ``self.solve()``, which would recurse back into this
-        Problem's own overridden, tape-recording ``solve()``.
+        directly (``dolfinx.fem.petsc.LinearProblem.solve``/
+        ``NonlinearProblem.solve``) rather than ``self.solve()``, which would
+        recurse back into this Problem's own overridden, tape-recording
+        ``solve()``.
 
         Returns:
-            The solution {py:class}`~dolfinx_adjoint.Function`, or one per
-            output block for a blocked problem.
+            The solution Function, or one per output block for a blocked problem.
         """
 
     def _record_and_solve(self, annotate: bool) -> _Function | typing.Sequence[_Function]:
         """Shared ``solve()`` skeleton for both classes.
 
-        Records a tape block (via the subclass's
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._make_block` hook) when
-        annotating, refreshes the forward solver's placeholder coefficients
-        from the user's own current values (a prior recompute -- see
-        {py:meth}`*ProblemBlock.prepare_recompute_component<dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_recompute_component>`
-        -- may have left them holding a checkpointed/candidate value instead),
-        solves (via the subclass's
-        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._dolfinx_solve` hook),
-        and records the block's outputs.
-
         Args:
             annotate: Whether to record this solve as a block on the working tape.
 
         Returns:
-            The solution {py:class}`~dolfinx_adjoint.Function`, or one per output block for a blocked problem.
+            The solution Function, or one per output block for a blocked problem.
         """
         annotate = pyadjoint.annotate_tape({"annotate": annotate})
         block = self._make_block() if annotate else None
@@ -713,6 +650,10 @@ class _ProblemBase(abc.ABC):
             tape = pyadjoint.get_working_tape()
             tape.add_block(block)
 
+        # Refresh the forward solver's placeholders from the user's own current
+        # values: a prior recompute (see *ProblemBlock.prepare_recompute_component,
+        # blocks/solvers.py) may have left them holding a checkpointed/candidate
+        # value instead.
         for original, placeholder in self._value_placeholders.items():
             placeholder.x.array[:] = original.x.array[:]
             placeholder.x.scatter_forward()
@@ -811,21 +752,19 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options
 
-        # Assign mixed-space `part` indices to Test/Trial arguments once,
-        # here, for blocked systems (mirroring what LinearProblemBlock used to
-        # redo per block): needed so a blocked bilinear/linear form can be
-        # safely combined into one whole-system form (via sum_form) when
-        # building the adjoint solver below.
+        # If a form is blocked from the user-side, it can be made without
+        # a {py:class}`ufl.MixedFunctionSpace`. Therefore we modify the
+        # form to use a {py:class}`ufl.MixedFunctionSpace` and split the form into its
+        # components.
         if not isinstance(a, ufl.Form):
             a, L = assign_mixed_parts(a, L)  # type: ignore[arg-type]
             if P is not None:
                 P, _ = assign_mixed_parts(P, L)  # type: ignore[arg-type]
 
-        self._u = resolve_u(u, L)  # type: ignore[arg-type]
+        self._u = find_or_create_then_overload(u, L)  # type: ignore[arg-type]
 
-        # A caller-omitted prefix must still be unique per Problem (see
-        # _PROBLEM_PREFIX_COUNTER) so PETSc's process-global options database
-        # never lets two Problems' SNES/KSP options bleed into each other.
+        # Unique, synchronized prefix for every solver instance (as SNES requires sync in prefix
+        # across processes).
         if petsc_options_prefix is None:
             petsc_options_prefix = f"dxa_linear_problem_{next(_PROBLEM_PREFIX_COUNTER)}_"
 
@@ -839,34 +778,29 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
         self._petsc_options_prefix = petsc_options_prefix
         self._kind = kind
 
-        # The forward solver's compiled forms reference dedicated placeholder
-        # coefficients rather than the user's own dependency objects --
-        # exactly like NonlinearProblem, so both classes share the same
-        # data-handling story: a solve always means "refresh the
-        # placeholders' values, then call the solver", never "recompile a
-        # form" or "mutate the user's own coefficient in place". solve()
-        # (below) refreshes them from the user's own current values;
-        # LinearProblemBlock.prepare_recompute_component refreshes them from
-        # a block's checkpointed/candidate values instead. Neither ever
-        # writes into the user's own coefficient objects, so a Taylor test
-        # that perturbs the original control directly
-        # (`pyadjoint.taylor_test(Jh, m, dm)`) always sees a pristine `m`.
+        # We replace all input coefficients with local coefficients,
+        # so that we don't disturb the input data during re-computations
+        # adjoints, etc. The local coefficients are stored in self._value_placeholders.
+        # The unknown `u` is not replaced, as it shouldn't be part of a linear problem's coefficients.
         u_list = self._u if isinstance(self._u, list) else [self._u]
         coefficients = collect_coefficients(a) | collect_coefficients(L)
+        if set(u_list).issubset(coefficients):
+            raise ValueError("The unknown `u` should not be part of the coefficients of a linear problem.")
         if P is not None:
             coefficients |= collect_coefficients(P)
-        coefficients -= set(u_list)
+            if set(u_list).issubset(coefficients):
+                raise ValueError("The unknown `u` should not be part of the coefficients of a linear problem.")
+
         self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
             c: dolfinx.fem.Function(c.function_space) for c in coefficients
         }
-
-        # Initialize linear solver
+        a_R, L_R, P_R = recursive_replace((a, L, P), self._value_placeholders)  # type: ignore[misc]
         super().__init__(
-            a=recursive_replace(a, self._value_placeholders),  # type: ignore[arg-type]
-            L=recursive_replace(L, self._value_placeholders),  # type: ignore[arg-type]
+            a=a_R,  # type: ignore[arg-type]
+            L=L_R,  # type: ignore[arg-type]
             bcs=bcs,
             u=self._u,  # type: ignore[arg-type]
-            P=recursive_replace(P, self._value_placeholders),  # type: ignore[arg-type]
+            P=P_R,  # type: ignore[arg-type]
             kind=kind,  # type: ignore[arg-type]
             petsc_options_prefix=petsc_options_prefix,
             petsc_options=petsc_options,
@@ -1032,19 +966,18 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         self._adj_options = adjoint_petsc_options
         self._tlm_options = tlm_petsc_options
 
-        # Assign mixed-space `part` indices to the test functions in a blocked
-        # residual once, here, mirroring LinearProblem: needed so a blocked
-        # residual's per-block forms can be safely combined into one
-        # whole-system form (via sum_form) inside _get_or_build_residual_template.
+        # If a form is blocked from the user-side, it can be made without
+        # a {py:class}`ufl.MixedFunctionSpace`. Therefore we modify the
+        # form to use a {py:class}`ufl.MixedFunctionSpace` and split the form into its
+        # components.
         if not isinstance(F, ufl.Form):
             F = assign_mixed_parts(F)  # type: ignore[arg-type]
 
-        self._u = resolve_u(u, F)  # type: ignore[arg-type]
+        self._u = find_or_create_then_overload(u, F)  # type: ignore[arg-type]
         self._bcs = [] if bcs is None else bcs
 
-        # A caller-omitted prefix must still be unique per Problem (see
-        # _PROBLEM_PREFIX_COUNTER) so PETSc's process-global options database
-        # never lets two Problems' SNES/KSP options bleed into each other.
+        # Unique, synchronized prefix for every solver instance (as SNES requires sync in prefix
+        # across processes).
         if petsc_options_prefix is None:
             petsc_options_prefix = f"dxa_nonlinear_problem_{next(_PROBLEM_PREFIX_COUNTER)}_"
 
@@ -1052,9 +985,7 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         # might appear in a hand-supplied Jacobian but not in F itself (e.g. a
         # stabilization term); the Jacobian _get_or_build_dFdu_template uses
         # for adjoint/TLM/Hessian purposes is always derived symbolically from
-        # F, never from this. Named distinctly from dolfinx.fem.petsc.NonlinearProblem's
-        # own `_J` (its compiled Jacobian, set by super().__init__() below) to avoid
-        # colliding with it.
+        # F, never from this.
         self._user_J = J
         self._rhs = F
         self._petsc_options = petsc_options
@@ -1064,27 +995,11 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         self._petsc_options_prefix = petsc_options_prefix
         self._kind = kind
 
-        # The SNES built by super().__init__() below binds to the exact
-        # compiled F/J/P Form objects passed to it, forever: its residual and
-        # Jacobian callbacks close over those objects in a context dict set up
-        # once (see dolfinx.fem.petsc.NonlinearProblem.__init__'s
-        # jacobian_ctx/function_ctx), so reassigning self._F/self._J later --
-        # the trick LinearProblem.solve() uses to switch between "live" and
-        # "recompute" forms -- would have no effect on what the SNES actually
-        # assembles. The only way to make the SNES see a different value for a
-        # coefficient is to mutate the exact Function object its compiled
-        # forms reference.
-        #
-        # To keep that mutation from ever touching an object the user (or a
-        # Taylor test perturbing a control directly) holds a live reference
-        # to, every non-u coefficient is routed through a dedicated
-        # placeholder Function from the very start: the SNES is built against
-        # F/J/P with every such coefficient replaced by its placeholder, and
-        # the placeholders are (re)populated -- from the user's own current
-        # values for an ordinary solve() (see solve() below), or from a
-        # block's checkpointed/candidate values for a recompute (see
-        # NonlinearProblemBlock.prepare_recompute_component) -- before every
-        # solve, never the other way around.
+        # We replace all input coefficients with local coefficients,
+        # so that we don't disturb the input data during re-computations
+        # adjoints, etc. The local coefficients are stored in self._value_placeholders.
+        # The unknown is not replaced in the residual, but when deriving the
+        # adjoint and TLM solutions, through `_residual_state_placeholder`
         u_list = self._u if isinstance(self._u, list) else [self._u]
         coefficients = collect_coefficients(F) - set(u_list)
         if J is not None:
@@ -1094,10 +1009,11 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         }
 
         # Initialize nonlinear solver
+        F_R, J_R, P_R = recursive_replace((F, J, P), self._value_placeholders)  # type: ignore[misc]
         super().__init__(
-            F=recursive_replace(F, self._value_placeholders),  # type: ignore[arg-type]
-            J=recursive_replace(J, self._value_placeholders),  # type: ignore[arg-type]
-            P=recursive_replace(P, self._value_placeholders),  # type: ignore[arg-type]
+            F=F_R,  # type: ignore[arg-type]
+            J=J_R,  # type: ignore[arg-type]
+            P=P_R,  # type: ignore[arg-type]
             bcs=self._bcs,
             u=self._u,  # type: ignore[arg-type]
             kind=kind,  # type: ignore[arg-type]
