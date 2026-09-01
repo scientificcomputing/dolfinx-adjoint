@@ -269,11 +269,25 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     forward_options = {
         "snes_monitor": None,
         "snes_type": "newtonls",
-        "snes_linesearch_type": "none",
+        # Default ("bt") backtracking line search: globalizes genuinely-far Newton
+        # steps (e.g. the largest Taylor-test perturbations). Disabling it
+        # ("snes_linesearch_type": "none") let an undamped step stall -- SNES then
+        # reported SNES_CONVERGED_SNORM_RELATIVE (step size below snes_stol) even
+        # though the residual was still ~1e-1, and snes_error_if_not_converged only
+        # raises on a *diverged* reason, so that false convergence passed silently.
         "snes_error_if_not_converged": True,
-        "snes_atol": 1e-9,
-        "snes_rtol": 1e-9,
-        "snes_stol": 1e-12,
+        # atol/rtol=1e-9 (tighter than this) plus line search re-enabled instead
+        # traded that silent failure for a *real* DIVERGED_LINE_SEARCH: warm-started
+        # from a neighbouring perturbation's solution, this problem's Newton
+        # iteration plateaus around residual ~9e-7 for many iterations before line
+        # search can no longer find a decrease -- 1e-9 is simply unreachable there.
+        # 1e-8 is comfortably above that plateau, so every recompute in the Taylor
+        # sweep below converges via the residual (not the step-size) criterion, in a
+        # single warm-started Newton iteration, well clear of both failure modes.
+        "snes_atol": 1e-8,
+        "snes_rtol": 1e-8,
+        # No explicit snes_stol: PETSc's default is loose enough, now that atol/rtol
+        # are the binding criteria, not to trigger a premature step-based exit.
         "ksp_type": "preonly",
         "ksp_error_if_not_converged": True,
         "pc_type": "lu",
