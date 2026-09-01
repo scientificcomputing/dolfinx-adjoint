@@ -51,8 +51,8 @@ class Function(dolfinx.fem.Function, FloatingType):
     def __init__(
         self,
         V: dolfinx.fem.FunctionSpace,
-        x: typing.Optional[dolfinx.la.Vector] = None,
-        name: typing.Optional[str] = None,
+        x: dolfinx.la.Vector | None = None,
+        name: str | None = None,
         dtype: npt.DTypeLike = dolfinx.default_scalar_type,
         **kwargs,
     ):
@@ -105,7 +105,7 @@ class Function(dolfinx.fem.Function, FloatingType):
     def _ad_restore_at_checkpoint(self, checkpoint):
         return checkpoint
 
-    def _ad_dot(self, other: typing.Self, options: typing.Optional[dict] = None):
+    def _ad_dot(self, other: typing.Self, options: dict | None = None):
         """Compute the inner product of the current function with ``other`` in the Riesz representation.
 
         Args:
@@ -165,9 +165,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         return r
 
     @no_annotations
-    def _ad_convert_riesz(
-        self, value: dolfinx.la.Vector, riesz_map: typing.Optional[dict] = None
-    ) -> dolfinx.fem.Function:
+    def _ad_convert_riesz(self, value: dolfinx.la.Vector, riesz_map: dict | None = None) -> dolfinx.fem.Function:
         """Convert a vector to a Riesz representation of the function."""
         options = {} if riesz_map is None else riesz_map
         riesz_representation = options.get("riesz_representation", "l2")
