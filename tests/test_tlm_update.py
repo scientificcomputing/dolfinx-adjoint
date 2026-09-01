@@ -1,11 +1,15 @@
-"""Regression tests for the tangent-linear solver cached on ``LinearProblemBlock``.
+"""Regression tests for cached adjoint/TLM/Hessian templates staying correct across evaluations.
 
-``construct_tlm_solver`` compiles ``_compute_residual_derivative()`` once and caches the
-resulting solver on the block.  That form is built from ``block_variable.saved_output``,
-which is a fresh object after every control update, so the cached operator can stay
-pinned to the evaluation point it was first built at.  When the control appears in the
-bilinear form -- so that dF/du genuinely depends on it -- every Hessian computed after
-the first one is then silently wrong.
+``_ProblemBase`` (``solvers.py``) builds ``dF/du``, the TLM right-hand side, and the Hessian
+templates once per ``LinearProblem``/``NonlinearProblem`` and reuses them -- refreshed at each
+new evaluation point -- across every block that Problem records, rather than recompiling per
+block/solve. These tests check that reuse never leaves an operator evaluated at a stale point:
+when the control appears in a way that makes ``dF/du`` genuinely depend on it, a cached-but-
+unrefreshed operator would make every Hessian computed after the first one silently wrong.
+Covers scalar and blocked (multi-field) problems, for both ``LinearProblem`` and
+``NonlinearProblem``, plus a warm-start pollution check (``test_hessian_mpi_breakdown`` --
+not actually MPI-specific, despite the name: it checks that solving at one control value in
+between two evaluations at another value doesn't perturb the second evaluation's result).
 """
 
 from mpi4py import MPI
@@ -36,9 +40,8 @@ def mesh_2D():
 def _viscous_stokes(mesh):
     """Blocked Stokes-like problem whose control ``mu`` sits inside ``a[0][0]``.
 
-    The control has to enter the bilinear form for this test to have any teeth: if it
-    only enters ``L``, dF/du is independent of the control and a stale tangent-linear
-    operator is indistinguishable from a fresh one.
+    The control is part of the bilinear form, so that dF/du!=0, and we get
+    a genuinely control-dependent tangent-linear operator.
     """
     el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
     el_p = basix.ufl.element("P", mesh.basix_cell(), 1)
@@ -52,11 +55,9 @@ def _viscous_stokes(mesh):
 
     u, p = ufl.TrialFunction(V), ufl.TrialFunction(Q)
     v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
-    # A rotational (non-conservative) body force.  A constant force would be balanced
-    # exactly by the pressure in a closed incompressible box, leaving u == 0 and making
-    # the functional independent of the control.  The 1e3 only sets the scale of the
-    # state, which keeps the Taylor remainders clear of pyadjoint's absolute
-    # machine-precision warning threshold.
+    # A rotational (non-conservative) body force.  Avoid using constant force to avoid
+    # velocity being 0 always, independent of control. Scaled to ensure decent-sized Taylor
+    # remainders.
     x = ufl.SpatialCoordinate(mesh)
     f = 1e3 * ufl.as_vector((ufl.sin(ufl.pi * x[1]), ufl.cos(ufl.pi * x[0])))
 

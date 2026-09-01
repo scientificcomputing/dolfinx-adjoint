@@ -13,6 +13,7 @@ import weakref
 
 from mpi4py import MPI
 
+import basix.ufl
 import dolfinx
 import numpy as np
 import pyadjoint
@@ -804,3 +805,112 @@ def test_default_petsc_options_prefix_is_unique_per_problem():
     # An explicitly-passed prefix must be honored unchanged.
     explicit = LinearProblem(a, L, petsc_options_prefix="my_custom_prefix_")
     assert explicit._petsc_options_prefix == "my_custom_prefix_"
+
+
+def test_nonlinear_blocked_problem_templates_compiled_once():
+    """As ``test_nonlinear_adjoint_lhs_compiled_once``/``test_nonlinear_tlm_rhs_templates_compiled_once``,
+    but for a *blocked* ``NonlinearProblem`` (a Navier-Stokes-like velocity/pressure system):
+    the adjoint solver, TLM solver, per-dependency TLM right-hand-side templates, and the
+    blocked Hessian templates (``NonlinearProblem._get_or_build_hessian_templates``'s
+    ``isinstance(self._u, list)`` branch, which otherwise has no caching-focused regression
+    coverage at all) must all be compiled exactly once and never rebuilt across repeated
+    ``derivative()``/``hessian()`` calls at different control values.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
+    el_p = basix.ufl.element("P", mesh.basix_cell(), 1)
+    V = dolfinx.fem.functionspace(mesh, el_u)
+    Q = dolfinx.fem.functionspace(mesh, el_p)
+    Z = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    dx = ufl.Measure("dx", domain=mesh)
+
+    mu = Function(Z, name="viscosity")
+    mu.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+
+    uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
+    v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
+
+    x = ufl.SpatialCoordinate(mesh)
+    f = 10.0 * ufl.as_vector((ufl.sin(ufl.pi * x[1]), ufl.cos(ufl.pi * x[0])))
+    F0 = (
+        ufl.inner(mu * ufl.grad(uh), ufl.grad(v)) * dx
+        + ufl.inner(ufl.dot(ufl.grad(uh), uh), v) * dx
+        + ufl.inner(ph, ufl.div(v)) * dx
+        - ufl.inner(f, v) * dx
+    )
+    F1 = ufl.inner(q, ufl.div(uh)) * dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets)
+    zero = dolfinx.fem.Constant(mesh, np.zeros(mesh.geometry.dim, dtype=dolfinx.default_scalar_type))
+    bc = dolfinx.fem.dirichletbc(zero, dofs, V)
+
+    forward_options = {
+        "snes_type": "newtonls",
+        "snes_error_if_not_converged": True,
+        "snes_atol": 1e-9,
+        "snes_rtol": 1e-9,
+        "snes_stol": 1e-12,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    adjoint_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = NonlinearProblem(
+        [F0, F1],
+        u=[uh, ph],
+        bcs=[bc],
+        petsc_options_prefix="dxa_blocked_nonlinear_reuse_test_",
+        petsc_options=forward_options,
+        adjoint_petsc_options=adjoint_options,
+        tlm_petsc_options=adjoint_options,
+    )
+    problem.solve()
+
+    J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
+    control = pyadjoint.Control(mu)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    dm = Function(Z)
+    dm.interpolate(lambda x: 0.2 * np.sin(3 * x[0]))
+    Jh.hessian(dm)
+
+    adjoint_solver = problem._get_or_build_adjoint_solver()
+    compiled_adjoint_lhs = adjoint_solver._a
+    assert compiled_adjoint_lhs is not None
+
+    tlm_solver = problem._get_or_build_tlm_solver()
+    compiled_tlm_lhs = tlm_solver._a
+    assert compiled_tlm_lhs is not None
+
+    tlm_templates, _, _ = problem._get_or_build_tlm_rhs_templates()
+    compiled_tlm_ids = {c: id(form) for c, form in tlm_templates.items()}
+    assert compiled_tlm_ids, "no TLM RHS templates were built"
+
+    hessian_templates = problem._get_or_build_hessian_templates()
+    assert isinstance(hessian_templates.soa_self, list), "expected a per-row list for a blocked problem"
+
+    mu2 = Function(Z)
+    mu2.interpolate(lambda x: 2.0 + np.cos(np.pi * x[0]))
+    Jh(mu2)
+    Jh.derivative()
+    Jh.hessian(dm)
+
+    assert adjoint_solver._a is compiled_adjoint_lhs, "adjoint LHS was rebuilt after evaluating at a new point"
+    assert tlm_solver._a is compiled_tlm_lhs, "TLM LHS was rebuilt after evaluating at a new point"
+
+    tlm_templates_after, _, _ = problem._get_or_build_tlm_rhs_templates()
+    for c, form in tlm_templates_after.items():
+        assert id(form) == compiled_tlm_ids[c], f"TLM RHS template for {c.name} was rebuilt"
+
+    assert problem._get_or_build_hessian_templates() is hessian_templates, (
+        "blocked Hessian templates were rebuilt after evaluating at a new point"
+    )
