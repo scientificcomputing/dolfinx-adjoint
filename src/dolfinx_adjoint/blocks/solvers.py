@@ -15,11 +15,31 @@ from dolfinx.fem.function import Function as _Function
 
 from ..types import Function
 from ..typing_utils import NestedMutableSequence
-from ..ufl_utils import assign_mixed_parts, collect_coefficients, sum_form
+from ..ufl_utils import assign_mixed_parts, sum_form
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
 if typing.TYPE_CHECKING:
     from ..solvers import LinearProblem, NonlinearProblem
+
+
+def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[Function]:
+    """Return the set of UFL coefficients appearing anywhere in ``form``.
+
+    ``form`` may be a single form or an arbitrarily nested sequence of forms
+    (entries may be ``None``, e.g. a zero block in a blocked system). Plain set
+    union rather than ``sum_form``: unlike summing, this never requires the
+    sub-forms' arguments to be mutually compatible (e.g. carry matching
+    ``part()`` tags), which a blocked ``NonlinearProblem``'s forms are not
+    required to be before ``assign_mixed_parts`` runs.
+    """
+    if form is None:
+        return set()
+    if isinstance(form, ufl.Form):
+        return set(form.coefficients())
+    coefficients: set = set()
+    for f in form:
+        coefficients |= collect_coefficients(f)
+    return coefficients
 
 
 def _map_block_variables_to_form(

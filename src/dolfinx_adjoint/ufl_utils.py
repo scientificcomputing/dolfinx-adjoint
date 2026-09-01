@@ -9,7 +9,7 @@ from .typing_utils import NestedSequence
 
 
 def recursive_space_discovery(
-    obj: NestedSequence[ufl.Form], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
+    obj: NestedSequence[ufl.Form | None], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
 ) -> None:
     """Recursively discover, for each row/column index, the function space of the
     (as yet unassigned) argument occupying that position.
@@ -34,15 +34,17 @@ def recursive_space_discovery(
         for i, item in enumerate(obj):
             if item is not None:
                 recursive_space_discovery(item, indices + (i,), spaces)
+    elif obj is None:
+        return
     else:
         raise TypeError(f"Expected ufl.Form or iterable, got {type(obj)}")
 
 
 def build_argument_replacement_map(
-    obj: NestedSequence[ufl.Form],
+    obj: NestedSequence[ufl.Form | None],
     indices: tuple[int, ...],
-    test_functions: typing.Sequence[ufl.TestFunction],
-    trial_functions: typing.Sequence[ufl.TrialFunction],
+    test_functions: typing.Sequence[ufl.Argument],
+    trial_functions: typing.Sequence[ufl.Argument],
     replace_map: dict[ufl.Argument, ufl.Argument],
 ) -> None:
     """
@@ -66,17 +68,21 @@ def build_argument_replacement_map(
         for i, item in enumerate(obj):
             if item is not None:
                 build_argument_replacement_map(item, indices + (i,), test_functions, trial_functions, replace_map)
+    elif obj is None:
+        return
+    else:
+        raise TypeError(f"Expected ufl.Form or iterable, got {type(obj)}")
 
 
 @typing.overload
-def assign_mixed_parts[T: NestedSequence[ufl.Form]](form1: T, /) -> T: ...
+def assign_mixed_parts[T: NestedSequence[ufl.Form | None]](form1: T, /) -> T: ...
 @typing.overload
-def assign_mixed_parts[T: NestedSequence[ufl.Form], S: NestedSequence[ufl.Form]](
+def assign_mixed_parts[T: NestedSequence[ufl.Form | None], S: NestedSequence[ufl.Form | None]](
     form1: T, form2: S, /
 ) -> tuple[T, S]: ...
 def assign_mixed_parts(
-    *form_structs: NestedSequence[ufl.Form],
-) -> NestedSequence[ufl.Form] | tuple[NestedSequence[ufl.Form], ...]:
+    *form_structs: NestedSequence[ufl.Form | None],
+) -> NestedSequence[ufl.Form | None] | tuple[NestedSequence[ufl.Form | None], ...]:
     """
     Recursively assigns mixed-space `part` indices to {py:class}`ufl.Argument`
     (test and trial functions), within nested iterables of forms.
@@ -106,7 +112,7 @@ def assign_mixed_parts(
         {py:class}`ufl.MixedFunctionSpace` built from the row/column function spaces
         discovered while walking the structure.
     """
-    spaces: dict[int, ufl.functionspace.AbstractFunctionSpace] = {}
+    spaces: dict[int, ufl.FunctionSpace] = {}
     for struct in form_structs:
         recursive_space_discovery(struct, (), spaces)
 
@@ -131,26 +137,6 @@ def assign_mixed_parts(
 def get_sorted_arguments(arguments: typing.Iterable[ufl.Argument], number: int) -> typing.Iterable[ufl.Argument]:
     """Extract all arguments of a given number, sorted by part."""
     return sorted(filter(lambda x: x.number() == number, arguments), key=lambda a: a.part())
-
-
-def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[ufl.Coefficient]:
-    """Return the set of UFL coefficients appearing anywhere in ``form``.
-
-    ``form`` may be a single form or an arbitrarily nested sequence of forms
-    (entries may be ``None``, e.g. a zero block in a blocked system). Plain set
-    union rather than ``sum_form``: unlike summing, this never requires the
-    sub-forms' arguments to be mutually compatible (e.g. carry matching
-    ``part()`` tags), which a blocked ``NonlinearProblem``'s forms are not
-    required to be before ``assign_mixed_parts`` runs.
-    """
-    if form is None:
-        return set()
-    if isinstance(form, ufl.Form):
-        return set(form.coefficients())
-    coefficients: set = set()
-    for f in form:
-        coefficients |= collect_coefficients(f)
-    return coefficients
 
 
 def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
@@ -195,7 +181,7 @@ def compute_adjoint(form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]
     return ufl.extract_blocks(compute_form_adjoint(form))
 
 
-def recursive_replace(form: ufl.Form | typing.Sequence | None, placeholders: dict) -> ufl.Form | typing.Sequence | None:
+def recursive_replace(form: NestedSequence[ufl.Form | None], placeholders: dict) -> NestedSequence[ufl.Form | None]:
     """Recursively apply {py:func}`ufl.replace` to a (possibly nested) form structure.
 
     Args:
