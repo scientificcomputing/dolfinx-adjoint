@@ -204,8 +204,8 @@ def _navier_stokes(mesh):
 def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh_2D):
     """``test_hessian_is_independent_of_previous_evaluation_points``'s ``NonlinearProblem``
     sibling: the same second-order Taylor test, but on a genuinely nonlinear, blocked
-    (multi-output) residual, exercising the blocked Hessian path
-    ``_ProblemBlockBase._evaluate_hessian_blocked_rhs``/``_evaluate_hessian_component_blocked``
+    (multi-output) residual, exercising the blocked Hessian path in
+    ``_ProblemBase._get_or_build_hessian_templates``/``_ProblemBlockBase.prepare_evaluate_hessian``
     for ``NonlinearProblem`` for the first time -- previously this path only ever ran for
     ``LinearProblem``.
     """

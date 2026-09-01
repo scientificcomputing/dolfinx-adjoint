@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import abc
 import typing
+import warnings
+import weakref
 
 from petsc4py import PETSc
 
@@ -10,146 +13,13 @@ import pyadjoint
 import ufl
 from dolfinx.fem.function import Function as _Function
 
-from ..compat import compute_form_adjoint
 from ..types import Function
+from ..typing_utils import NestedMutableSequence
+from ..ufl_utils import assign_mixed_parts, collect_coefficients, sum_form
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
 if typing.TYPE_CHECKING:
     from ..solvers import LinearProblem, NonlinearProblem
-
-type NestedMutableSequence[T] = T | typing.MutableSequence["NestedMutableSequence[T]"]
-type NestedSequence[T] = T | typing.Sequence["NestedSequence[T]"]
-
-
-@typing.overload
-def assign_mixed_parts[T: NestedSequence[ufl.Form]](form1: T, /) -> T: ...
-@typing.overload
-def assign_mixed_parts[T: NestedSequence[ufl.Form], S: NestedSequence[ufl.Form]](
-    form1: T, form2: S, /
-) -> tuple[T, S]: ...
-def assign_mixed_parts(
-    *form_structs: NestedSequence[ufl.Form],
-) -> NestedSequence[ufl.Form] | tuple[NestedSequence[ufl.Form], ...]:
-    """
-    Recursively assigns mixed-space `part` indices to {py:class}`ufl.Argument`
-    (test and trial functions), within nested iterables of forms.
-
-    When solving monolithic block systems in FEniCSx, the UFL arguments must have the
-    method {py:meth}`ufl.Argument.part` return the index corresponding to their block position.
-    For a block matrix (list of lists), the TestFunction corresponds to the row index, and the
-    TrialFunction corresponds to the column index.
-
-    This utility traverses arbitrary nested structures (e.g., a 2D list for the LHS
-    matrix `a` and a 1D list for the RHS vector `L` simultaneously), extracts arguments
-    that lack a part index, builds a unified replacement map, and applies it.
-
-    Args:
-        *form_structs: One or more UFL forms, or nested iterables (lists/tuples) of
-            UFL forms. Passing multiple structures (like `a` and `L`) ensures they
-            share the same replacement map, preventing mismatched compilation.
-
-    Returns:
-        The modified form structures with identical nesting and sequence types, where
-        all unassigned TestFunction and TrialFunction arguments have been mapped.
-        Returns a single structure if one was passed, otherwise returns a tuple.
-
-    Note:
-        The replacement arguments are drawn from {py:func}`ufl.TestFunctions`
-        and {py:func}`ufl.TrialFunctions` of a single
-        {py:class}`ufl.MixedFunctionSpace` built from the row/column function spaces
-        discovered while walking the structure.
-    """
-    spaces: dict[int, ufl.functionspace.AbstractFunctionSpace] = {}
-
-    def _discover_spaces(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
-        """Recursively discover, for each row/column index, the function space of the
-        (as yet unassigned) argument occupying that position.
-
-        `indices` will be `(row,)` for vectors and `(row, col)` for matrices.
-        """
-        if isinstance(obj, ufl.Form):
-            for arg in obj.arguments():
-                if arg.part() is None:
-                    # The argument number corresponds to the index of the row/column
-                    # in the nested structure
-                    num = arg.number()
-                    if num < len(indices):
-                        spaces.setdefault(indices[num], arg.ufl_function_space())
-        elif isinstance(obj, typing.Iterable):
-            for i, item in enumerate(obj):
-                if item is not None:
-                    _discover_spaces(item, indices + (i,))
-        else:
-            raise TypeError(f"Expected ufl.Form or iterable, got {type(obj)}")
-
-    for struct in form_structs:
-        _discover_spaces(struct, ())
-
-    # If no replacements are needed, exit early to save computation
-    if not spaces:
-        return form_structs if len(form_structs) > 1 else form_structs[0]
-
-    num_parts = max(spaces) + 1
-    mixed_space = ufl.MixedFunctionSpace(*(spaces[i] for i in range(num_parts)))
-    test_functions = ufl.TestFunctions(mixed_space)
-    trial_functions = ufl.TrialFunctions(mixed_space)
-
-    replace_map = {}
-
-    def _build_map(obj: NestedSequence[ufl.Form], indices: tuple[int, ...]) -> None:
-        if isinstance(obj, ufl.Form):
-            for arg in obj.arguments():
-                if arg.part() is None and arg not in replace_map:
-                    num = arg.number()
-                    if num < len(indices):
-                        replace_map[arg] = (test_functions if num == 0 else trial_functions)[indices[num]]
-        elif isinstance(obj, typing.Iterable):
-            for i, item in enumerate(obj):
-                if item is not None:
-                    _build_map(item, indices + (i,))
-
-    for struct in form_structs:
-        _build_map(struct, ())
-
-    def _replace(obj: typing.Any) -> typing.Any:
-        """
-        Recursively rebuild the structure using the populated replace_map,
-        strictly preserving original sequence types (lists vs. tuples).
-        """
-        if isinstance(obj, ufl.Form):
-            return ufl.replace(obj, replace_map)
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(_replace(item) for item in obj)
-        return obj
-
-    # Apply the replacements and unpack if necessary
-    replaced = tuple(_replace(struct) for struct in form_structs)
-    return replaced if len(replaced) > 1 else replaced[0]
-
-
-def get_sorted_arguments(arguments: typing.Iterable[ufl.Argument], number: int) -> typing.Iterable[ufl.Argument]:
-    """Extract all arguments of a given number, sorted by part."""
-    return sorted(filter(lambda x: x.number() == number, arguments), key=lambda a: a.part())
-
-
-def _collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set:
-    """Return the set of UFL coefficients appearing anywhere in ``form``.
-
-    ``form`` may be a single form or an arbitrarily nested sequence of forms
-    (entries may be ``None``, e.g. a zero block in a blocked system). Plain set
-    union rather than ``sum_form``: unlike summing, this never requires the
-    sub-forms' arguments to be mutually compatible (e.g. carry matching
-    ``part()`` tags), which a blocked ``NonlinearProblem``'s forms are not
-    required to be before ``assign_mixed_parts`` runs.
-    """
-    if form is None:
-        return set()
-    if isinstance(form, ufl.Form):
-        return set(form.coefficients())
-    coefficients: set = set()
-    for f in form:
-        coefficients |= _collect_coefficients(f)
-    return coefficients
 
 
 def _map_block_variables_to_form(
@@ -178,54 +48,32 @@ def _map_block_variables_to_form(
     return replace_map
 
 
-def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
-    """Sum a blocked form into a single form."""
-    # Handle top-level None
-    if form is None:
-        return None
-
-    if isinstance(form, ufl.Form):
-        return form
-
-    elif isinstance(form, typing.Iterable):
-        # Recursively sum items, filtering out Nones
-        valid_forms: list[ufl.Form] = []
-        for fi in form:
-            summed_fi = sum_form(fi)
-            if summed_fi is not None:
-                valid_forms.append(summed_fi)
-
-        # Handle empty case safely
-        if not valid_forms:
-            return None
-
-        # Safely sum without defaulting to integer 0, removing the need for type: ignore
-        return sum(valid_forms[1:], start=valid_forms[0])
-
-    else:
-        raise TypeError(f"Cannot sum form of type {type(form)}")
-
-
-class _ProblemBlockBase(pyadjoint.Block):
-    """Shared tape-block machinery for ``LinearProblemBlock``/``NonlinearProblemBlock``.
+class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
+    """Shared tape-block machinery for
+    {py:class}`~dolfinx_adjoint.blocks.solvers.LinearProblemBlock`/{py:class}`~dolfinx_adjoint.blocks.solvers.NonlinearProblemBlock`.
 
     Holds what is unconditionally identical or shares one implementation
     between the two Problem kinds: fetching the owning Problem, recovering
     Dirichlet BC dependencies, detecting a boundary-condition-only adjoint,
     transposing a (possibly blocked) bilinear form, the shared warm-started
-    recompute flow, and -- since ``LinearProblem._compute_residual`` and
-    ``NonlinearProblem._compute_residual`` both settle on the same output
-    shape (a single summed ``ufl.Form`` plus its dependency replacement map,
-    see each subclass's docstring) -- every first-order adjoint, TLM and
+    recompute flow, and -- since
+    {py:meth}`LinearProblemBlock._compute_residual<dolfinx_adjoint.blocks.solvers.LinearProblemBlock._compute_residual>`
+    and
+    {py:meth}`NonlinearProblemBlock._compute_residual<dolfinx_adjoint.blocks.solvers.NonlinearProblemBlock._compute_residual>`
+    both settle on the same output shape (a single summed {py:class}`ufl.Form`
+    plus its dependency replacement map, see each subclass's docstring) --
+    every first-order adjoint, TLM and
     Hessian method built *on top of* that residual, both scalar and blocked.
     Each concrete subclass still implements its own ``__init__`` (constructor
-    kwargs differ: ``a``/``L`` vs ``J``/``F``) and ``_compute_residual``
+    kwargs differ: ``a``/``L`` vs ``J``/``F``) and
+    {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._compute_residual`
     itself, since building the residual is the one place a shared algorithm
     isn't possible -- the two classes start from different user-supplied
     data.
     """
 
-    _problem_obj: typing.Any
+    _problem_ref: weakref.ReferenceType["LinearProblem | NonlinearProblem"]
+    _rebuilt_problem: "LinearProblem | NonlinearProblem | None" = None
     _bcs: typing.Sequence[dolfinx.fem.DirichletBC]
     _u: _Function | typing.Sequence[_Function]
     _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
@@ -235,113 +83,140 @@ class _ProblemBlockBase(pyadjoint.Block):
     _form_compiler_options: dict | None
     _entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None
 
-    @property
-    def _problem(self) -> typing.Any:
-        """Return this block's owning Problem, which owns the shared solvers."""
-        return self._problem_obj
+    def get_reference_problem(self) -> "LinearProblem | NonlinearProblem":
+        """Return this block's owning Problem, which owns the shared solvers.
 
+        Held via a weakref, not a strong reference: a throwaway Problem (solve it, then
+        only touch the resulting {py:class}`~pyadjoint.ReducedFunctional`) must not be
+        kept alive for as long as this Block stays reachable from the tape. If the
+        Problem has already been collected, rebuild an equivalent one from the
+        fields this Block stored at construction time (see
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._rebuild_problem`)
+        and keep a strong reference to the rebuilt Problem on this Block from then
+        on -- this is a rare, costly fallback
+        (a fresh Problem means fresh, uncompiled forms and solvers), not the common
+        path, so it warns; the strong reference amortizes that cost across every later
+        call this Block makes rather than rebuilding again on every call.
+
+        Returns:
+            This block's owning Problem (rebuilt, if necessary).
+        """
+        problem = self._problem_ref()
+        if problem is None:
+            problem = self._rebuild_problem()
+            self._problem_ref = weakref.ref(problem)
+            self._rebuilt_problem = problem
+        return problem
+
+    @abc.abstractmethod
+    def _rebuild_problem(self) -> "LinearProblem | NonlinearProblem":
+        """Reconstruct an equivalent Problem from the fields this Block stored at
+        construction time, after the original Problem has been garbage collected.
+
+        Each subclass overrides this to call its own Problem constructor
+        ({py:class}`~dolfinx_adjoint.LinearProblem`/{py:class}`~dolfinx_adjoint.NonlinearProblem`
+        take different arguments -- ``a``/``L`` vs ``F``/``J``).
+
+        Returns:
+            A freshly constructed Problem, equivalent to the one this Block was
+            originally given.
+        """
+
+    @abc.abstractmethod
     def _compute_residual(self) -> tuple[ufl.Form, dict[Function, Function]]:
         """Build this block's residual ``F(u, v) = 0`` at its checkpointed dependency values.
 
-        The one genuinely irreducible difference between the two Problem kinds: ``LinearProblem``
-        derives it from ``a``/``L`` via ``ufl.action``, ``NonlinearProblem`` already has ``F``
-        directly. Both settle on the same output shape -- a single summed ``ufl.Form`` plus its
-        dependency replacement map -- which is what lets every method built on top of this one
-        (below) be shared. Not implemented on the base; each subclass overrides it.
-        """
-        raise NotImplementedError
+        The one genuinely irreducible difference between the two Problem kinds:
+        {py:class}`~dolfinx_adjoint.LinearProblem` derives it from ``a``/``L`` via
+        {py:func}`ufl.action`, {py:class}`~dolfinx_adjoint.NonlinearProblem`
+        already has ``F`` directly. Both settle on the same output shape -- a
+        single summed {py:class}`ufl.Form` plus its dependency replacement map --
+        which is what lets every method built on top of this one (below) be
+        shared. Each subclass overrides this.
 
-    def _refresh_dFdu_state(self, problem: typing.Any) -> None:
+        Returns:
+            A ``(F_form, replacement_map)`` pair: a single summed {py:class}`ufl.Form` for the
+            residual, and the dependency-to-checkpoint replacement map used to build it.
+        """
+
+    def _refresh_dFdu_state(self, problem: "LinearProblem | NonlinearProblem") -> None:
         """Refresh whichever coefficient stands in for "the state" in ``dF/du``, if any.
 
-        A no-op by default: ``LinearProblem``'s ``dF/du`` (``a``) is bilinear and never
-        references the state at all, so there is nothing to refresh before using the shared
-        adjoint solver. ``NonlinearProblemBlock`` overrides this, since ``dF/du`` genuinely
-        depends on ``u``'s current value there -- and, unlike the TLM path (which already loops
-        over ``problem._get_or_build_tlm_rhs_templates()``'s state placeholder(s) generically),
-        neither ``prepare_evaluate_adj`` nor ``prepare_evaluate_hessian`` otherwise touches it.
+        A no-op by default: {py:class}`~dolfinx_adjoint.LinearProblem`'s ``dF/du``
+        (``a``) is bilinear and never references the state at all, so there is
+        nothing to refresh before using the shared adjoint solver.
+        {py:class}`~dolfinx_adjoint.blocks.solvers.NonlinearProblemBlock`
+        overrides this, since ``dF/du`` genuinely depends on ``u``'s current
+        value there -- and, unlike the TLM path (which already loops over
+        ``problem.residual_state_placeholder`` generically), neither
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_adj`
+        nor
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian`
+        otherwise touches it.
+
+        Args:
+            problem: This block's owning Problem (see ``self.get_reference_problem()``).
         """
-
-    def _recover_bcs(self):
-        bcs = []
-        for block_variable in self.get_dependencies():
-            c = block_variable.output
-            c_rep = block_variable.saved_output
-
-            if isinstance(c, dolfinx.fem.DirichletBC):
-                bcs.append(c_rep)
-        return bcs
-
-    def _should_compute_boundary_adjoint(
-        self, relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]]
-    ) -> bool:
-        """Determine if the adjoint should be computed with respect to the boundary conditions."""
-        bdy = False
-        for _, dep in relevant_dependencies:
-            if isinstance(dep.output, dolfinx.fem.DirichletBC):
-                bdy = True
-                break
-        return bdy
-
-    @classmethod
-    def _compute_adjoint(cls, form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
-        """
-        Compute adjoint of a bilinear form :math:`a(u, v)`, which could be written as a blocked system.
-        """
-        return ufl.extract_blocks(compute_form_adjoint(form))
+        pass
 
     def _create_replace_map(self, form: ufl.Form | NestedMutableSequence[ufl.Form] | None) -> dict[Function, Function]:
-        """Replace dependencies with latest checkpoint."""
+        """Map each dependency and output to its checkpointed value, wherever it appears in ``form``.
+
+        Args:
+            form: This block's residual (or nested block structure thereof).
+
+        Returns:
+            A dict from each coefficient (dependency or output) appearing in ``form``
+            to the {py:class}`~dolfinx_adjoint.Function` it should be replaced by (its
+            checkpointed value).
+        """
         replace_map: dict = {}
         replace_map.update(_map_block_variables_to_form(form, self.get_dependencies()))
         replace_map.update(_map_block_variables_to_form(form, self.get_outputs()))
         return replace_map
 
-    def _compute_residual_derivative(self) -> ufl.Form | list[list[ufl.Form]]:
-        """Compute the derivative of the residual with respect to the outputs.
-
-        Shared by both Problem kinds: built purely from ``self._compute_residual()``'s output
-        (a single summed form, the same shape for both classes), so no per-class override is
-        needed even though the two classes construct that residual very differently.
-        """
-        F_form, _ = self._compute_residual()
-
-        outputs = self.get_outputs()
-        # Use r.saved_output directly; no lookup in replacement_map needed!
-        r_funcs = [r.saved_output for r in outputs]
-
-        test_functions = get_sorted_arguments(F_form.arguments(), 0)
-        trial_functions = [
-            ufl.TrialFunction(output.function_space, part=arg.part())
-            for arg, output in zip(test_functions, r_funcs, strict=True)
-        ]
-
-        dFdu = ufl.derivative(F_form, r_funcs, trial_functions)
-
-        if isinstance(self._u, list):
-            return ufl.extract_blocks(dFdu)
-        return dFdu
-
     def prepare_evaluate_tlm(
         self, inputs, tlm_inputs, relevant_outputs
     ) -> typing.Sequence[Function] | dolfinx.fem.Function:
+        """Assemble and solve the tangent-linear (TLM) system for this block.
 
-        # The TLM solver -- and the compiled LHS it solves with, shared
-        # verbatim with dF/du (see *Problem._get_or_build_dFdu_template) --
-        # are shared across every block this Problem records; likewise the
-        # per-dependency TLM right-hand-side templates (see
-        # *Problem._get_or_build_tlm_rhs_templates) are each compiled once.
-        # Refresh this block's own checkpointed values into the placeholders
-        # and re-establish this block's own bcs on every call, since another
-        # block may have used the same solver in between -- but never rebuild
-        # or recompile any of these forms.
-        problem = self._problem
+        The TLM solver -- and the compiled LHS it solves with, shared verbatim with
+        dF/du (see
+        {py:meth}`*Problem._get_or_build_dFdu_template<dolfinx_adjoint.solvers._ProblemBase._get_or_build_dFdu_template>`)
+        -- are shared across every block this Problem records; likewise the
+        per-dependency TLM right-hand-side templates (see
+        {py:meth}`*Problem._get_or_build_tlm_rhs_templates<dolfinx_adjoint.solvers._ProblemBase._get_or_build_tlm_rhs_templates>`)
+        are each compiled once. Refresh this block's own checkpointed values into the
+        placeholders and re-establish this block's own bcs on every call, since
+        another block may have used the same solver in between -- but never rebuild
+        or recompile any of these forms. Only dependencies that actually have a
+        tangent-linear value this call are assembled into the right-hand side (see
+        {py:meth}`*Problem._get_or_build_tlm_rhs_templates<dolfinx_adjoint.solvers._ProblemBase._get_or_build_tlm_rhs_templates>`
+        for why an inactive dependency's term must be skipped entirely rather than
+        evaluated with a zeroed direction).
+
+        Args:
+            inputs: The dependencies' current values. Unused: each dependency is
+                visited via ``self.get_dependencies()`` instead.
+            tlm_inputs: The dependencies' tangent-linear values, parallel to
+                ``inputs``. Unused for the same reason.
+            relevant_outputs: The output block variables relevant to
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_tlm_component`.
+                Unused: this block always solves for every output at once (see
+                ``self.get_outputs()``).
+
+        Returns:
+            ``self._tlm_solutions``: this block's own tangent-linear solution(s),
+            already solved for. Passed through unchanged as ``prepared`` to every
+            subsequent {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_tlm_component` call.
+        """
+        problem = self.get_reference_problem()
         tlm_solver = problem._get_or_build_tlm_solver()
         tlm_solver.bcs = self._bcs
         templates, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
 
         for block_variable in self.get_dependencies():
-            placeholder = problem._value_placeholders.get(block_variable.output)
+            placeholder = problem.value_placeholders.get(block_variable.output)
             if placeholder is not None:
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
@@ -388,8 +263,22 @@ class _ProblemBlockBase(pyadjoint.Block):
         return self._tlm_solutions
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None) -> dolfinx.fem.Function:
-        # The system was solved natively in prepare_evaluate_tlm.
-        # Return the corresponding requested sub-function.
+        """Return this output's share of the tangent-linear solution already computed
+        by {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_tlm`.
+
+        Args:
+            inputs: The dependencies' current values. Unused.
+            tlm_inputs: The dependencies' tangent-linear values. Unused.
+            block_variable: The output block variable corresponding to ``idx``.
+                Unused: the result is read from ``prepared`` instead.
+            idx: Index of the output to return, into ``self._tlm_solutions`` if it is
+                a list (a blocked problem); ignored for a scalar problem.
+            prepared: ``self._tlm_solutions``, as returned by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_tlm`.
+
+        Returns:
+            This output's tangent-linear solution.
+        """
         if isinstance(self._tlm_solutions, list):
             return self._tlm_solutions[idx]
         else:
@@ -402,21 +291,40 @@ class _ProblemBlockBase(pyadjoint.Block):
         adj_inputs: typing.Sequence[dolfinx.la.Vector],
         relevant_dependencies: typing.List[tuple[int, pyadjoint.block_variable.BlockVariable]],
     ) -> tuple[ufl.Form, dict[Function, Function]]:
-        """Prepare the block for evaluating the adjoint."""
+        """Assemble and solve the first-order adjoint equation for this block.
 
-        # The adjoint solver -- and the compiled LHS it solves with -- are
-        # shared across every block this Problem records. Refresh this
-        # block's own checkpointed values into the placeholders, refresh
-        # whatever "state" dF/du is evaluated at if it depends on one (a
-        # no-op for LinearProblem, see _refresh_dFdu_state), and re-establish
-        # this block's own bcs on every call, since another block may have
-        # used the same solver in between -- but never rebuild or recompile
-        # the form itself.
-        problem = self._problem
+        The adjoint solver -- and the compiled LHS it solves with -- are shared
+        across every block this Problem records. Refresh this block's own
+        checkpointed values into the placeholders, refresh whatever "state" dF/du is
+        evaluated at if it depends on one (a no-op for
+        {py:class}`~dolfinx_adjoint.LinearProblem`, see
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._refresh_dFdu_state`),
+        and re-establish this block's own bcs on every call, since another block may
+        have used the same solver in between -- but never rebuild or recompile the
+        form itself.
+
+        Args:
+            inputs: The dependencies' current values. Unused: each dependency's
+                checkpointed value is read directly from ``self.get_dependencies()``.
+            adj_inputs: The adjoint seed(s) received from this block's output(s) --
+                one entry per output for a blocked problem -- assembled into the
+                adjoint equation's right-hand side.
+            relevant_dependencies: The dependency block variables relevant to
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_adj_component`.
+                Unused: every dependency is visited via ``self.get_dependencies()``
+                instead.
+
+        Returns:
+            A ``(F_form, replacement_map)`` pair -- this block's residual (from
+            ``self._compute_residual()``) and its dependency replacement map --
+            passed through unchanged as ``prepared`` to every subsequent
+            {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_adj_component` call.
+        """
+        problem = self.get_reference_problem()
         adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
         for block_variable in self.get_dependencies():
-            placeholder = problem._value_placeholders.get(block_variable.output)
+            placeholder = problem.value_placeholders.get(block_variable.output)
             if placeholder is not None:
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
@@ -468,8 +376,25 @@ class _ProblemBlockBase(pyadjoint.Block):
         idx: int,
         prepared: tuple[ufl.Form, dict[Function, Function]],
     ) -> _SpecialVector:
-        """Evaluate the adjoint component, i.e. :math:`\\frac{\\partial F}{\\partial m}`."""
+        r"""Return this dependency's contribution to the adjoint action,
+        :math:`\left(\partial F/\partial m\right)^{*}\lambda`.
 
+        Args:
+            inputs: The dependencies' current values. Unused.
+            adj_inputs: The adjoint seed(s) already consumed by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_adj`. Unused here.
+            block_variable: The dependency block variable corresponding to ``idx``.
+            idx: Index of the dependency to compute the contribution for, used to
+                select the correct mixed-space {py:meth}`ufl.Argument.part` for a blocked problem's
+                trial function.
+            prepared: The ``(F_form, replacement_map)`` pair returned by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_adj`.
+
+        Returns:
+            The assembled sensitivity vector for this dependency, where
+            :math:`\lambda` is the first-order adjoint solution
+            (``self._adjoint_solutions``).
+        """
         residual, replacement_map = prepared
         c = block_variable.output
         c_rep = block_variable.saved_output
@@ -508,10 +433,10 @@ class _ProblemBlockBase(pyadjoint.Block):
     ) -> _Function | typing.Sequence[_Function]:
         """Prepare for recomputing the block with different control inputs, and solve.
 
-        The forward solver (``self._problem``) is bound, forever, to
+        The forward solver (``self.get_reference_problem()``) is bound, forever, to
         compiled forms referencing dedicated placeholder coefficients rather
-        than the user's own dependency objects (see ``LinearProblem``/
-        ``NonlinearProblem._value_placeholders``): writing this call's
+        than the user's own dependency objects (see
+        {py:class}`~dolfinx_adjoint.solvers._ProblemBase`'s ``value_placeholders``): writing this call's
         candidate/checkpointed values into the placeholders -- never into
         ``block_variable.output`` itself -- is what the next solve sees,
         without ever mutating an object the user (or a Taylor test perturbing
@@ -519,7 +444,7 @@ class _ProblemBlockBase(pyadjoint.Block):
 
         The Problem's own unknown(s) are warm-started from this block's own
         saved outputs rather than zeroed: required for SNES/Newton
-        convergence, and applied to a KSP-based ``LinearProblem`` the same
+        convergence, and applied to a KSP-based {py:class}`~dolfinx_adjoint.LinearProblem` the same
         way, so an iterative solver configured with a nonzero initial guess
         benefits from it too -- both classes now solve by refreshing
         placeholder/unknown values and calling an unchanging, already-built
@@ -527,33 +452,48 @@ class _ProblemBlockBase(pyadjoint.Block):
         form.
 
         Solving happens once, here -- not once per output in
-        ``recompute_component`` -- which matters for a multi-output (blocked)
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.recompute_component`
+        -- which matters for a multi-output (blocked)
         problem. The base ``dolfinx`` ``solve()`` is called directly (via
         ``problem._dolfinx_solve()``), not ``problem.solve()``, which would
         record another block onto the tape.
+
+        Args:
+            inputs: The dependencies' current (candidate/checkpointed) values.
+                Unused: each dependency is visited via ``self.get_dependencies()``
+                instead.
+            relevant_outputs: The ``(idx, block_variable)`` pairs identifying which
+                of this block's own outputs the Problem's unknown(s) should be
+                warm-started from.
+
+        Returns:
+            The Problem's own (just-recomputed) unknown(s), ``problem.u`` -- shared
+            storage, not yet isolated per block;
+            {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.recompute_component`
+            below copies out this block's own share.
         """
-        problem = self._problem
+        problem = self.get_reference_problem()
         for block_variable in self.get_dependencies():
-            placeholder = problem._value_placeholders.get(block_variable.output)
+            placeholder = problem.value_placeholders.get(block_variable.output)
             if placeholder is not None:
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
 
         # Re-establish this block's own bcs on the shared forward solver (the
-        # Problem itself -- see _problem()), since another block may have
+        # Problem itself -- see _problem), since another block may have
         # used it with different bcs in between.
         problem.bcs = self._bcs
 
         # Warm-start the Problem's own unknown(s) from this block's own saved
         # outputs.
-        u_list = problem._u if isinstance(problem._u, list) else [problem._u]
+        u_list = problem.u if isinstance(problem.u, list) else [problem.u]
         for idx, out_bv in relevant_outputs:
             u_list[idx].x.array[:] = out_bv.saved_output.x.array[:]
             u_list[idx].x.scatter_forward()
 
         with pyadjoint.stop_annotating():
             problem._dolfinx_solve()
-        return problem._u
+        return problem.u
 
     def recompute_component(
         self,
@@ -562,7 +502,23 @@ class _ProblemBlockBase(pyadjoint.Block):
         idx: int,
         prepared: _Function | typing.Sequence[_Function],
     ) -> Function:
-        """Return an isolated copy of this block's own share of the already-recomputed state."""
+        """Return an isolated copy of this block's own share of the already-recomputed state.
+
+        Args:
+            inputs: The dependencies' current values. Unused.
+            block_variable: The output block variable corresponding to ``idx``.
+                Unused: the result is read from ``prepared`` instead.
+            idx: Index of the output to return, into ``prepared`` if it is a
+                sequence (a blocked problem); ignored for a scalar problem.
+            prepared: The Problem's own unknown(s), as returned by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_recompute_component`
+                -- shared storage the Problem itself still owns.
+
+        Returns:
+            An isolated copy of this output, so this tape block's own checkpoint
+            stays stable even if the shared Problem's unknown is later overwritten
+            by another block's recompute.
+        """
         if isinstance(prepared, dolfinx.fem.Function):
             assert idx == 0
             # Return an explicit copy so each tape block gets an isolated state snapshot
@@ -574,17 +530,37 @@ class _ProblemBlockBase(pyadjoint.Block):
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
         """Assemble and solve the second-order-adjoint (SOA) equation.
 
-        Scalar (single-output) problems share one implementation for both
-        Problem kinds, built entirely from the Problem's cached Hessian/TLM
-        templates (see ``HessianTemplates``) -- no block-specific residual
-        construction needed, since the SOA self-term is already correctly
-        zero/nonzero per class (see ``_build_soa_self_template``). A blocked
-        (multi-output) problem has no templated fast path; its right-hand
-        side is assembled by ``_evaluate_hessian_blocked_rhs``, also shared
-        by both Problem kinds, built from ``_compute_residual_derivative``/
-        ``_compute_adjoint`` -- themselves built only from the per-class
-        ``_compute_residual`` hook (the two Problem kinds start from
-        different user-supplied data there).
+        Shared by both Problem kinds and both scalar and blocked problems, built
+        entirely from the Problem's cached Hessian/TLM templates (see
+        {py:class}`~dolfinx_adjoint.solvers.HessianTemplates`) -- no
+        block-specific residual construction needed, since the SOA self-term is
+        already correctly zero/nonzero per class (see
+        {py:func}`~dolfinx_adjoint.solvers._build_soa_self_template`) and, for a
+        blocked problem, already split into one compiled form per output row (see
+        {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
+
+        Args:
+            inputs: The dependencies' current values. Unused.
+            hessian_inputs: The Hessian seed(s) received from this block's output(s)
+                -- one entry per output for a blocked problem -- added into the
+                second-order-adjoint equation's right-hand side.
+            adj_inputs: The first-order adjoint seed(s). Unused: the first-order
+                adjoint solution needed here was already solved for and cached in
+                ``self._adjoint_solutions`` by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_adj`.
+            relevant_dependencies: The dependency block variables relevant to
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_hessian_component`.
+                Unused: every dependency is visited via ``self.get_dependencies()``
+                instead.
+
+        Returns:
+            A ``(residual, adjoint_solution, second_adjoint_solution)`` tuple -- this
+            block's residual (from ``self._compute_residual()``) and both adjoint
+            solutions -- passed through unchanged as ``prepared`` to every
+            subsequent
+            {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_hessian_component`
+            call. ``None`` if there is nothing to do (no Hessian input, or no
+            dependency has a tangent-linear value).
         """
         outputs = self.get_outputs()
         tlm_output = [output.tlm_value for output in outputs if output is not None]
@@ -598,31 +574,48 @@ class _ProblemBlockBase(pyadjoint.Block):
         # block's own bcs on every call, since another block may have used
         # the same solver in between -- but never rebuild or recompile the
         # LHS itself.
-        problem = self._problem
+        problem = self.get_reference_problem()
         adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
         for block_variable in self.get_dependencies():
-            placeholder = problem._value_placeholders.get(block_variable.output)
+            placeholder = problem.value_placeholders.get(block_variable.output)
             if placeholder is not None:
                 placeholder.x.array[:] = block_variable.saved_output.x.array[:]
                 placeholder.x.scatter_forward()
-        self._refresh_dFdu_state(problem)
+
+        # Use the cached per-dependency Hessian templates (see
+        # *Problem._get_or_build_hessian_templates) instead of rebuilding and
+        # recompiling the SOA right-hand side symbolically on every call.
+        # Refreshing the state placeholder here subsumes _refresh_dFdu_state's
+        # no-op-for-Linear/state-only-for-Nonlinear distinction: the Hessian's
+        # own F_template/L1 depend on the state's value for *both* classes
+        # (Linear's F_template is action(a, state) - L, genuinely state-valued),
+        # unlike dF/du itself, which only Nonlinear's depends on.
+        _, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
+        hessian_templates = problem._get_or_build_hessian_templates()
+
+        state_list = state_placeholder if isinstance(state_placeholder, list) else [state_placeholder]
+        adj_sol_placeholders = problem.adjoint_solution_placeholder
+        adj_sol_placeholder_list = (
+            adj_sol_placeholders if isinstance(adj_sol_placeholders, list) else [adj_sol_placeholders]
+        )
+        adjoint_solutions_list = (
+            self._adjoint_solutions if isinstance(self._adjoint_solutions, list) else [self._adjoint_solutions]
+        )
+        hessian_u_seed = problem.hessian_u_seed
+        hessian_u_seed_list = hessian_u_seed if isinstance(hessian_u_seed, list) else [hessian_u_seed]
+
+        for placeholder, out_bv in zip(state_list, outputs, strict=True):
+            placeholder.x.array[:] = out_bv.saved_output.x.array[:]
+            placeholder.x.scatter_forward()
+        for placeholder, adj_sol in zip(adj_sol_placeholder_list, adjoint_solutions_list, strict=True):
+            placeholder.x.array[:] = adj_sol.x.array[:]
+            placeholder.x.scatter_forward()
+        for placeholder, tlm_val in zip(hessian_u_seed_list, tlm_output, strict=True):
+            placeholder.x.array[:] = tlm_val.x.array[:]
+            placeholder.x.scatter_forward()
 
         if len(outputs) == 1:
-            # Use the cached per-dependency Hessian templates (see
-            # *Problem._get_or_build_hessian_templates) instead of rebuilding
-            # and recompiling the SOA right-hand side symbolically on every
-            # call.
-            _, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
-            hessian_templates = problem._get_or_build_hessian_templates()
-
-            state_placeholder.x.array[:] = outputs[0].saved_output.x.array[:]  # type: ignore[union-attr]
-            state_placeholder.x.scatter_forward()  # type: ignore[union-attr]
-            problem._adjoint_solution_placeholder.x.array[:] = self._adjoint_solutions.x.array[:]  # type: ignore[union-attr]
-            problem._adjoint_solution_placeholder.x.scatter_forward()  # type: ignore[union-attr]
-            problem._hessian_u_seed.x.array[:] = tlm_output[0].x.array[:]  # type: ignore[union-attr]
-            problem._hessian_u_seed.x.scatter_forward()  # type: ignore[union-attr]
-
             b = adjoint_solver.b
             with b.localForm() as b_loc:
                 b_loc.set(0.0)
@@ -648,7 +641,44 @@ class _ProblemBlockBase(pyadjoint.Block):
                 b_loc.array[:] += hessian_inputs[0].array[:]
             b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
         else:
-            self._evaluate_hessian_blocked_rhs(adjoint_solver, hessian_inputs, tlm_output, relevant_dependencies)
+            assert isinstance(hessian_templates.soa_self, list)
+            bs = []
+            for i, soa_self_i in enumerate(hessian_templates.soa_self):
+                out_i = outputs[i].saved_output
+                bi = dolfinx.la.vector(out_i.function_space.dofmap.index_map, out_i.function_space.dofmap.index_map_bs)
+                bi.array[:] = 0.0
+                dolfinx.fem.assemble_vector(bi.array, soa_self_i)
+                bs.append(bi)
+
+            for block_variable in self.get_dependencies():
+                tlm_input = block_variable.tlm_value
+                if tlm_input is None:
+                    continue
+                c = block_variable.output
+                if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
+                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+                templates = hessian_templates.soa_cross.get(c)
+                if templates is None:
+                    continue
+                seed = seed_placeholders[c]
+                seed.x.array[:] = tlm_input.x.array[:]
+                seed.x.scatter_forward()
+                for bi, template_i in zip(bs, templates, strict=True):
+                    dolfinx.fem.assemble_vector(bi.array, template_i)
+
+            for i, bi in enumerate(bs):
+                bi.scatter_reverse(dolfinx.la.InsertMode.add)
+                bi.scatter_forward()
+                bi.array[:] *= -1
+                hess_input = hessian_inputs[i]
+                if hess_input is not None:
+                    bi.array[:] += hess_input.array
+                bi.scatter_forward()
+
+            b = adjoint_solver.b
+            local_arrays = [bi.array[: bi.index_map.size_local * bi.block_size] for bi in bs]
+            dolfinx.la.petsc.assign(local_arrays, b)
+            b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
 
         # The SOA (second-order-adjoint) equation shares its LHS verbatim with
         # the first-order adjoint equation (both are adjoint(dF/du)) --
@@ -660,83 +690,24 @@ class _ProblemBlockBase(pyadjoint.Block):
                 adj_sol.x.array[:] = sol.x.array[:]
         else:
             self._second_adjoint_solutions.x.array[:] = adjoint_solver.u.x.array[:]
-            if len(outputs) == 1:
-                problem._second_adjoint_solution_placeholder.x.array[:] = (  # type: ignore[union-attr]
-                    self._second_adjoint_solutions.x.array[:]
-                )
-                problem._second_adjoint_solution_placeholder.x.scatter_forward()  # type: ignore[union-attr]
+
+        # fixed/cross (used by evaluate_hessian_component below) depend on
+        # problem.second_adjoint_solution_placeholder's current value for
+        # both scalar and blocked problems -- refresh it here regardless.
+        second_adjoint_solutions_list = (
+            self._second_adjoint_solutions
+            if isinstance(self._second_adjoint_solutions, list)
+            else [self._second_adjoint_solutions]
+        )
+        second_adj_placeholders = problem.second_adjoint_solution_placeholder
+        second_adj_placeholder_list = (
+            second_adj_placeholders if isinstance(second_adj_placeholders, list) else [second_adj_placeholders]
+        )
+        for placeholder, sol in zip(second_adj_placeholder_list, second_adjoint_solutions_list, strict=True):
+            placeholder.x.array[:] = sol.x.array[:]
+            placeholder.x.scatter_forward()
 
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
-
-    def _evaluate_hessian_blocked_rhs(self, adjoint_solver, hessian_inputs, tlm_output, relevant_dependencies):
-        """Assemble the SOA right-hand side for a blocked (multi-output) problem into ``adjoint_solver.b``.
-
-        No templated fast path exists for a blocked problem (see
-        ``*Problem._get_or_build_hessian_templates``): the right-hand side is built symbolically,
-        per call, from ``_compute_residual_derivative``/``_compute_adjoint`` -- the same two
-        hooks the scalar path's templates are themselves built from -- so this one implementation
-        is shared by both Problem kinds. ``d2Fdu2`` (the SOA self-term) is always included
-        unconditionally rather than asserted zero: it comes out zero for a linear residual as a
-        result of the maths, exactly like ``_build_soa_self_template``'s scalar-path self-term --
-        and, mirroring that helper, is reduced from bilinear (test and trial) to linear (test
-        only) by adjointing and acting on the first-order adjoint solution before use, since
-        ``ufl.derivative`` w.r.t. a *coefficient* (``unknowns``) leaves ``dF/du``'s own trial
-        argument untouched.
-        """
-        dFdu_form = self._compute_residual_derivative()
-        unknowns = [output.saved_output for output in self.get_outputs()]
-        summed_form = sum_form(dFdu_form)
-        d2Fdu2 = ufl.algorithms.expand_derivatives(ufl.derivative(summed_form, unknowns, tlm_output))
-
-        if d2Fdu2.empty():
-            b_form = d2Fdu2
-        else:
-            b_form = ufl.action(ufl.adjoint(d2Fdu2), self._adjoint_solutions)
-        dFdu_adj = self._compute_adjoint(sum_form(dFdu_form))
-        for bo in self.get_dependencies():
-            c = bo.output
-            c_rep = bo.saved_output
-            tlm_input = bo.tlm_value
-            if tlm_input is None:
-                continue
-            if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
-                raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
-            else:
-                summed_form = sum_form(dFdu_adj)
-                dFdu_adj_applied = ufl.action(summed_form, self._adjoint_solutions)
-                b_form += ufl.derivative(dFdu_adj_applied, c_rep, tlm_input)
-
-        bs = []
-        b_form = ufl.extract_blocks(b_form)
-        for i, hess_input in enumerate(hessian_inputs):
-            if hess_input is not None:
-                bi = dolfinx.la.vector(hess_input.index_map, hess_input.block_size)
-            else:
-                out_i = self.get_outputs()[i].saved_output
-                bi = dolfinx.la.vector(out_i.function_space.dofmap.index_map, out_i.function_space.dofmap.index_map_bs)
-            bs.append(bi)
-            bi.array[:] = 0.0
-            form_i = ufl.algorithms.apply_derivatives.apply_derivatives(b_form[i])
-            if not form_i.empty():
-                compiled_soa_rhs = dolfinx.fem.form(
-                    form_i,
-                    jit_options=self._jit_options,
-                    form_compiler_options=self._form_compiler_options,
-                    entity_maps=self._entity_maps,
-                )
-                dolfinx.fem.assemble_vector(bi.array, compiled_soa_rhs)
-                bi.scatter_reverse(dolfinx.la.InsertMode.add)
-                bi.scatter_forward()
-                bi.array[:] *= -1
-
-            if hess_input is not None:
-                bi.array[:] += hess_input.array
-
-            bi.scatter_forward()
-        b = adjoint_solver.b
-        local_arrays = [bi.array[: bi.index_map.size_local * bi.block_size] for bi in bs]
-        dolfinx.la.petsc.assign(local_arrays, b)
-        b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
 
     def evaluate_hessian_component(
         self,
@@ -750,15 +721,33 @@ class _ProblemBlockBase(pyadjoint.Block):
     ):
         """Return this dependency's contribution to the Hessian action.
 
-        Scalar (single-output) problems share one implementation for both
-        Problem kinds (see ``prepare_evaluate_hessian``); a blocked
-        (multi-output) problem falls back to
-        ``_evaluate_hessian_component_blocked``.
+        Shared by both Problem kinds and both scalar and blocked problems, built
+        entirely from the Problem's cached Hessian templates -- ``fixed``/``cross``
+        have the same per-dependency (not per-output-row) shape regardless of
+        blocking, since they live on the *control's* own test space, not the
+        (possibly blocked) state's (see {py:class}`~dolfinx_adjoint.solvers.HessianTemplates`).
+
+        Args:
+            inputs: The dependencies' current values. Unused.
+            hessian_inputs: The Hessian seed(s) already consumed by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian`. Unused here.
+            adj_inputs: The first-order adjoint seed(s). Unused.
+            block_variable: The dependency block variable corresponding to ``idx``.
+            idx: Index of the dependency to compute the contribution for. Unused
+                directly: ``block_variable.output``/``.saved_output`` identify the
+                dependency instead.
+            relevant_dependencies: The ``(idx, block_variable)`` pairs for every
+                other dependency that may contribute a cross term.
+            prepared: The ``(residual, adjoint_solution, second_adjoint_solution)``
+                tuple returned by
+                {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian`.
+                Unused here: every quantity it carries was already used to
+                refresh the cached templates' placeholders there.
+
+        Returns:
+            The assembled Hessian-action contribution for this dependency.
         """
         c = block_variable.output
-        residual_prepared, adj_sol, adj_sol2 = prepared
-        outputs = self.get_outputs()
-        tlm_output = [output.tlm_value for output in outputs]
         c_rep = block_variable.saved_output
 
         # If m = DirichletBC then d^2F(u,m)/dm^2 = 0 and d^2F(u,m)/dudm = 0,
@@ -777,115 +766,40 @@ class _ProblemBlockBase(pyadjoint.Block):
             assert isinstance(c, dolfinx.fem.Function)
             W = c.function_space
 
-        if len(outputs) == 1:
-            # Use the cached per-dependency Hessian templates instead of
-            # rebuilding and recompiling the Hessian-action output
-            # symbolically on every call. All the placeholders these
-            # templates reference (the dependency values, the state, and both
-            # adjoint solutions) were already refreshed by
-            # prepare_evaluate_hessian above; only the per-dependency
-            # "direction" seeds need setting here, and only for dependencies
-            # that actually have a tangent-linear value this call -- see
-            # *Problem._get_or_build_hessian_templates for why an inactive
-            # dependency's cross term must be skipped entirely rather than
-            # evaluated with a zeroed direction.
-            problem = self._problem
-            hessian_templates = problem._get_or_build_hessian_templates()
-            _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
+        # Use the cached per-dependency Hessian templates instead of
+        # rebuilding and recompiling the Hessian-action output symbolically
+        # on every call. All the placeholders these templates reference (the
+        # dependency values, the state, and both adjoint solutions) were
+        # already refreshed by prepare_evaluate_hessian above; only the
+        # per-dependency "direction" seeds need setting here, and only for
+        # dependencies that actually have a tangent-linear value this call --
+        # see *Problem._get_or_build_hessian_templates for why an inactive
+        # dependency's cross term must be skipped entirely rather than
+        # evaluated with a zeroed direction.
+        problem = self.get_reference_problem()
+        hessian_templates = problem._get_or_build_hessian_templates()
+        _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
 
-            fixed_template = hessian_templates.fixed[c]
-            hessian_output = _create_vector(fixed_template, W)
-            hessian_output.array[:] = 0.0
-            assemble_compiled_form(fixed_template, hessian_output)
+        fixed_template = hessian_templates.fixed[c]
+        hessian_output = _create_vector(fixed_template, W)
+        hessian_output.array[:] = 0.0
+        assemble_compiled_form(fixed_template, hessian_output)
 
-            for _, bv in relevant_dependencies:
-                c2 = bv.output
-                if isinstance(c2, dolfinx.fem.DirichletBC):
-                    continue
-                tlm_input = bv.tlm_value
-                if tlm_input is None:
-                    continue
-                template = hessian_templates.cross.get((c, c2))
-                if template is None:
-                    continue
-                seed2 = seed_placeholders[c2]
-                seed2.x.array[:] = tlm_input.x.array[:]
-                seed2.x.scatter_forward()
-                assemble_compiled_form(template, hessian_output)
-
-            hessian_output.array[:] *= -1.0
-            return hessian_output
-
-        return self._evaluate_hessian_component_blocked(
-            residual_prepared, adj_sol, adj_sol2, c, c_rep, W, tlm_output, relevant_dependencies
-        )
-
-    def _evaluate_hessian_component_blocked(
-        self, residual_prepared, adj_sol, adj_sol2, c, c_rep, W, tlm_output, relevant_dependencies
-    ):
-        """Return this dependency's Hessian-action contribution for a blocked (multi-output) problem.
-
-        No templated fast path exists for a blocked problem; this builds it symbolically, per
-        call, from the residual ``prepare_evaluate_hessian`` already recorded
-        (``residual_prepared``) -- shared by both Problem kinds, since both settle on the same
-        ``_compute_residual`` output shape.
-
-        We are trying to compute (dF/dm)^T lambda_1
-        and (dF_dm)^T lambda_ 2. However, standard approach of UFL
-        does not work for MixedFunctionSpaces, as the control space is not
-        mixed. Therefore, we instead we compute it as dL/dm = d(lambda_i^T F(m))/dm,
-        which is equivalent.
-        """
-        F_form, replacement_map = residual_prepared
-        outputs = self.get_outputs()
-
-        F_summed = sum_form(F_form)
-        L1 = ufl.action(F_summed, adj_sol)
-        L2 = ufl.action(F_summed, adj_sol2)
-
-        # Compute first derivatives (1-forms tested exactly against the single 'dc' object)
-        dc = ufl.TestFunction(W)
-        assert c_rep in replacement_map.values()
-        dL1dm = ufl.derivative(L1, c_rep, dc)
-        dL2dm = ufl.derivative(L2, c_rep, dc)
-
-        sa = [output.saved_output for output in outputs]
-        d2Fdudm = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, sa, tlm_output))
-
-        d2Fdm2 = ufl.ZeroBaseForm((dc,))  # Initialize the second derivative form
-        # We need to add terms from every other dependency
-        # i.e. the terms d^2F/dm_1dm_2
         for _, bv in relevant_dependencies:
             c2 = bv.output
-            c2_rep = bv.saved_output
-
             if isinstance(c2, dolfinx.fem.DirichletBC):
                 continue
             tlm_input = bv.tlm_value
             if tlm_input is None:
                 continue
+            template = hessian_templates.cross.get((c, c2))
+            if template is None:
+                continue
+            seed2 = seed_placeholders[c2]
+            seed2.x.array[:] = tlm_input.x.array[:]
+            seed2.x.scatter_forward()
+            assemble_compiled_form(template, hessian_output)
 
-            if isinstance(c2_rep, dolfinx.mesh.Mesh):
-                X = ufl.SpatialCoordinate(c2_rep)
-                d2Fdm2 += ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, X, tlm_input))
-            else:
-                d2Fdm2 += ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, c2_rep, tlm_input))
-
-        hessian_form = ufl.algorithms.expand_derivatives(d2Fdm2 + dL2dm + d2Fdudm)
-
-        compiled_hessian = dolfinx.fem.form(
-            hessian_form,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
-        )
-
-        test_functions = get_sorted_arguments(hessian_form.arguments(), 0)
-        assert len(test_functions) == 1
-        hessian_output = _create_vector(compiled_hessian, test_functions[0].ufl_function_space())
-
-        hessian_output.array[:] = 0.0
-        assemble_compiled_form(compiled_hessian, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output
 
@@ -913,6 +827,11 @@ class LinearProblemBlock(_ProblemBlockBase):
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        kind: typing.Any = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         ad_block_tag: str | None = None,
         problem: "LinearProblem" = ...,
     ) -> None: ...
@@ -929,6 +848,11 @@ class LinearProblemBlock(_ProblemBlockBase):
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        kind: typing.Any = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         ad_block_tag: str | None = None,
         problem: "LinearProblem" = ...,
     ) -> None: ...
@@ -944,20 +868,30 @@ class LinearProblemBlock(_ProblemBlockBase):
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        kind: typing.Any = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         ad_block_tag: str | None = None,
         problem: "LinearProblem" = None,  # type: ignore[assignment]
     ) -> None:
 
         assert problem is not None, "problem must be provided."
-        # Strong reference, deliberately: a throwaway LinearProblem (solve it,
-        # then only touch the ReducedFunctional) is a common pattern, so the
-        # block must keep the Problem -- and its shared solvers -- alive for
-        # as long as the block itself is reachable. Not cyclic garbage on its
-        # own (verified), so this doesn't reintroduce the MPI
-        # collective-destruction hazard from dolfinx-adjoint-knowledge's
-        # mpi-collective-destruction-hazard note -- that needs an unmerged
-        # checkpoint schedule making the *tape* cyclic.
-        self._problem_obj = problem
+        # Held via a weakref, not a strong reference: a throwaway LinearProblem
+        # (solve it, then only touch the ReducedFunctional) must not be kept
+        # alive for as long as this Block is reachable from the tape. The
+        # remaining constructor arguments cached below (kind/petsc_options/...)
+        # are not needed for this Block's own forward/adjoint/TLM/Hessian math
+        # -- that all lives on `problem` -- they exist solely to let
+        # _rebuild_problem() reconstruct an equivalent LinearProblem if the
+        # original one is ever collected while this Block still needs it.
+        self._problem_ref = weakref.ref(problem)
+        self._kind = kind
+        self._petsc_options = petsc_options
+        self._petsc_options_prefix = petsc_options_prefix
+        self._adjoint_petsc_options = adjoint_petsc_options
+        self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
 
         # Collect all arguments in variational forms and replace them with similar
@@ -1032,7 +966,7 @@ class LinearProblemBlock(_ProblemBlockBase):
                     self.add_dependency(bc, no_duplicates=True)
 
         # No forward/adjoint/TLM solver is built here: this block shares the
-        # ones owned by self._problem (see LinearProblem in ../solvers.py),
+        # ones owned by self.get_reference_problem() (see LinearProblem in ../solvers.py),
         # built once and reused across every block that Problem records
         # instead of once per solve() call.
 
@@ -1049,6 +983,10 @@ class LinearProblemBlock(_ProblemBlockBase):
     def _compute_residual(self) -> tuple[ufl.Form, dict[Function, Function]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where
         :math:`u_b` is the solution of the forward problem at the current time and all coefficients are updated.
+
+        Returns:
+            A ``(F_form, replacement_map)`` pair, per
+            {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._compute_residual`.
         """
         # NOTE: Should probably be possible to compile this form once.
         replacement_functions = self.get_outputs()
@@ -1063,11 +1001,43 @@ class LinearProblemBlock(_ProblemBlockBase):
         F_form = ufl.replace(F_form, replacement_map)
         return F_form, replacement_map
 
+    def _rebuild_problem(self) -> "LinearProblem":
+        """See {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._rebuild_problem`.
+
+        Returns:
+            A freshly constructed {py:class}`~dolfinx_adjoint.LinearProblem`, built from the ``a``/``L``/bcs/
+            options this block itself stored at construction time.
+        """
+        from ..solvers import LinearProblem
+
+        warnings.warn(
+            "This block's LinearProblem was garbage collected before being "
+            "recomputed/differentiated; rebuilding an equivalent one. Keep the "
+            "LinearProblem object alive for as long as its blocks may need "
+            "replay to avoid this cost.",
+            stacklevel=4,
+        )
+        return LinearProblem(
+            self._lhs,  # type: ignore[arg-type]
+            self._rhs,  # type: ignore[arg-type]
+            bcs=self._bcs,
+            u=self._u,  # type: ignore[arg-type]
+            P=self._preconditioner,  # type: ignore[arg-type]
+            kind=self._kind,
+            petsc_options=self._petsc_options,
+            petsc_options_prefix=self._petsc_options_prefix,
+            adjoint_petsc_options=self._adjoint_petsc_options,
+            tlm_petsc_options=self._tlm_petsc_options,
+            form_compiler_options=self._form_compiler_options,
+            jit_options=self._jit_options,
+            entity_maps=self._entity_maps,
+        )  # type: ignore[misc]
+
 
 class NonlinearProblemBlock(_ProblemBlockBase):
-    """A linear problem that can be used with adjoint methods.
+    """A nonlinear problem that can be used with adjoint methods.
 
-    This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
+    This class extends the `dolfinx.fem.petsc.NonlinearProblem` to support adjoint methods.
     """
 
     _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
@@ -1086,6 +1056,11 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        kind: typing.Any = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         ad_block_tag: str | None = None,
         problem: "NonlinearProblem" = ...,
     ) -> None: ...
@@ -1101,6 +1076,11 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        kind: typing.Any = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         ad_block_tag: str | None = None,
         problem: "NonlinearProblem" = ...,
     ) -> None: ...
@@ -1115,14 +1095,28 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
+        kind: typing.Any = None,
+        petsc_options: dict | None = None,
+        petsc_options_prefix: str | None = None,
+        adjoint_petsc_options: dict | None = None,
+        tlm_petsc_options: dict | None = None,
         ad_block_tag: str | None = None,
         problem: "NonlinearProblem" = None,  # type: ignore[assignment]
     ) -> None:
 
         assert problem is not None, "problem must be provided."
-        # See LinearProblemBlock.__init__ for the rationale for holding a
-        # plain (strong) reference here.
-        self._problem_obj = problem
+        # Held via a weakref -- see LinearProblemBlock.__init__ for the
+        # rationale. The remaining constructor arguments cached below are not
+        # needed for this Block's own math (that all lives on `problem`);
+        # they exist solely for _rebuild_problem() to reconstruct an
+        # equivalent NonlinearProblem if the original one is ever collected
+        # while this Block still needs it.
+        self._problem_ref = weakref.ref(problem)
+        self._kind = kind
+        self._petsc_options = petsc_options
+        self._petsc_options_prefix = petsc_options_prefix
+        self._adjoint_petsc_options = adjoint_petsc_options
+        self._tlm_petsc_options = tlm_petsc_options
         super().__init__(ad_block_tag=ad_block_tag)
         self._preconditioner = P
 
@@ -1140,12 +1134,15 @@ class NonlinearProblemBlock(_ProblemBlockBase):
             assert isinstance(F, typing.Iterable)
             replace_dict = {ui: _ui for ui, _ui in zip(u, self._u)}
             self._rhs = [ufl.replace(Fi, replace_dict) for Fi in F]
+        # Kept only for _rebuild_problem() -- see NonlinearProblem.__init__'s
+        # own self._user_J for why this must never be read for anything else.
+        self._user_J = J
 
         # NOTE: Add mesh and constants as dependencies later on
         u_list = self._u if isinstance(self._u, list) else [self._u]
-        for c in _collect_coefficients(J) - set(u_list):
+        for c in collect_coefficients(J) - set(u_list):
             self.add_dependency(c, no_duplicates=True)
-        for c in _collect_coefficients(self._rhs) - set(u_list):
+        for c in collect_coefficients(self._rhs) - set(u_list):
             self.add_dependency(c, no_duplicates=True)
 
         # Cache form parameters for later
@@ -1156,7 +1153,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self._bcs = bcs if bcs is not None else []
 
         # No forward/adjoint solver is built here: this block shares the ones
-        # owned by self._problem (see NonlinearProblem in ../solvers.py),
+        # owned by self.get_reference_problem() (see NonlinearProblem in ../solvers.py),
         # built once and reused across every block that Problem records
         # instead of once per solve() call.
 
@@ -1173,11 +1170,17 @@ class NonlinearProblemBlock(_ProblemBlockBase):
     def _compute_residual(self) -> tuple[ufl.Form, dict[Function, Function]]:
         """Build the residual :math:`F(u_b, v) = 0` at the current checkpointed dependency values.
 
-        Unlike ``LinearProblemBlock`` (which derives ``F`` from ``a``/``L`` via ``ufl.action``),
-        ``F`` is already the residual here -- this only needs to substitute in the checkpointed
+        Unlike {py:class}`~dolfinx_adjoint.blocks.solvers.LinearProblemBlock` (which
+        derives ``F`` from ``a``/``L`` via {py:func}`ufl.action`), ``F`` is already
+        the residual here -- this only needs to substitute in the checkpointed
         dependency and output values. Settles on the same output shape as
-        ``LinearProblemBlock._compute_residual`` (a single summed form plus its replacement map)
-        so every method built on top of it (adjoint, TLM, Hessian) is shared on the base class.
+        {py:meth}`~dolfinx_adjoint.blocks.solvers.LinearProblemBlock._compute_residual`
+        (a single summed form plus its replacement map) so every method built on
+        top of it (adjoint, TLM, Hessian) is shared on the base class.
+
+        Returns:
+            A ``(F_form, replacement_map)`` pair, per
+            {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._compute_residual`.
         """
         replacement_functions = self.get_outputs()
         replacement_map = self._create_replace_map(self._rhs)
@@ -1189,15 +1192,50 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         F_form = ufl.replace(sum_form(self._rhs), replacement_map)
         return F_form, replacement_map
 
-    def _refresh_dFdu_state(self, problem: typing.Any) -> None:
+    def _rebuild_problem(self) -> "NonlinearProblem":
+        """See {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._rebuild_problem`.
+
+        Returns:
+            A freshly constructed {py:class}`~dolfinx_adjoint.NonlinearProblem`, built from the ``F``/``J``/
+            bcs/options this block itself stored at construction time.
+        """
+        from ..solvers import NonlinearProblem
+
+        warnings.warn(
+            "This block's NonlinearProblem was garbage collected before being "
+            "recomputed/differentiated; rebuilding an equivalent one. Keep the "
+            "NonlinearProblem object alive for as long as its blocks may need "
+            "replay to avoid this cost.",
+            stacklevel=4,
+        )
+        return NonlinearProblem(
+            self._rhs,  # type: ignore[arg-type]
+            u=self._u,  # type: ignore[arg-type]
+            bcs=self._bcs,
+            J=self._user_J,  # type: ignore[arg-type]
+            P=self._preconditioner,  # type: ignore[arg-type]
+            kind=self._kind,
+            petsc_options=self._petsc_options,
+            petsc_options_prefix=self._petsc_options_prefix,
+            adjoint_petsc_options=self._adjoint_petsc_options,
+            tlm_petsc_options=self._tlm_petsc_options,
+            form_compiler_options=self._form_compiler_options,
+            jit_options=self._jit_options,
+            entity_maps=self._entity_maps,
+        )  # type: ignore[misc]
+
+    def _refresh_dFdu_state(self, problem: "LinearProblem | NonlinearProblem") -> None:
         """Refresh ``problem``'s "state" placeholder(s) from this block's own saved outputs.
 
-        Unlike ``LinearProblem`` (where ``dF/du`` never references the state), ``dF/du`` here
+        Unlike {py:class}`~dolfinx_adjoint.LinearProblem` (where ``dF/du`` never references the state), ``dF/du`` here
         genuinely depends on ``u``'s current value, so the shared adjoint solver's compiled LHS
         must be evaluated at *this* block's checkpointed output before it is used -- another
         block sharing the same solver may have left a different value there.
+
+        Args:
+            problem: This block's owning Problem (see ``self.get_reference_problem()``).
         """
-        state_placeholder = problem._residual_state_placeholder
+        state_placeholder = problem.residual_state_placeholder
         state_list = state_placeholder if isinstance(state_placeholder, list) else [state_placeholder]
         for placeholder, out_bv in zip(state_list, self.get_outputs(), strict=True):
             placeholder.x.array[:] = out_bv.saved_output.x.array[:]

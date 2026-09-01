@@ -16,6 +16,7 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pyadjoint
+import pytest
 import ufl
 
 from dolfinx_adjoint import Function, LinearProblem, NonlinearProblem, assemble_scalar, assign
@@ -557,7 +558,7 @@ def test_linear_problem_released_by_refcounting_not_gc():
     calls -- one inside a PETSc Mat's collective MUMPS-termination destructor, the
     other already building an unrelated dofmap for the next test -- while this bug
     was present. Fixed by making the recursive helper
-    (``dolfinx_adjoint.solvers._replace_with_placeholders``) a plain module-level
+    (``dolfinx_adjoint.ufl_utils.recursive_replace``) a plain module-level
     function taking the placeholder dict as an explicit argument, so it does not need
     to capture itself or ``self``.
     """
@@ -647,3 +648,159 @@ def test_nonlinear_problem_released_by_refcounting_not_gc():
         )
     finally:
         gc.enable()
+
+
+def test_linear_problem_rebuilt_after_garbage_collection():
+    """A block only holds a ``weakref`` to its owning LinearProblem (see
+    LinearProblemBlock._problem/_rebuild_problem), precisely so dropping every
+    external reference to the Problem releases it immediately, even while blocks
+    that reference it are still on the tape. Replaying the tape afterwards (e.g. to
+    differentiate) must still work: the block rebuilds an equivalent LinearProblem on
+    demand, warning since that is a costly fallback, and the rebuilt Problem must
+    give the same answer the original would have.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2)
+
+    a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    petsc_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options, petsc_options_prefix="dxa_rebuild_test_")
+    problem.solve()
+
+    J = assemble_scalar(uh * uh * ufl.dx)
+    control = pyadjoint.Control(m)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    problem_ref = weakref.ref(problem)
+    del problem
+    assert problem_ref() is None, (
+        "LinearProblem should be released the instant its last external reference is "
+        "dropped, since blocks only hold a weakref to it"
+    )
+
+    pert = Function(V)
+    pert.interpolate(lambda x: np.cos(x[1]))
+
+    with pytest.warns(UserWarning, match="LinearProblem was garbage collected"):
+        min_rate = pyadjoint.taylor_test(Jh, m, pert)
+    assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_rate}"
+
+
+def test_nonlinear_problem_rebuilt_after_garbage_collection():
+    """As ``test_linear_problem_rebuilt_after_garbage_collection``, but for
+    NonlinearProblem."""
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    f = Function(V, name="control")
+    f.interpolate(lambda x: 2.0 + np.sin(x[0]))
+
+    u1 = Function(V, name="state")
+    u1.interpolate(lambda x: np.ones_like(x[0]))
+    v1 = ufl.TestFunction(V)
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
+    bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
+
+    options = {
+        "snes_error_if_not_converged": True,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    adjoint_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+
+    problem = NonlinearProblem(
+        F1,
+        u=u1,
+        bcs=[bc],
+        petsc_options=options,
+        adjoint_petsc_options=adjoint_options,
+        petsc_options_prefix="dxa_nonlinear_rebuild_test_",
+    )
+    problem.solve()
+
+    d = pyadjoint.AdjFloat(0.2)
+    J = assemble_scalar((u1 - d) * (u1 - d) * ufl.dx)
+    control = pyadjoint.Control(f)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    problem_ref = weakref.ref(problem)
+    del problem
+    assert problem_ref() is None, (
+        "NonlinearProblem should be released the instant its last external reference "
+        "is dropped, since blocks only hold a weakref to it"
+    )
+
+    pert = Function(V)
+    pert.interpolate(lambda x: np.cos(x[1]))
+
+    with pytest.warns(UserWarning, match="NonlinearProblem was garbage collected"):
+        min_rate = pyadjoint.taylor_test(Jh, f, pert)
+    assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_rate}"
+
+
+def test_default_petsc_options_prefix_is_unique_per_problem():
+    """Two Problems of the same kind that don't pass ``petsc_options_prefix``
+    explicitly must not resolve to the same default prefix.
+
+    PETSc's options database is process-global and keyed by prefix: two Problems
+    sharing one would let one instance's SNES/KSP options silently leak into (or get
+    overwritten by) the other's, exactly the kind of collision this default-prefix
+    scheme exists to prevent -- see ``dolfinx_adjoint.solvers._PROBLEM_PREFIX_COUNTER``.
+    """
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 2, 2)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    a = ufl.inner(u, v) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx
+
+    linear_a = LinearProblem(a, L)
+    linear_b = LinearProblem(a, L)
+    assert linear_a._petsc_options_prefix != linear_b._petsc_options_prefix
+
+    u1 = Function(V, name="state")
+    F = ufl.inner((1 + u1**2) * u1, v) * ufl.dx - ufl.inner(dolfinx.fem.Constant(mesh, 1.0), v) * ufl.dx
+    nonlinear_a = NonlinearProblem(F, u=u1)
+    nonlinear_b = NonlinearProblem(F, u=u1)
+    assert nonlinear_a._petsc_options_prefix != nonlinear_b._petsc_options_prefix
+
+    # Also unique across the two classes, since they draw from one shared counter.
+    assert linear_a._petsc_options_prefix != nonlinear_a._petsc_options_prefix
+
+    # An explicitly-passed prefix must be honored unchanged.
+    explicit = LinearProblem(a, L, petsc_options_prefix="my_custom_prefix_")
+    assert explicit._petsc_options_prefix == "my_custom_prefix_"
