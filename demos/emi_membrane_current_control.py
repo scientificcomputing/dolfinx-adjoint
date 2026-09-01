@@ -475,11 +475,6 @@ else:
     plotter.show()
 # -
 
-# ```{note}
-# Unlike `demos/poisson_mother`, we do not attempt a mesh-independence/convergence study
-# here: repeating a submesh + blocked + adjoint optimization across several mesh
-# resolutions and optimizers is disproportionately expensive for a demo of this kind.
-# ```
 
 # ## References
 # ```{bibliography}
