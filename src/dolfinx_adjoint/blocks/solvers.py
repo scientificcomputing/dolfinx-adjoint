@@ -750,12 +750,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             solutions -- passed through unchanged as ``prepared`` to every
             subsequent
             {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_hessian_component`
-            call. ``None`` if there is nothing to do (no Hessian input, or no
-            dependency has a tangent-linear value).
+            call. ``None`` if there is nothing to do (no dependency has a
+            tangent-linear value).
         """
         outputs = self.get_outputs()
         tlm_output = [output.tlm_value for output in outputs if output is not None]
-        if (hessian_inputs is None) or (len(tlm_output) == 0):
+        if len(tlm_output) == 0:
             return
 
         # The adjoint solver -- and the compiled LHS it solves with, shared
@@ -1021,9 +1021,10 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
 
 class LinearProblemBlock(_ProblemBlockBase):
-    """A linear problem that can be used with adjoint methods.
+    """The pyadjoint tape block recorded by a {py:class}`~dolfinx_adjoint.LinearProblem` solve.
 
-    This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
+    See `_ProblemBlockBase`'s own docstring for the shared adjoint/TLM/Hessian machinery;
+    this subclass supplies the pieces genuinely specific to a linear ``a``/``L`` residual.
     """
 
     _adjoint_solutions: Function | typing.Sequence[Function]
@@ -1176,10 +1177,9 @@ class LinearProblemBlock(_ProblemBlockBase):
         self._bcs = bcs if bcs is not None else []
 
         # Add dependencies from the boundary conditions
-        if self._bcs is not None:
-            for bc in self._bcs:
-                if hasattr(bc, "block_variable"):
-                    self.add_dependency(bc, no_duplicates=True)
+        for bc in self._bcs:
+            if hasattr(bc, "block_variable"):
+                self.add_dependency(bc, no_duplicates=True)
 
         # Which output block each bc constrains, for evaluate_adj_component/
         # evaluate_hessian_component's DirichletBC branch to index into the
@@ -1273,9 +1273,10 @@ class LinearProblemBlock(_ProblemBlockBase):
 
 
 class NonlinearProblemBlock(_ProblemBlockBase):
-    """A nonlinear problem that can be used with adjoint methods.
+    """The pyadjoint tape block recorded by a {py:class}`~dolfinx_adjoint.NonlinearProblem` solve.
 
-    This class extends the `dolfinx.fem.petsc.NonlinearProblem` to support adjoint methods.
+    See `_ProblemBlockBase`'s own docstring for the shared adjoint/TLM/Hessian machinery;
+    this subclass supplies the pieces genuinely specific to a nonlinear ``F`` residual.
     """
 
     _adjoint_solutions: Function | typing.Sequence[Function]

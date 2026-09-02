@@ -20,7 +20,7 @@ def build_cpp_bc_and_kwargs(
 
     Shared by :py:class:`~dolfinx_adjoint.types.dirichletbc.DirichletBC` (the tape-tracked
     constructor) and :py:meth:`DirichletBCBlock.evaluate_tlm_component` (a plain,
-    untracked bc built fresh each TLM call): both need the same fix for the same reason.
+    untracked bc built fresh each TLM call).
 
     The cpp constructor is always called the V-less way regardless of whether the caller
     passed ``V``: the 3-arg cpp overload for a `Function`-valued ``g`` requires ``dofs`` to
@@ -29,11 +29,11 @@ def build_cpp_bc_and_kwargs(
     ``dofs`` array plus a broadcast-style value (e.g. a
     :py:class:`~dolfinx_adjoint.Constant`, itself a `Function` on a single-dof real space)
     needs. The V-less overload already broadcasts a real-space `Function`'s single value
-    across an arbitrary flat ``dofs`` array correctly (the whole point of implementing
-    `Constant` via a real space). ``V`` is instead threaded through purely at the *Python*
-    level, which :py:class:`dolfinx.fem.DirichletBC` keeps entirely independent of the cpp
-    object: ``bc.function_space`` is whatever ``V`` is passed to the Python wrapper, never
-    introspected from the cpp bc.
+    across an arbitrary flat ``dofs`` array correctly. ``V`` is instead threaded through
+    purely at the *Python* level, which :py:class:`dolfinx.fem.DirichletBC` keeps entirely
+    independent of the cpp object: ``bc.function_space`` is whatever ``V`` is passed to the
+    Python wrapper, never introspected from the cpp bc. See dolfinx-adjoint-knowledge's
+    scratch/boundary-control/issues/01 for the bug this avoids.
     """
     dtype = g.dtype
     V_used = V if V is not None else g.function_space
@@ -117,11 +117,8 @@ class DirichletBCBlock(Block):
         here, at the position in the tape this block itself occupies (always *before* any
         solve block that consumes ``bc``, since the bc must be constructed first), is what
         makes a later solve block see the right value regardless of which tape position is
-        being replayed. Without this, replaying an earlier position (a Taylor-test
-        perturbation, an optimizer step, a later solve in a time loop reusing the same bc)
-        would silently keep using whatever ``g.x.array`` currently holds -- observed
-        directly as an all-zero Taylor-test residual, since the "perturbed" forward solve
-        never actually saw a different bc value.
+        being replayed. See dolfinx-adjoint-knowledge's
+        scratch/boundary-control/issues/02 for what breaks without this.
         """
         bc = block_variable.saved_output
         if prepared is not None:
@@ -166,9 +163,7 @@ class DirichletBCBlock(Block):
 
         Same pass-through as ``evaluate_adj_component``, applied to the second-order
         boundary reaction (``prepare_evaluate_hessian``'s ``_adj_sol2_bdy``) instead of the
-        first-order one -- correct because ``d2F/dm2 = d2F/dudm = 0`` for a Dirichlet bc
-        control (it only ever enters the residual through its own linear right-hand side),
-        so the boundary reaction against the second-order adjoint solution is the *entire*
-        Hessian-action contribution.
+        first-order one -- the *entire* Hessian-action contribution for a Dirichlet bc
+        control (see dolfinx-adjoint-knowledge's scratch/boundary-control/spec.md for why).
         """
         return hessian_inputs[0]
