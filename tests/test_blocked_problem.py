@@ -24,7 +24,7 @@ def mesh_2D():
 
 
 @pytest.mark.parametrize("use_mixed_space", [True, False])
-def test_solver(use_mixed_space: bool, mesh_2D):
+def test_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches_finite_difference):
     pyadjoint.get_working_tape().clear_tape()
     mesh = mesh_2D
     el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
