@@ -52,6 +52,15 @@ cd dolfinx-adjoint
 python3 -m pip install -e ".[all]"
 ```
 
+The `docs` extra builds the demos and API docs, but not [Moola](https://github.com/funsim/moola)
+(used by two of the three demos): PyPI rejects packages that declare a direct git-URL
+dependency, so it can't be listed in `pyproject.toml`. Install it separately first if you
+want to build the docs or run those demos locally:
+
+```bash
+python3 -m pip install git+https://github.com/funsim/moola.git
+```
+
 
 ## Quick Start
 

@@ -10,7 +10,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
 dependencies = [
-      "fenics-dolfinx>=0.10.0",
+      "fenics-dolfinx>=0.11.0",
       "pyadjoint-ad>=2025.10.0",
       "typing_extensions; python_version < '3.11'",
       "packaging>=24.2",
@@ -25,7 +25,10 @@ dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",
       "jupytext",
-      # "moola@git+https://github.com/funsim/moola.git",
+      # moola (needed by two of the three demos) is deliberately not listed here: PyPI
+      # #     mesh = form.ufl_domain()
+        #     space = c1._ad_function_space(mesh)rejects packages that declare a direct git-URL dependency. Install it manually
+      # first (see README.md's Development Install section, and .github/workflows/build_docs.yml).
       "pandas",
       "pyvista[all]>0.45",
       "networkx",
@@ -102,3 +105,8 @@ current_version = "0.3.0"
 filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "CITATION.cff"
+search = 'version: v{current_version}'
+replace = 'version: v{new_version}'
