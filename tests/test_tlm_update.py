@@ -174,9 +174,8 @@ def _navier_stokes(mesh):
         # step can make backtracking line search report DIVERGED_LINE_SEARCH.  An
         # explicit absolute tolerance lets it recognize "already converged" and
         # exit immediately instead.
-        "snes_atol": 1e-9,
-        "snes_rtol": 1e-9,
-        "snes_stol": 1e-12,
+        "snes_atol": 1e-8,
+        "snes_rtol": 1e-8,
     }
     forward_options.update(direct_solve)
     problem = NonlinearProblem(
