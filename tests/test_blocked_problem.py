@@ -280,14 +280,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
 
     forward_options = {
-        "snes_monitor": None,
         "snes_type": "newtonls",
-        # Default ("bt") backtracking line search: globalizes genuinely-far Newton
-        # steps (e.g. the largest Taylor-test perturbations). Disabling it
-        # ("snes_linesearch_type": "none") let an undamped step stall -- SNES then
-        # reported SNES_CONVERGED_SNORM_RELATIVE (step size below snes_stol) even
-        # though the residual was still ~1e-1, and snes_error_if_not_converged only
-        # raises on a *diverged* reason, so that false convergence passed silently.
         "snes_error_if_not_converged": True,
         "snes_atol": 1e-9,
         "snes_rtol": 1e-9,
