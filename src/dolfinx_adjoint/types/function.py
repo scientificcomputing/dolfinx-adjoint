@@ -13,6 +13,7 @@ from pyadjoint.overloaded_type import (
     register_overloaded_type,
 )
 from pyadjoint.tape import no_annotations
+from ufl.core.ufl_id import attach_ufl_id
 
 from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
@@ -35,6 +36,7 @@ def _create_function(
     return Function(V, x=x, annotate=False)
 
 
+@attach_ufl_id
 class Function(dolfinx.fem.Function, FloatingType):
     """A class overloading `dolfinx.fem.Function` to support it being used as a control variable
     in the adjoint framework.
@@ -56,6 +58,8 @@ class Function(dolfinx.fem.Function, FloatingType):
         dtype: npt.DTypeLike = dolfinx.default_scalar_type,
         **kwargs,
     ):
+        ufl_id = kwargs.pop("ufl_id", None)
+        self._ufl_id = self._init_ufl_id(ufl_id)
         super(Function, self).__init__(
             V,
             x,
@@ -249,6 +253,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         return self._x
 
 
+@attach_ufl_id
 class Constant(Function):
     """A class overloading {py:class}`dolfinx.fem.Constant`
     to support it being used as a control variable in
@@ -274,7 +279,10 @@ class Constant(Function):
         self,
         domain: dolfinx.mesh.Mesh,
         c: float | numpy.floating | complex | numpy.complexfloating | typing.Sequence | numpy.ndarray,
+        ufl_id: int | None = None,
     ):
+        self._ufl_id = self._init_ufl_id(ufl_id)
+
         value_shape = numpy.shape(c)
         try:
             el = basix.ufl.real_element(domain.basix_cell(), value_shape=numpy.shape(c))

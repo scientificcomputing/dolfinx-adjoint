@@ -791,9 +791,10 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
             coefficients |= collect_coefficients(P)
             if set(u_list).issubset(coefficients):
                 raise ValueError("The unknown `u` should not be part of the coefficients of a linear problem.")
-
+        # Has to be sorted when creating placeholders, as function creation is a collective operation
+        sorted_coefficients = sorted(coefficients, key=lambda c: c.ufl_id())
         self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
-            c: dolfinx.fem.Function(c.function_space) for c in coefficients
+            c: dolfinx.fem.Function(c.function_space) for c in sorted_coefficients
         }
         a_R, L_R, P_R = recursive_replace((a, L, P), self._value_placeholders)  # type: ignore[misc]
         super().__init__(
