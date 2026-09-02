@@ -51,7 +51,7 @@ def _viscous_stokes(mesh):
     dx = ufl.Measure("dx", domain=mesh)
 
     mu = Function(Z, name="viscosity")
-    mu.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+    mu.interpolate(lambda x: 15.0 + 0.5 * np.sin(np.pi * x[0]))
 
     u, p = ufl.TrialFunction(V), ufl.TrialFunction(Q)
     v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
@@ -104,8 +104,8 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
     Jh, Z = _viscous_stokes(mesh_2D)
 
     m1, m2 = Function(Z), Function(Z)
-    m1.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
-    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    m1.interpolate(lambda x: 15.0 + 0.5 * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 25.0 + 0.5 * np.cos(np.pi * x[1]))
     h = Function(Z)
     h.interpolate(lambda x: 10.0 + 3.2 * np.sin(3 * x[0]))
 
@@ -137,7 +137,7 @@ def _navier_stokes(mesh):
     dx = ufl.Measure("dx", domain=mesh)
 
     mu = Function(Z, name="viscosity")
-    mu.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+    mu.interpolate(lambda x: 25.0 + 0.5 * np.sin(np.pi * x[0]))
 
     uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
     v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
@@ -211,7 +211,8 @@ def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh
     Jh, Z = _navier_stokes(mesh_2D)
 
     m2 = Function(Z)
-    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    m2.interpolate(lambda x: 25.0 + 0.5 * np.cos(np.pi * x[1]))
+    # Ensure min(m2) - max(h) > 0, so that the Taylor test's finite-difference perturbation doesn't
     h = Function(Z)
     h.interpolate(lambda x: 1.0 + 0.3 * np.sin(3 * x[0]))
 
@@ -234,7 +235,7 @@ def _diffusive_poisson(mesh):
     dx = ufl.Measure("dx", domain=mesh)
 
     m = Function(Z, name="diffusivity")
-    m.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+    m.interpolate(lambda x: 23.0 + 0.5 * np.sin(np.pi * x[0]))
 
     u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
     x = ufl.SpatialCoordinate(mesh)
@@ -281,8 +282,8 @@ def test_hessian_is_independent_of_previous_evaluation_points_scalar(warm_up_at_
     Jh, Z = _diffusive_poisson(mesh_2D)
 
     m1, m2 = Function(Z), Function(Z)
-    m1.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
-    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    m1.interpolate(lambda x: 25.0 + 0.5 * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 40.0 + 0.5 * np.cos(np.pi * x[1]))
     h = Function(Z)
     h.interpolate(lambda x: 1.0 + 0.3 * np.sin(3 * x[0]))
 
@@ -304,8 +305,8 @@ def test_hessian_mpi_breakdown(mesh_2D):
     Jh, Z = _viscous_stokes(mesh_2D)
 
     m1, m2 = Function(Z), Function(Z)
-    m1.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
-    m2.interpolate(lambda x: 2.0 + 0.5 * np.cos(np.pi * x[1]))
+    m1.interpolate(lambda x: 17.0 + 0.5 * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 13.2 + 0.2 * np.cos(np.pi * x[1]))
     h = Function(Z)
     h.interpolate(lambda x: 3.0 + 2.0 * np.sin(3 * x[0]))
 
