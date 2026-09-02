@@ -218,6 +218,7 @@ bc_dofs = dolfinx.fem.locate_dofs_topological(Ve, omega_e.topology.dim - 1, sub_
 # the BC is fixed data, not a control, leaving it untracked is also the right modelling
 # choice, not just a workaround; the discrepancy is worth a closer look/report upstream.
 # This is hopefully fixed with PR #83.
+
 zero = dolfinx.fem.Constant(omega_e, 0.0)
 bc = dolfinx.fem.dirichletbc(zero, bc_dofs, Ve)
 # -
@@ -255,18 +256,18 @@ truth_problem = dolfinx.fem.petsc.LinearProblem(
     entity_maps=entity_maps,
 )
 truth_problem.solve()
+# -
 
+# The desired state can stay a plain {py:class}`dolfinx.fem.Function`, not a
+# {py:class}`dolfinx_adjoint.Function`: `AssembleBlock` only records coefficients that are
+# already tape-tracked as dependencies, so a plain Function is simply left untracked
+# rather than raising -- exactly what we want here, since `d_e` is fixed "hidden truth"
+# data, not something to differentiate through. We copy the values over directly rather
+# than through a tracked assignment for the same reason.
 
-# The desired state must be a `dolfinx_adjoint.Function` (not a plain `dolfinx.fem.Function`)
-# so that it is a valid, if untracked, coefficient in a tape-recorded form: assembling a
-# form scans every coefficient for tape bookkeeping, which fails on a plain Function. We
-# simply copy the values over rather than routing them through a tracked assignment --
-# this is a fixed leaf value, exactly like the initial guess set for the control below,
-# with no tape block needed to explain where it came from.
-d_e = dolfinx_adjoint.Function(Ve, name="d_e")
+d_e = dolfinx.fem.Function(Ve, name="d_e")
 d_e.x.array[:] = ue_true.x.array
 d_e.x.scatter_forward()
-# -
 
 # ## The dolfinx-adjoint control problem
 # As opposed to standard DOLFINx code, the control and state are created as
@@ -318,20 +319,43 @@ dxE_native = ufl.Measure("dx", domain=omega_e)
 dGamma_native = ufl.Measure("dx", domain=Gamma)
 
 alpha = dolfinx_adjoint.Constant(Gamma, 1.0e-6, name="alpha")  # Tikhonov regularization parameter
-alpha.name = "alpha"  # type: ignore
 J_state = 1e3 * dolfinx_adjoint.assemble_scalar(0.5 * ufl.inner(ue - d_e, ue - d_e) * dxE_native)
 J_control = dolfinx_adjoint.assemble_scalar(0.5 * alpha * ufl.inner(Im, Im) * dGamma_native)
 J = J_state + J_control
 # -
 
 # ## Verifying the gradient with a Taylor test
-# This demo is the first in dolfinx-adjoint to combine `entity_maps` (submeshes) with a
-# *blocked* {py:class}`LinearProblem<dolfinx_adjoint.LinearProblem>` under tape
-# annotation. Before trusting an optimization built on top of it, we verify the gradient
-# with a Taylor remainder test, following the same pattern as
-# `tests/test_blocked_problem.py`: the 0th-order remainder should shrink at rate $\approx
-# 1$, and, once the gradient is used to correct for the first-order term, the 1st-order
-# remainder should shrink at rate $\approx 2$.
+# ```{note}
+# Unlike the scalar [Poisson mother problem](./poisson_mother),
+# the interface coupling here makes deriving a closed-form analytic optimum intractable,
+# so instead of comparing against an analytic
+# solution we verify the gradient computed by *dolfinx-adjoint* with a Taylor remainder
+# test.
+# ```
+#
+# Write $\hat J(I_m) = J(u_e(I_m), I_m)$ for the *reduced* functional obtained by
+# eliminating the state through the (linear) EMI solve, and fix a perturbation
+# direction $\delta I_m \in Q(\Gamma)$ -- `perturbation` below. For a step
+# $\varepsilon > 0$, {py:func}`pyadjoint.taylor_test` forms the Taylor remainders
+#
+# $$
+# R_0(\varepsilon) = \bigl|\hat J(I_m + \varepsilon\,\delta I_m) - \hat J(I_m)\bigr|,
+# \qquad
+# R_1(\varepsilon) = \Bigl|\hat J(I_m + \varepsilon\,\delta I_m) - \hat J(I_m)
+# - \varepsilon\Bigl\langle \frac{\mathrm{d}\hat J}{\mathrm{d} I_m}, \delta I_m
+# \Bigr\rangle\Bigr|
+# $$
+#
+# and reports the smallest convergence rate observed as $\varepsilon$ is repeatedly
+# halved. $R_0$ only re-derives $\hat J$'s value by finite differencing -- it never
+# touches the computed gradient (passing `dJdm=0` below) -- so it converges at rate
+# $1$ regardless of whether the adjoint is implemented correctly; it merely confirms
+# $\hat J$ responds to the perturbation at all. $R_1$ additionally subtracts the
+# directional derivative $\langle \mathrm{d}\hat J/\mathrm{d} I_m, \delta I_m\rangle$
+# returned by {py:meth}`pyadjoint.ReducedFunctional.derivative`, and converges at the
+# faster rate $2$ *only if* that directional derivative is truly the gradient of
+# $\hat J$ at $I_m$ along $\delta I_m$ -- which is what makes the 1st order test below
+# an actual check of the adjoint-computed gradient, rather than of $\hat J$ itself.
 
 # +
 control = pyadjoint.Control(Im)
@@ -435,16 +459,9 @@ grid_ue.point_data["u_e desired"] = d_e.x.array
 grid_ui = pyvista.UnstructuredGrid(*dolfinx.plot.vtk_mesh(Vi))
 grid_ui.point_data["u_i optimal"] = ui.x.array
 
-# I_m lives in a DG0 space; interpolate into a DG1 plotting space on Gamma so that
-# warp_by_scalar has point data to work with, as in demos/poisson_mother.
-Q_plot = dolfinx.fem.functionspace(Gamma, ("Discontinuous Lagrange", 1))
-Im_plot = dolfinx.fem.Function(Q_plot)
-Im_plot.interpolate(Im)
-Im_true_plot = dolfinx.fem.Function(Q_plot)
-Im_true_plot.interpolate(Im_true)
-grid_gamma = pyvista.UnstructuredGrid(*dolfinx.plot.vtk_mesh(Q_plot))
-grid_gamma.point_data["I_m optimal"] = Im_plot.x.array
-grid_gamma.point_data["I_m true"] = Im_true_plot.x.array
+grid_gamma = pyvista.UnstructuredGrid(*dolfinx.plot.vtk_mesh(Q))
+grid_gamma.point_data["I_m optimal"] = Im.x.array
+grid_gamma.point_data["I_m true"] = Im_true.x.array
 
 plotter = pyvista.Plotter(shape=(2, 3))
 plotter.subplot(0, 0)

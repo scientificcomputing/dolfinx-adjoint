@@ -4,7 +4,7 @@ from mpi4py import MPI
 
 import dolfinx
 import ufl
-from pyadjoint import Block, create_overloaded_object
+from pyadjoint import Block, OverloadedType, create_overloaded_object
 from ufl.formatting.ufl2unicode import ufl2unicode
 
 from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
@@ -76,7 +76,8 @@ class AssembleBlock(Block):
         # mesh = self.form.ufl_domain().ufl_cargo()
         # self.add_dependency(mesh)
         for coefficient in self.form.coefficients():
-            self.add_dependency(coefficient, no_duplicates=True)
+            if isinstance(coefficient, OverloadedType):
+                self.add_dependency(coefficient, no_duplicates=True)
         # Set up cache for vectors that can be reused in adjoint action
         # self._cached_vectors: dict[int, _SpecialVector] = {}
 
