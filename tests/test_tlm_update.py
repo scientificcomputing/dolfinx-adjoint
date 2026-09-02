@@ -218,8 +218,8 @@ def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh
     m2.interpolate(lambda x: baseline + 0.2 * baseline * np.cos(np.pi * x[1]))
     # Ensure min(m2) - max(h) > 0, so that the Taylor test's finite-difference perturbation doesn't
     h = Function(Z)
-    h.interpolate(lambda x: 0.3 * baseline * np.sin(3 * x[0]))
-    assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
+    h.interpolate(lambda x: 0.4 * baseline * np.sin(3 * x[0]))
+    assert np.min(m2.x.array - h.x.array) > 0.01, "Taylor test perturbation must not violate positivity of viscosity"
     Jh(m2)
     dJdm = Jh.derivative()._ad_dot(h)
     Hm = Jh.hessian(h)._ad_dot(h)
