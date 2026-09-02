@@ -12,6 +12,7 @@ not actually MPI-specific, despite the name: it checks that solving at one contr
 between two evaluations at another value doesn't perturb the second evaluation's result).
 """
 
+
 from mpi4py import MPI
 
 import basix.ufl
@@ -213,12 +214,13 @@ def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _navier_stokes(mesh_2D)
 
+    baseline = 10.0
     m2 = Function(Z)
-    m2.interpolate(lambda x: 25.0 + 0.5 * np.cos(np.pi * x[1]))
+    m2.interpolate(lambda x: baseline + 0.2 * baseline * np.cos(np.pi * x[1]))
     # Ensure min(m2) - max(h) > 0, so that the Taylor test's finite-difference perturbation doesn't
     h = Function(Z)
-    h.interpolate(lambda x: 1.0 + 0.3 * np.sin(3 * x[0]))
-
+    h.interpolate(lambda x: 0.3 * baseline * np.sin(3 * x[0]))
+    assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
     Jh(m2)
     dJdm = Jh.derivative()._ad_dot(h)
     Hm = Jh.hessian(h)._ad_dot(h)
@@ -283,18 +285,19 @@ def test_hessian_is_independent_of_previous_evaluation_points_scalar(warm_up_at_
     """
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _diffusive_poisson(mesh_2D)
+    baseline = 10.0
 
     m1, m2 = Function(Z), Function(Z)
-    m1.interpolate(lambda x: 25.0 + 0.5 * np.sin(np.pi * x[0]))
-    m2.interpolate(lambda x: 40.0 + 0.5 * np.cos(np.pi * x[1]))
+    m1.interpolate(lambda x: 2 * baseline + 0.1 * baseline * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 3 * baseline + 0.5 * baseline * np.cos(np.pi * x[1]))
     h = Function(Z)
-    h.interpolate(lambda x: 1.0 + 0.3 * np.sin(3 * x[0]))
-
+    h.interpolate(lambda x: 0.3 * baseline * np.sin(3 * x[0]))
+    assert np.min(m1.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positive diffusivity"
+    assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positive diffusivity"
     if warm_up_at_another_point:
         Jh(m1)
         Jh.derivative()
         Jh.hessian(h)
-
     Jh(m2)
     dJdm = Jh.derivative()._ad_dot(h)
     Hm = Jh.hessian(h)._ad_dot(h)
@@ -306,13 +309,15 @@ def test_hessian_is_independent_of_previous_evaluation_points_scalar(warm_up_at_
 def test_hessian_mpi_breakdown(mesh_2D):
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _viscous_stokes(mesh_2D)
+    baseline = 23.2
 
     m1, m2 = Function(Z), Function(Z)
-    m1.interpolate(lambda x: 17.0 + 0.5 * np.sin(np.pi * x[0]))
-    m2.interpolate(lambda x: 13.2 + 0.2 * np.cos(np.pi * x[1]))
+    m1.interpolate(lambda x: 2 * baseline + 0.25 * baseline * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 4 * baseline + 0.2 * baseline * np.cos(np.pi * x[1]))
     h = Function(Z)
-    h.interpolate(lambda x: 3.0 + 2.0 * np.sin(3 * x[0]))
-
+    h.interpolate(lambda x: -0.8 * baseline * np.cos(x[1]) * np.sin(3 * x[0]))
+    assert np.min(m1.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positive viscosity"
+    assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positive viscosity"
     # === COLD START ===
     J_cold = float(Jh(m2))
     dJ_cold = Jh.derivative()
