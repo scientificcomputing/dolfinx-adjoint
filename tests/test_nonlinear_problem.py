@@ -49,6 +49,8 @@ def test_sequential_nonlinear_problems():
         "ksp_type": "preonly",
         "pc_type": "lu",
         "pc_factor_mat_solver_type": "mumps",
+        "mat_mumps_icntl_24": 1,
+        "pc_factor_mat_ordering_type": "rcm",
     }
     options = {
         "snes_monitor": None,
