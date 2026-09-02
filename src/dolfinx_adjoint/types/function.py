@@ -279,6 +279,7 @@ class Constant(Function):
         self,
         domain: dolfinx.mesh.Mesh,
         c: float | numpy.floating | complex | numpy.complexfloating | typing.Sequence | numpy.ndarray,
+        name: str | None = None,
         ufl_id: int | None = None,
     ):
         self._ufl_id = self._init_ufl_id(ufl_id)
@@ -295,7 +296,7 @@ class Constant(Function):
                 raise ImportError("scifem is required to use Constant 'pip install scifem") from e
 
             V = scifem.create_real_functionspace(domain, value_shape=value_shape)
-        super().__init__(V)
+        super().__init__(V, name=name)
         self.x.array[:] = c
 
     @property
