@@ -275,6 +275,8 @@ class _ProblemBase(abc.ABC):
             dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None
         ) = None
         self._hessian_u_seed: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None
+        self._adjoint_reaction_template: dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form] | None = None
+        self._second_order_adjoint_reaction_template: dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form] | None = None
 
     @abc.abstractmethod
     def _get_or_build_residual_template(
@@ -399,6 +401,119 @@ class _ProblemBase(abc.ABC):
             self._tlm_rhs_templates = templates
         return self._tlm_rhs_templates, self._tlm_seed_placeholders, state_placeholder
 
+    def _ensure_hessian_placeholders(
+        self,
+    ) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+        """Build (once) the adjoint_solution_placeholder/second_adjoint_solution_placeholder/
+        hessian_u_seed placeholders, independently of the rest of the (more expensive) Hessian
+        templates.
+
+        Factored out of `_get_or_build_hessian_templates` so that
+        `_get_or_build_adjoint_reaction_template` (a boundary-control gradient, needed even
+        when no Hessian is ever requested) can share the *same* adjoint_solution_placeholder
+        object without pulling in soa_self/soa_cross/fixed/cross -- refreshing one placeholder
+        must correctly serve both consumers, so there must only ever be one such object, built
+        here exactly once regardless of which caller reaches it first.
+
+        Returns:
+            The (possibly newly built) adjoint_solution_placeholder.
+        """
+        if self._adjoint_solution_placeholder is None:
+            # NOTE: Cant we just use self._u.function_space or loop over it here?
+            # It seems silly to call get_or_build_tlm_rhs_templates
+            _, _, state_placeholder = self._get_or_build_tlm_rhs_templates()
+            if isinstance(self._u, list):
+                assert isinstance(state_placeholder, typing.Sequence)
+                state_list = list(state_placeholder)
+                self._adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
+                self._second_adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
+                self._hessian_u_seed = [dolfinx.fem.Function(s.function_space) for s in state_list]
+            else:
+                assert isinstance(state_placeholder, dolfinx.fem.Function)
+                self._adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
+                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
+                self._hessian_u_seed = dolfinx.fem.Function(state_placeholder.function_space)
+        return self._adjoint_solution_placeholder
+
+    def _get_or_build_adjoint_reaction_template(
+        self,
+    ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
+        """Build (once) and return adjoint(dF/du) applied to the (placeholder) adjoint solution,
+        compiled with **no bcs applied at all** -- this is the boundary-control gradient
+        recipe (confirmed against the current upstream legacy dolfin-adjoint source,
+        `fenics_adjoint/blocks/solving.py::GenericSolveBlock._assemble_and_solve_adj_eq`):
+        ``adj_sol_bdy = dJdu - action(adjoint(dF/du), adj_sol)``, where ``dJdu`` is a copy of
+        the adjoint right-hand side taken *before* any bc homogenization and ``adj_sol`` is
+        solved *with* homogenized bcs. The difference is ~0 on interior dofs (where the
+        homogeneous adjoint equation holds) and equals the sensitivity of J w.r.t. a
+        Dirichlet bc's value on that bc's own constrained dofs.
+
+        This is deliberately a separate, lighter-weight method from
+        `_get_or_build_hessian_templates` (which needs the *symbolic* form of
+        ``action(dFdu_adj_template, adjoint_solution_placeholder)`` to keep differentiating
+        further for soa_cross) -- this one only ever needs the *compiled*, directly
+        assemblable form, and must not force building the rest of the (more expensive)
+        Hessian machinery for problems that never request a Hessian.
+        """
+        if self._adjoint_reaction_template is None:
+            placeholder = self._ensure_hessian_placeholders()
+            self._adjoint_reaction_template = self._build_adjoint_reaction_template(placeholder)
+        return self._adjoint_reaction_template
+
+    def _get_or_build_second_order_adjoint_reaction_template(
+        self,
+    ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
+        """Build (once) and return adjoint(dF/du) applied to the (placeholder) *second*-order
+        adjoint solution -- the Hessian-side counterpart of
+        `_get_or_build_adjoint_reaction_template`, sharing the same ``adjoint(dF/du)``
+        operator (the SOA equation's LHS is verbatim the first-order adjoint equation's, see
+        `blocks/solvers.py::_ProblemBlockBase.prepare_evaluate_hessian`) but evaluated at the
+        second-order adjoint solution instead of the first-order one. For a Dirichlet bc
+        control, ``d2F/dm2 = d2F/dudm = 0`` (the bc only ever enters ``F`` through its own
+        linear right-hand side), so this reaction term is the *entire* Hessian-action
+        contribution -- there is no separate fixed/cross term the way an ordinary
+        coefficient control has.
+        """
+        if self._second_order_adjoint_reaction_template is None:
+            self._ensure_hessian_placeholders()
+            assert self._second_adjoint_solution_placeholder is not None
+            self._second_order_adjoint_reaction_template = self._build_adjoint_reaction_template(
+                self._second_adjoint_solution_placeholder
+            )
+        return self._second_order_adjoint_reaction_template
+
+    def _build_adjoint_reaction_template(
+        self, adjoint_placeholder: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
+        """Compile ``action(adjoint(dF/du), adjoint_placeholder)``, with no bcs applied.
+
+        Shared builder for `_get_or_build_adjoint_reaction_template` (first-order) and
+        `_get_or_build_second_order_adjoint_reaction_template` (SOA) -- identical except for
+        which adjoint-solution placeholder is applied.
+        """
+        dFdu_adj_template = sum_form(self._get_or_build_dFdu_adj_template())  # type: ignore[arg-type]
+        assert isinstance(dFdu_adj_template, ufl.Form)
+        reaction_form = ufl.action(dFdu_adj_template, adjoint_placeholder)
+        if isinstance(self._u, list):
+            F_template, _ = self._get_or_build_residual_template()
+            test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
+            return [
+                dolfinx.fem.form(  # type: ignore[return-value]
+                    form_i,  # type: ignore[arg-type]
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+                for form_i in _pad_blocks_by_part(reaction_form, test_funcs)
+            ]
+        else:
+            return dolfinx.fem.form(
+                reaction_form,
+                jit_options=self._jit_options,
+                form_compiler_options=self._form_compiler_options,
+                entity_maps=self._entity_maps,
+            )
+
     def _get_or_build_hessian_templates(self) -> HessianTemplates:
         """Build (once) and return the per-dependency Hessian templates.
 
@@ -417,19 +532,15 @@ class _ProblemBase(abc.ABC):
             assert isinstance(dFdu_template, ufl.Form)
             assert isinstance(dFdu_adj_template, ufl.Form)
 
+            self._ensure_hessian_placeholders()
+            assert self._hessian_u_seed is not None
+            assert self._adjoint_solution_placeholder is not None
             blocked = isinstance(self._u, list)
             soa_self: NestedSequence[dolfinx.fem.Form]
             if blocked:
-                # One placeholder Function per output block, mirroring how
-                # _get_or_build_hessian_templates's scalar branch below uses a
-                # single one -- these back the adjoint_solution_placeholder/
-                # second_adjoint_solution_placeholder/hessian_u_seed properties.
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
                 test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
-                self._adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
-                self._second_adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
-                self._hessian_u_seed = [dolfinx.fem.Function(s.function_space) for s in state_list]
                 state_arg: typing.Any = state_list
 
                 # soa_self = adjoint(d2F/du2) . adjoint_solution -- the SOA
@@ -461,9 +572,8 @@ class _ProblemBase(abc.ABC):
                 ]
             else:
                 assert isinstance(state_placeholder, dolfinx.fem.Function)
-                self._adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
-                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
-                self._hessian_u_seed = dolfinx.fem.Function(state_placeholder.function_space)
+                assert isinstance(self._hessian_u_seed, dolfinx.fem.Function)
+                assert isinstance(self._adjoint_solution_placeholder, dolfinx.fem.Function)
                 state_arg = state_placeholder
 
                 soa_self = _build_soa_self_template(

@@ -3,9 +3,10 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pyadjoint
+import pytest
 import ufl
 
-from dolfinx_adjoint import Function, assemble_scalar
+from dolfinx_adjoint import Function, assemble_scalar, dirichletbc
 from dolfinx_adjoint.solvers import NonlinearProblem
 
 
@@ -94,6 +95,45 @@ def test_sequential_nonlinear_problems():
     dHddu = Jh.hessian(pert)._ad_dot(pert)
     min_rate_hess = pyadjoint.taylor_test(Jh, ctrl_eval, pert, dJdm=dJdm, Hm=dHddu)
     assert np.isclose(min_rate_hess, 3.0, rtol=1e-2, atol=1e-2), f"Expected 3.0, got {min_rate_hess}"
+
+
+@pytest.mark.xfail(
+    reason="Boundary control (a tracked Dirichlet bc value) is not implemented for "
+    "NonlinearProblem: NonlinearProblemBlock never adds a bc as a tape dependency, so "
+    "it would otherwise give pyadjoint a silent zero gradient rather than erroring, and "
+    "an explicit guard in NonlinearProblemBlock.__init__ (blocks/solvers.py) raises "
+    "NotImplementedError instead. Use LinearProblem if the bc's value needs to be a "
+    "control. Marked xfail(strict=True) rather than asserted via pytest.raises so that "
+    "implementing this feature later trips an XPASS here as a reminder to upgrade this "
+    "test into a real one, instead of the guard's removal going unnoticed.",
+    raises=NotImplementedError,
+    strict=True,
+)
+def test_tracked_bc_rejected():
+    """A tracked (dolfinx_adjoint) Dirichlet bc value is not supported as a control for
+    NonlinearProblem -- see the xfail reason above.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 4, 4)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    u = Function(V, name="state")
+    u.interpolate(lambda x: np.ones_like(x[0]))
+    v = ufl.TestFunction(V)
+    F = ufl.inner((1 + u**2) * ufl.grad(u), ufl.grad(v)) * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+
+    g = Function(V, name="bc_value")
+    g.interpolate(lambda x: np.ones_like(x[0]))
+    bc = dirichletbc(g, boundary_dofs, V=V)
+
+    # The tape-recording NonlinearProblemBlock (where the guard lives) is only built
+    # lazily, on the first solve -- see _ProblemBase._make_block.
+    problem = NonlinearProblem(F, u=u, bcs=[bc])
+    problem.solve()
 
 
 if __name__ == "__main__":

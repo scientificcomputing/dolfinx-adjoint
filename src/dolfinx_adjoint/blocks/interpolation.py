@@ -436,6 +436,16 @@ class ExprInterpolationBlock(Block):
                     V_in = target_dep_i.function_space
                     du = ufl.TrialFunction(V_in)
                     d2E = ufl.derivative(dE_total, target_dep_i, du)
+                    # ufl.derivative returns a lazy, unexpanded CoefficientDerivative node
+                    # that formally references `du` regardless of whether the expanded
+                    # expression actually depends on it (e.g. `dE_total` linear in
+                    # target_dep_i, as for a bare-coefficient expr -- its second
+                    # derivative is identically zero, but the *unexpanded* node still
+                    # reports one argument, previously causing a spurious H_op to be
+                    # compiled from a mesh-less zero expression). Expand derivatives
+                    # first so the argument count (and isinstance-zero check) reflect
+                    # the true, simplified expression.
+                    d2E = ufl.algorithms.apply_derivatives.apply_derivatives(d2E)
 
                     if not isinstance(d2E, (int, float)):
                         args = ufl.algorithms.extract_arguments(d2E)
