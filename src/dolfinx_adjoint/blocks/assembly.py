@@ -13,19 +13,22 @@ from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
 def assemble_compiled_form(
     form: dolfinx.fem.Form, tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None
 ) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
-    """Assemble a compiled form and optionally apply Dirichlet boundary condition.
+    """Assemble a compiled form into ``tensor`` (or return a new scalar).
 
     Args:
         form: Compiled form to assemble.
-        tensor: Optional vector to which the assembled form will be added.
+        tensor: For a rank-1 form, the vector to accumulate the assembled contribution
+            into, while it is unused for a rank-0 form.
     Returns:
-        tensor: The assembled vector, which is either the input tensor or a new vector
-            created from the form's function space(s).
+        For a rank-1 form, ``tensor`` itself (mutated in place). For a rank-0 form, the
+        assembled scalar as a Python ``float``.
     Raises:
         NotImplementedError: If the form's rank is not 0 or 1.
     """
 
     if form.rank == 1:
+        if tensor is None:
+            raise ValueError("tensor must be provided for rank-1 forms.")
         assert isinstance(tensor, dolfinx.la.Vector)
         dolfinx.fem.assemble._assemble_vector_array(tensor.array, form)
         tensor.scatter_reverse(dolfinx.la.InsertMode.add)
@@ -34,9 +37,9 @@ def assemble_compiled_form(
         local_val = dolfinx.fem.assemble_scalar(form)
         comm = form.mesh.comm
         tensor = comm.allreduce(local_val, op=MPI.SUM)
-
     else:
         raise NotImplementedError("Only 1-form assembly is currently supported.")
+    assert tensor is not None
     return tensor
 
 
@@ -271,17 +274,19 @@ class AssembleBlock(Block):
         c1_rep = block_variable.saved_output
 
         if isinstance(c1, dolfinx.fem.Constant):
-            mesh = form.ufl_domain()
-            space = c1._ad_function_space(mesh)
-        elif isinstance(c1, dolfinx.fem.Function):
+            raise RuntimeError(
+                "All constants should have been replaced with real space coefficients before this point."
+            )
+        if isinstance(c1, dolfinx.fem.Function):
             space = c1.function_space
-        elif isinstance(c1, dolfinx.mesh.Mesh):
-            c1_rep = ufl.SpatialCoordinate(c1)
-            space = c1._ad_function_space()
+        # TODO: Add support for shape optimization
+        # elif isinstance(c1, dolfinx.mesh.Mesh):
+        #     c1_rep = ufl.SpatialCoordinate(c1)
+        #     space = c1._ad_function_space()
         else:
             return None
         hessian_outputs, dform = self.compute_action_adjoint(hessian_input, arity_form, form, c1_rep, space)
-        ddform = 0
+        ddform = 0.0
         for other_idx, bv in relevant_dependencies:
             c2_rep = bv.saved_output
             tlm_input = bv.tlm_value
@@ -298,7 +303,6 @@ class AssembleBlock(Block):
             ddform = ufl.algorithms.expand_derivatives(ddform)
 
         if not ddform.empty():
-            # FIXME: COmpare ddform with legacy dolfin_adjoitn here, as this is DG-0, while hessian is in DG-0
             adj_action = self.compute_action_adjoint(adj_input, arity_form, dform=ddform)[0]
             try:
                 hessian_outputs += adj_action
