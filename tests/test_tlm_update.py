@@ -177,10 +177,8 @@ def _navier_stokes(mesh):
         "snes_atol": 1e-9,
         "snes_rtol": 1e-9,
         "snes_stol": 1e-12,
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "pc_factor_mat_solver_type": "mumps",
     }
+    forward_options.update(direct_solve)
     problem = NonlinearProblem(
         [F0, F1],
         u=[uh, ph],

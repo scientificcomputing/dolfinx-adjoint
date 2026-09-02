@@ -11,10 +11,9 @@ import dolfinx.fem.petsc
 import numpy as np
 import pyadjoint
 import ufl
-from dolfinx.fem.function import Function as _Function
 
 from ..types import Function
-from ..typing_utils import NestedMutableSequence
+from ..typing_utils import NestedSequence
 from ..ufl_utils import assign_mixed_parts, sum_form
 from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
 
@@ -43,7 +42,7 @@ def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[Functio
 
 
 def _map_block_variables_to_form(
-    form: ufl.Form | NestedMutableSequence[ufl.Form] | None,
+    form: NestedSequence[ufl.Form | None],
     block_variables: typing.Iterable[pyadjoint.block_variable.BlockVariable],
 ) -> dict[Function, Function]:
     """Map each ``block_variable``'s output coefficient, where it appears in ``form``, to its
@@ -95,10 +94,10 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
     _problem_ref: weakref.ReferenceType["LinearProblem | NonlinearProblem"]
     _rebuilt_problem: "LinearProblem | NonlinearProblem | None" = None
     _bcs: typing.Sequence[dolfinx.fem.DirichletBC]
-    _u: _Function | typing.Sequence[_Function]
-    _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
-    _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
-    _tlm_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _u: Function | typing.Sequence[Function]
+    _adjoint_solutions: Function | typing.Sequence[Function]
+    _second_adjoint_solutions: Function | typing.Sequence[Function]
+    _tlm_solutions: Function | typing.Sequence[Function]
     _jit_options: dict | None
     _form_compiler_options: dict | None
     _entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None
@@ -179,7 +178,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         """
         pass
 
-    def _create_replace_map(self, form: ufl.Form | NestedMutableSequence[ufl.Form] | None) -> dict[Function, Function]:
+    def _create_replace_map(self, form: NestedSequence[ufl.Form | None]) -> dict[Function, Function]:
         """Map each dependency and output to its checkpointed value, wherever it appears in ``form``.
 
         Args:
@@ -195,9 +194,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         replace_map.update(_map_block_variables_to_form(form, self.get_outputs()))
         return replace_map
 
-    def prepare_evaluate_tlm(
-        self, inputs, tlm_inputs, relevant_outputs
-    ) -> typing.Sequence[Function] | dolfinx.fem.Function:
+    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> NestedSequence[Function]:
         """Assemble and solve the tangent-linear (TLM) system for this block.
 
         The TLM solver -- and the compiled LHS it solves with, shared verbatim with
@@ -282,7 +279,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
         return self._tlm_solutions
 
-    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None) -> dolfinx.fem.Function:
+    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx: int, prepared=None) -> Function:
         """Return this output's share of the tangent-linear solution already computed
         by {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_tlm`.
 
@@ -302,7 +299,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         if isinstance(self._tlm_solutions, list):
             return self._tlm_solutions[idx]
         else:
-            assert isinstance(self._tlm_solutions, dolfinx.fem.Function)
+            assert isinstance(self._tlm_solutions, Function)
             return self._tlm_solutions
 
     def prepare_evaluate_adj(
@@ -374,11 +371,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             dolfinx.la.petsc.assign(arrs, dJdu)
             dJdu.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)  # type: ignore[arg-type]
 
-        # F_form/replacement_map are still needed by evaluate_adj_component
-        # (to build each dependency's own sensitivity form), but the adjoint
-        # LHS itself is already correct on adjoint_solver -- no rebuild, no
-        # recompile.
-        F_form, replacement_map = self._compute_residual()
         adjoint_solver.solve()
         if isinstance(self._adjoint_solutions, list):
             for adj_sol, sol in zip(self._adjoint_solutions, adjoint_solver.u):
@@ -386,6 +378,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         else:
             assert isinstance(self._adjoint_solutions, dolfinx.fem.Function)
             self._adjoint_solutions.x.array[:] = adjoint_solver.u.x.array[:]
+
+        # F_form/replacement_map are still needed by evaluate_adj_component
+        # (to build each dependency's own sensitivity form), but the adjoint
+        # LHS itself is already correct on adjoint_solver -- no rebuild, no
+        # recompile.
+        F_form, replacement_map = self._compute_residual()
         return F_form, replacement_map
 
     def evaluate_adj_component(
@@ -450,8 +448,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
     def prepare_recompute_component(
         self, inputs: typing.Sequence[typing.Any], relevant_outputs: typing.Sequence[typing.Any]
-    ) -> _Function | typing.Sequence[_Function]:
-        """Prepare for recomputing the block with different control inputs, and solve.
+    ) -> Function | typing.Sequence[Function]:
+        """Recompute the block's own forward solution(s) from its checkpointed dependencies and outputs.
+
+        Each problem has replaced its own forms' coefficients with placeholders, which are populated
+        from the block's saved outputs and dependencies here, then the shared forward solver is called
+        once to recompute the solution(s).
 
         The forward solver (``self.get_reference_problem()``) is bound, forever, to
         compiled forms referencing dedicated placeholder coefficients rather
@@ -520,7 +522,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         inputs: typing.Iterable[Function],
         block_variable: pyadjoint.block_variable.BlockVariable,
         idx: int,
-        prepared: _Function | typing.Sequence[_Function],
+        prepared: Function | typing.Sequence[Function],
     ) -> Function:
         """Return an isolated copy of this block's own share of the already-recomputed state.
 
@@ -537,15 +539,27 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         Returns:
             An isolated copy of this output, so this tape block's own checkpoint
             stays stable even if the shared Problem's unknown is later overwritten
-            by another block's recompute.
+            by another block's recompute. Reuses ``block_variable.checkpoint`` in
+            place when one already exists (mirroring
+            {py:class}`~dolfinx_adjoint.blocks.interpolation.InterpolationBlock`'s
+            recompute and Firedrake's equivalent ``GenericSolveBlock.recompute_component``),
+            since {py:meth}`~dolfinx_adjoint.types.function.Function._ad_create_checkpoint`
+            -- not a bare ``.copy()``, which always returns a plain, non-overloaded
+            ``dolfinx.fem.Function`` regardless of the source's concrete type -- is what
+            correctly builds a *new* one when none exists yet.
         """
-        if isinstance(prepared, dolfinx.fem.Function):
+        if isinstance(prepared, Function):
             assert idx == 0
-            # Return an explicit copy so each tape block gets an isolated state snapshot
-            return prepared.copy()
+            source = prepared
         else:
             assert isinstance(prepared, typing.Sequence)
-            return prepared[idx].copy()
+            source = prepared[idx]
+        checkpoint = block_variable.checkpoint
+        if isinstance(checkpoint, Function):
+            checkpoint.x.array[:] = source.x.array[:]
+            checkpoint.x.scatter_forward()
+            return checkpoint
+        return source._ad_create_checkpoint()
 
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
         """Assemble and solve the second-order-adjoint (SOA) equation.
@@ -830,9 +844,9 @@ class LinearProblemBlock(_ProblemBlockBase):
     This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
     """
 
-    _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
-    _tlm_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
-    _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _adjoint_solutions: Function | typing.Sequence[Function]
+    _tlm_solutions: Function | typing.Sequence[Function]
+    _second_adjoint_solutions: Function | typing.Sequence[Function]
 
     # 2. Overload for the SCALAR case
     @typing.overload
@@ -842,7 +856,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         L: ufl.Form,
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: _Function | None = None,
+        u: Function | None = None,
         P: ufl.Form | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
@@ -863,7 +877,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         L: typing.Sequence[ufl.Form],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: typing.Sequence[_Function] | None = None,
+        u: typing.Sequence[Function] | None = None,
         P: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
@@ -883,7 +897,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         L: ufl.Form | typing.Sequence[ufl.Form],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: _Function | typing.Sequence[_Function] | None = None,
+        u: Function | typing.Sequence[Function] | None = None,
         P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
@@ -926,7 +940,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         self._preconditioner = P
 
         # Create overloaded functions
-        self._u: _Function | typing.Sequence[_Function]
+        self._u: Function | typing.Sequence[Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
         elif u is None:
@@ -990,15 +1004,21 @@ class LinearProblemBlock(_ProblemBlockBase):
         # built once and reused across every block that Problem records
         # instead of once per solve() call.
 
+        # Private, isolated scratch storage for this block's own adjoint/TLM
+        # solutions -- never shared with problem.u or with any other block.
+        # Built via _ad_create_checkpoint(), not a bare .copy(): the latter
+        # always returns a plain, non-overloaded dolfinx.fem.Function
+        # regardless of the source's concrete type (see the same note on
+        # Function._ad_create_checkpoint in types/function.py).
         if isinstance(self._u, dolfinx.fem.Function):
-            self._adjoint_solutions = self._u.copy()
-            self._second_adjoint_solutions = self._u.copy()
-            self._tlm_solutions = self._u.copy()
+            self._adjoint_solutions = self._u._ad_create_checkpoint()
+            self._second_adjoint_solutions = self._u._ad_create_checkpoint()
+            self._tlm_solutions = self._u._ad_create_checkpoint()
         else:
             assert isinstance(self._u, typing.Iterable)
-            self._adjoint_solutions = [u.copy() for u in self._u]
-            self._second_adjoint_solutions = [u.copy() for u in self._u]
-            self._tlm_solutions = [u.copy() for u in self._u]
+            self._adjoint_solutions = [u._ad_create_checkpoint() for u in self._u]
+            self._second_adjoint_solutions = [u._ad_create_checkpoint() for u in self._u]
+            self._tlm_solutions = [u._ad_create_checkpoint() for u in self._u]
 
     def _compute_residual(self) -> tuple[ufl.Form, dict[Function, Function]]:
         """Convert the formulation :math:`a(u, v)=L(v)` into a residual :math:`F(u_b, v) = 0` where
@@ -1060,9 +1080,9 @@ class NonlinearProblemBlock(_ProblemBlockBase):
     This class extends the `dolfinx.fem.petsc.NonlinearProblem` to support adjoint methods.
     """
 
-    _adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
-    _second_adjoint_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
-    _tlm_solutions: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+    _adjoint_solutions: Function | typing.Sequence[Function]
+    _second_adjoint_solutions: Function | typing.Sequence[Function]
+    _tlm_solutions: Function | typing.Sequence[Function]
     _rhs: ufl.Form | typing.Sequence[ufl.Form]
 
     @typing.overload
@@ -1070,7 +1090,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self,
         F: ufl.Form,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: dolfinx.fem.Function | None = None,
+        u: Function | None = None,
         J: ufl.Form | None = None,
         P: ufl.Form | None = None,
         form_compiler_options: dict | None = None,
@@ -1090,7 +1110,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self,
         F: typing.Sequence[ufl.Form],
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: typing.Sequence[dolfinx.fem.Function] | None = None,
+        u: typing.Sequence[Function] | None = None,
         J: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
         P: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
         form_compiler_options: dict | None = None,
@@ -1109,7 +1129,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self,
         F: ufl.Form | typing.Sequence[ufl.Form],
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None,
+        u: Function | typing.Sequence[Function] | None = None,
         J: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
         P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
         form_compiler_options: dict | None = None,
@@ -1142,7 +1162,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
 
         # Create overloaded functions
         assert u is not None, "Control variable(s) must be provided."
-        self._u: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]
+        self._u: Function | typing.Sequence[Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
             replace_dict = {u: self._u}
@@ -1177,15 +1197,21 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         # built once and reused across every block that Problem records
         # instead of once per solve() call.
 
+        # Private, isolated scratch storage for this block's own adjoint/TLM
+        # solutions -- never shared with problem.u or with any other block.
+        # Built via _ad_create_checkpoint(), not a bare .copy(): the latter
+        # always returns a plain, non-overloaded dolfinx.fem.Function
+        # regardless of the source's concrete type (see the same note on
+        # Function._ad_create_checkpoint in types/function.py).
         if isinstance(self._u, dolfinx.fem.Function):
-            self._adjoint_solutions = self._u.copy()  # type: ignore[assignment]
-            self._second_adjoint_solutions = self._u.copy()  # type: ignore[assignment]
-            self._tlm_solutions = self._u.copy()  # type: ignore[assignment]
+            self._adjoint_solutions = self._u._ad_create_checkpoint()
+            self._second_adjoint_solutions = self._u._ad_create_checkpoint()
+            self._tlm_solutions = self._u._ad_create_checkpoint()
         else:
             assert isinstance(self._u, typing.Iterable)
-            self._adjoint_solutions = [u.copy() for u in self._u]
-            self._second_adjoint_solutions = [u.copy() for u in self._u]
-            self._tlm_solutions = [u.copy() for u in self._u]
+            self._adjoint_solutions = [u._ad_create_checkpoint() for u in self._u]
+            self._second_adjoint_solutions = [u._ad_create_checkpoint() for u in self._u]
+            self._tlm_solutions = [u._ad_create_checkpoint() for u in self._u]
 
     def _compute_residual(self) -> tuple[ufl.Form, dict[Function, Function]]:
         """Build the residual :math:`F(u_b, v) = 0` at the current checkpointed dependency values.

@@ -44,20 +44,24 @@ def test_sequential_nonlinear_problems():
     bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
 
     # Use SNES options for the nonlinear solver
-    options = {
-        "snes_monitor": None,
-        "snes_error_if_not_converged": True,
-        "snes_type": "newtonls",
+    direct_options = {
+        "ksp_monitor": None,
         "ksp_type": "preonly",
         "pc_type": "lu",
         "pc_factor_mat_solver_type": "mumps",
     }
+    options = {
+        "snes_monitor": None,
+        "snes_error_if_not_converged": True,
+        "snes_type": "newtonls",
+    }
+    options.update(direct_options)
 
     # 5. Solve the Cascade
-    problem1 = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    problem1 = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=direct_options)
     problem1.solve()
 
-    problem2 = NonlinearProblem(F2, u=u2, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    problem2 = NonlinearProblem(F2, u=u2, bcs=[bc], petsc_options=options, adjoint_petsc_options=direct_options)
     problem2.solve()
 
     # 6. Objective (using the cubed error to ensure a 3.0 Hessian rate)
