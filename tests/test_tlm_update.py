@@ -30,6 +30,8 @@ direct_solve = {
     "ksp_error_if_not_converged": True,
     "pc_factor_mat_solver_type": "mumps",
     "ksp_monitor": None,
+    "mat_mumps_icntl_24": 1,
+    "pc_factor_mat_ordering_type": "rcm",
 }
 
 
