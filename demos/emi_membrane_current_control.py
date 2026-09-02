@@ -1,26 +1,31 @@
-# # Optimal control of the EMI equations: recovering a membrane stimulus current
-# *Section author: Jørgen S. Dokken ([dokken@simula.no](mailto:dokken@simula.no))*.
+# # Optimal control of the EMI equations
+# *Author: Jørgen S. Dokken ([dokken@simula.no](mailto:dokken@simula.no))*.
 
-# This demo is a second "mother problem" of PDE-constrained optimization, this time
-# constrained by the EMI (Extracellular-Membrane-Intracellular) equations rather than
-# the Poisson equation of {py:mod}`demos/poisson_mother`. Physically, the problem can be
-# interpreted as recovering the stimulus current that a pacing electrode must inject at
-# a cell membrane in order to reproduce a desired extracellular potential recording.
+# This demo is a second a stepping stone up from the
+# [Poisson mother problem](./poisson_mother).
+# Instead of having a control in the whole volume $\Omega$, we
+# have a control on the interface $\Gamma$ between two subdomains,
+# and the state is constrained by the EMI
+# (Extracellular-Membrane-Intracellular) equations, see
+# [Quick intro to the EMI equations]
+# (https://scientificcomputing.github.io/fenics-in-the-wild/src/ucs/emi/emi.html).
+# Physically, the problem can be interpreted as recovering the stimulus current
+# that a pacing electrode must inject at a cell membrane in order to reproduce
+# a desired extracellular potential recording.
 
 # ## Problem definition
-# We split the unit square $\Omega$ into an intracellular block $\Omega_i$ and the
-# surrounding extracellular domain $\Omega_e=\Omega\setminus\Omega_i$, separated by the
-# membrane $\Gamma=\partial\Omega_i$, exactly as in
-# {py:mod}`the primal single-domain EMI example <ucs.emi.emi_primal_single>` and
-# {py:mod}`the primal mixed-domain EMI example <ucs.emi.emi_primal_mixed>`
-# of [FEniCS in the Wild](https://github.com/scientificcomputing/fenics-in-the-wild),
-# see {cite}`emi-Kuchta2021emi` Ch. 5.2 for the underlying finite element formulation.
+# We split the unit square $\Omega$ into an intracellular block $\Omega_i$
+# and the surrounding extracellular domain $\Omega_e=\Omega\setminus\Omega_i$,
+# separated by the membrane $\Gamma=\partial\Omega_i$.
+# We use the primal-single-domain formulation of the EMI equations,
+# see {cite}`emi-Kuchta2021emi` Ch. 5.2 for the underlying finite element
+# formulation.
 #
-# Rather than solving for the membrane current $I_m$ as an unknown (as in the primal
-# mixed-domain example), here $I_m$ is the *control*: it is added on top of the passive,
-# Robin-type membrane coupling as an independent, injected current -- exactly how a
-# stimulus current is added to the membrane current balance in EMI/bidomain cardiac
-# models. Find $u_i\in V_i=V(\Omega_i)$ and $u_e\in V_e=V(\Omega_e)$ such that
+# Rather than solving for the membrane current $I_m$ as an unknown
+# (as in the primal mixed-domain example), here $I_m$ is the *control*:
+# it is added on top of the passive, Robin-type membrane coupling as an
+# independent, injected current.
+# Find $u_i\in V_i=V(\Omega_i)$ and $u_e\in V_e=V(\Omega_e)$ such that
 #
 # $$
 # \int_{\Omega_e} \sigma_e \nabla u_e \cdot \nabla v_e~\mathrm{d}x +
@@ -157,8 +162,7 @@ entity_maps = [interior_to_parent, exterior_to_parent, interface_to_parent]
 
 # For the volume integrals we restrict the integration measure on $\Omega$ to $\Omega_i$
 # and $\Omega_e$ via the cell tags, and build the consistently-oriented interface measure
-# on $\Gamma$ with {py:func}`scifem.compute_interface_data`, following
-# {ref}`consistent_restrictions` in the primal single-domain example.
+# on $\Gamma$ with {py:func}`scifem.compute_interface_data`.
 
 # +
 dx = ufl.Measure("dx", domain=omega, subdomain_data=ct)
