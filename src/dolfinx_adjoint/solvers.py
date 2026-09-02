@@ -410,10 +410,9 @@ class _ProblemBase(abc.ABC):
 
         Factored out of `_get_or_build_hessian_templates` so that
         `_get_or_build_adjoint_reaction_template` (a boundary-control gradient, needed even
-        when no Hessian is ever requested) can share the *same* adjoint_solution_placeholder
-        object without pulling in soa_self/soa_cross/fixed/cross -- refreshing one placeholder
-        must correctly serve both consumers, so there must only ever be one such object, built
-        here exactly once regardless of which caller reaches it first.
+        when no Hessian is ever requested) can share the same placeholder without pulling in
+        the full Hessian machinery -- see `dolfinx-adjoint-knowledge`'s
+        `scratch/boundary-control/spec.md` for the design rationale.
 
         Returns:
             The (possibly newly built) adjoint_solution_placeholder.
@@ -431,27 +430,22 @@ class _ProblemBase(abc.ABC):
                 self._adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
                 self._second_adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
                 self._hessian_u_seed = dolfinx.fem.Function(state_placeholder.function_space)
+        assert self._adjoint_solution_placeholder is not None
         return self._adjoint_solution_placeholder
 
     def _get_or_build_adjoint_reaction_template(
         self,
     ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
-        """Build (once) and return adjoint(dF/du) applied to the (placeholder) adjoint solution,
-        compiled with **no bcs applied at all** -- this is the boundary-control gradient
-        recipe (confirmed against the current upstream legacy dolfin-adjoint source,
-        `fenics_adjoint/blocks/solving.py::GenericSolveBlock._assemble_and_solve_adj_eq`):
-        ``adj_sol_bdy = dJdu - action(adjoint(dF/du), adj_sol)``, where ``dJdu`` is a copy of
-        the adjoint right-hand side taken *before* any bc homogenization and ``adj_sol`` is
-        solved *with* homogenized bcs. The difference is ~0 on interior dofs (where the
-        homogeneous adjoint equation holds) and equals the sensitivity of J w.r.t. a
-        Dirichlet bc's value on that bc's own constrained dofs.
+        """Build (once) and return ``action(adjoint(dF/du), adjoint_solution_placeholder)``,
+        compiled with **no bcs applied at all** -- the boundary-control gradient recipe. See
+        `dolfinx-adjoint-knowledge`'s `scratch/boundary-control/spec.md` for the full
+        derivation and why no bcs are applied here.
 
-        This is deliberately a separate, lighter-weight method from
-        `_get_or_build_hessian_templates` (which needs the *symbolic* form of
-        ``action(dFdu_adj_template, adjoint_solution_placeholder)`` to keep differentiating
-        further for soa_cross) -- this one only ever needs the *compiled*, directly
-        assemblable form, and must not force building the rest of the (more expensive)
-        Hessian machinery for problems that never request a Hessian.
+        Deliberately a separate, lighter-weight method from `_get_or_build_hessian_templates`
+        (which needs the *symbolic* form to keep differentiating further for soa_cross) --
+        this one only ever needs the *compiled*, directly assemblable form, and must not
+        force building the rest of the (more expensive) Hessian machinery for problems that
+        never request a Hessian.
         """
         if self._adjoint_reaction_template is None:
             placeholder = self._ensure_hessian_placeholders()
@@ -461,16 +455,14 @@ class _ProblemBase(abc.ABC):
     def _get_or_build_second_order_adjoint_reaction_template(
         self,
     ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
-        """Build (once) and return adjoint(dF/du) applied to the (placeholder) *second*-order
-        adjoint solution -- the Hessian-side counterpart of
-        `_get_or_build_adjoint_reaction_template`, sharing the same ``adjoint(dF/du)``
-        operator (the SOA equation's LHS is verbatim the first-order adjoint equation's, see
+        """Build (once) and return ``action(adjoint(dF/du), second_adjoint_solution_placeholder)``
+        -- the Hessian-side counterpart of `_get_or_build_adjoint_reaction_template`, sharing
+        the same ``adjoint(dF/du)`` operator (the SOA equation's LHS is verbatim the
+        first-order adjoint equation's, see
         `blocks/solvers.py::_ProblemBlockBase.prepare_evaluate_hessian`) but evaluated at the
-        second-order adjoint solution instead of the first-order one. For a Dirichlet bc
-        control, ``d2F/dm2 = d2F/dudm = 0`` (the bc only ever enters ``F`` through its own
-        linear right-hand side), so this reaction term is the *entire* Hessian-action
-        contribution -- there is no separate fixed/cross term the way an ordinary
-        coefficient control has.
+        second-order adjoint solution instead of the first-order one. This is the *entire*
+        Hessian-action contribution for a Dirichlet bc control -- see
+        `dolfinx-adjoint-knowledge`'s `scratch/boundary-control/spec.md` for why.
         """
         if self._second_order_adjoint_reaction_template is None:
             self._ensure_hessian_placeholders()
@@ -792,6 +784,8 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
         P: Preconditioner for the linear problem.
         kind: Kind of PETSc Matrix to assemble the system into.
         petsc_options: Options dictionary for the PETSc krylov supspace solver.
+        petsc_options_prefix: Options prefix for the PETSc solver -- auto-generated,
+            unique per `LinearProblem`, if not supplied.
         form_compiler_options: Form compiler options for generating assembly kernels.
         jit_options: Options for just-in-time compilation of the forms.
         entity_maps: Mapping from meshes that coefficients and arguments are defined on to the
@@ -1006,6 +1000,8 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         P: Preconditioner for the nonlinear problem.
         kind: Kind of PETSc Matrix to assemble the system into.
         petsc_options: Options dictionary for the PETSc SNES solver.
+        petsc_options_prefix: Options prefix for the PETSc solver -- auto-generated,
+            unique per `NonlinearProblem`, if not supplied.
         form_compiler_options: Form compiler options for generating assembly kernels.
         jit_options: Options for just-in-time compilation of the forms.
         entity_maps: Mapping from meshes that coefficients and arguments are defined on to the
@@ -1144,9 +1140,8 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         """Dirichlet boundary conditions applied to the residual and Jacobian.
 
         {py:class}`dolfinx.fem.petsc.NonlinearProblem` has no ``bcs`` attribute of its
-        own (its SNES callbacks close over a fixed ``bcs`` list at
-        construction, see the note in {py:meth}`~dolfinx_adjoint.NonlinearProblem.__init__`); this property exposes
-        ``self._bcs`` under the same name {py:class}`~dolfinx_adjoint.LinearProblem` uses (there, it is
+        own (its SNES callbacks close over a fixed ``bcs`` list at construction); this
+        property exposes ``self._bcs`` under the same name {py:class}`~dolfinx_adjoint.LinearProblem` uses (there, it is
         the base class's own attribute), so {py:class}`~dolfinx_adjoint.solvers._ProblemBase`'s shared methods
         can read/write ``self.bcs`` uniformly across both classes.
         """
