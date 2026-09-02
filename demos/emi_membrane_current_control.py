@@ -7,8 +7,7 @@
 # have a control on the interface $\Gamma$ between two subdomains,
 # and the state is constrained by the EMI
 # (Extracellular-Membrane-Intracellular) equations, see
-# [Quick intro to the EMI equations]
-# (https://scientificcomputing.github.io/fenics-in-the-wild/src/ucs/emi/emi.html).
+# [Quick intro to the EMI equations](https://scientificcomputing.github.io/fenics-in-the-wild/src/ucs/emi/emi.html).
 # Physically, the problem can be interpreted as recovering the stimulus current
 # that a pacing electrode must inject at a cell membrane in order to reproduce
 # a desired extracellular potential recording.
@@ -30,10 +29,10 @@
 # $$
 # \int_{\Omega_e} \sigma_e \nabla u_e \cdot \nabla v_e~\mathrm{d}x +
 # \int_\Gamma T (u_e - u_i) v_e ~\mathrm{d}s &=
-# \int_\Gamma I_m v_e ~\mathrm{d}s \\
+# \int_\Gamma I_m v_e ~\mathrm{d}s, \\
 # \int_{\Omega_i} \sigma_i \nabla u_i \cdot \nabla v_i~\mathrm{d}x
 # + \int_\Gamma T (u_i - u_e) v_i ~\mathrm{d}s &=
-# -\int_\Gamma I_m v_i ~\mathrm{d}s
+# -\int_\Gamma I_m v_i ~\mathrm{d}s,
 # $$
 #
 # for all $v_e\in V_e$ and $v_i\in V_i$, with $u_e = 0$ on $\partial\Omega$ and
@@ -53,25 +52,16 @@
 # $$
 #
 # where $\alpha\in[0,\infty)$ is a Tikhonov regularization parameter.
-#
-# ```{note}
-# Unlike the scalar Poisson mother problem, the interface coupling here makes deriving a
-# closed-form analytic optimum intractable, so instead of comparing against an analytic
-# solution we verify the gradient computed by *dolfinx-adjoint* with a Taylor remainder
-# test (as in `tests/test_blocked_problem.py`), then check that optimization recovers a
-# membrane current and state close to the hidden truth used to generate the data.
-# ```
 
 # ## Implementation
-# We start by importing the necessary modules for this demo. `scifem` (used for the
+# We start by importing the necessary modules for this demo. {py:mod}`scifem` (used for the
 # submesh/interface utilities below) is an optional dependency of dolfinx-adjoint
 # (`pip install dolfinx-adjoint[scifem]`), so we exit early if it is not installed.
 
 # +
-
 from mpi4py import MPI
 
-import dolfinx
+import dolfinx.fem.petsc
 
 try:
     import scifem
@@ -98,12 +88,9 @@ pyvista.set_jupyter_backend("html")
 
 # ## Geometry, submeshes and interface
 # We build the intracellular block $\Omega_i = [0.25, 0.75]^2$ and the surrounding
-# extracellular domain $\Omega_e$, exactly as in
-# {py:mod}`the primal mixed-domain EMI example <ucs.emi.emi_primal_mixed>`, and extract
+# extracellular domain $\Omega_e$, exactly as in the FEniCS-in-the-wild demo, and extract
 # $\Omega_i$, $\Omega_e$ and the membrane $\Gamma$ as three separate meshes with
-# {py:func}`scifem.extract_submesh`. We use a much coarser mesh than the forward-accuracy
-# studies in the reference examples (which use $M=132$-$400$), since the optimization
-# loop below performs many repeated forward and adjoint block solves.
+# {py:func}`scifem.extract_submesh`.
 
 # +
 M = 24
