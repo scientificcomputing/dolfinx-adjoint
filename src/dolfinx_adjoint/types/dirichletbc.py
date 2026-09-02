@@ -50,7 +50,7 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         bc_kwargs: dict[str, Any] = {}
         # If dolfinx-version is 0.12 we need to pass the following
         # due to https://github.com/FEniCS/dolfinx/pull/4342/
-        if Version(dolfinx.__version__).minor >= 11:
+        if Version(dolfinx.__version__).minor > 11:
             bc_kwargs["V"] = g.function_space
             bc_kwargs["g"] = g
 
