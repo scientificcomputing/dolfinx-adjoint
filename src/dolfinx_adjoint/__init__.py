@@ -1,4 +1,4 @@
-"""Top-level package for dxa."""
+"""Top-level package for dolfinx_adjoint."""
 
 from importlib.metadata import metadata
 
