@@ -20,7 +20,7 @@ direct_solve = {
 
 @pytest.fixture(scope="module")
 def mesh_2D():
-    return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 7)
+    return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 27, 32)
 
 
 @pytest.mark.parametrize("use_mixed_space", [True, False])
@@ -50,7 +50,7 @@ def test_solver(use_mixed_space: bool, mesh_2D):
 
     Z = dolfinx.fem.functionspace(mesh, ("DG", 0, (mesh.geometry.dim,)))
     f = Function(Z, name="control")
-    f.interpolate(lambda x: (np.sin(x[0]), x[1]))
+    f.interpolate(lambda x: (np.sin(x[0]), -2 * x[1]))
 
     if use_mixed_space:
         W = ufl.MixedFunctionSpace(*[V, Q])
@@ -102,7 +102,7 @@ def test_solver(use_mixed_space: bool, mesh_2D):
     d.interpolate(lambda x: (10 * x[0], x[1]))
 
     e = Function(Z)
-    e.interpolate(lambda x: (1e3 * np.sin(x[1]), 1e3 * x[0]))
+    e.interpolate(lambda x: (np.sin(x[1]), x[0]))
     min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
     assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
 
@@ -110,7 +110,10 @@ def test_solver(use_mixed_space: bool, mesh_2D):
     min_rate = pyadjoint.taylor_test(Jh, d, e)
     assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_rate}"
 
+    # Scale perturbation for hessian
     Jh(d)
+    e.x.array[:] *= 200
+    e.x.scatter_forward()
     dJdm = Jh.derivative()._ad_dot(e)
     hessian = Jh.hessian(e)
     dHddu = hessian._ad_dot(e)
@@ -118,9 +121,11 @@ def test_solver(use_mixed_space: bool, mesh_2D):
     assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
     z = Function(Z)
-    z.interpolate(lambda x: (np.sin(x[1]), -(x[0] ** 2)))
+    z.interpolate(lambda x: (3 * np.sin(x[1]), -5 * (x[0] ** 2)))
     f = Function(Z)
-    f.interpolate(lambda x: (1e4 * x[0], 1e5 * np.sin(x[1])))
+    f.interpolate(lambda x: (1e3 * x[0] ** 2, 1e2 * np.sin(x[1])))
+    f.x.array[:] *= 10_030
+    f.x.scatter_forward()
     Jh(z)
     dJdm = Jh.derivative()._ad_dot(f)
     hessian = Jh.hessian(f)
@@ -223,6 +228,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     assert np.isclose(min_rate, 2.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 2.0, got {min_rate}"
 
     Jh(d)
+    e.x.array[:] *= 300
     dJdm = Jh.derivative()._ad_dot(e)
     hessian = Jh.hessian(e)
     dHddu = hessian._ad_dot(e)
@@ -237,6 +243,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     h2 = Function(Z)
     h2.interpolate(lambda x: 0.5 * np.cos(4 * x[0]))
     Jh(mu2)
+    h2.x.array[:] *= 103
     dJdm = Jh.derivative()._ad_dot(h2)
     hessian = Jh.hessian(h2)
     dHddu = hessian._ad_dot(h2)

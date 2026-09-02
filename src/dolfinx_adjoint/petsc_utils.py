@@ -99,7 +99,7 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
             except RuntimeError:
                 bcs0 = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.forms.extract_spaces(self._L), self.bcs)  # type: ignore
                 dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=0.0)
-
+        self._b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)  # type: ignore
         # Solve linear system and update ghost values in the solution
         self._solver.solve(self._b, self._x)
         dolfinx.la.petsc._ghost_update(self._x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)  # type: ignore
