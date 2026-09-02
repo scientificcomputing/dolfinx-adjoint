@@ -98,40 +98,45 @@ def test_solver(use_mixed_space: bool, mesh_2D):
 
     control = pyadjoint.Control(f)
     Jh = pyadjoint.ReducedFunctional(J, control)
-    d = Function(Z)
-    d.interpolate(lambda x: (10 * x[0], x[1]))
+    with pyadjoint.stop_annotating():
+        d = Function(Z)
+        d.interpolate(lambda x: (10 * x[0], x[1]))
 
-    e = Function(Z)
-    e.interpolate(lambda x: (np.sin(x[1]), x[0]))
-    min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
-    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+        e = Function(Z)
+        e.interpolate(lambda x: (np.sin(x[1]), x[0] ** 2))
+        min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
+        assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), (
+            f"Expected convergence rate close to 1.0, got {min_rate}"
+        )
 
-    Jh.derivative()
-    min_rate = pyadjoint.taylor_test(Jh, d, e)
-    assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_rate}"
+        Jh.derivative()
+        min_rate = pyadjoint.taylor_test(Jh, d, e)
+        assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2), (
+            f"Expected convergence rate close to 2.0, got {min_rate}"
+        )
 
-    # Scale perturbation for hessian
-    Jh(d)
-    e.x.array[:] *= 200
-    e.x.scatter_forward()
-    dJdm = Jh.derivative()._ad_dot(e)
-    hessian = Jh.hessian(e)
-    dHddu = hessian._ad_dot(e)
-    min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+        # Scale perturbation for hessian
+        Jh(d)
+        e.x.array[:] *= 201
+        e.x.scatter_forward()
+        dJdm = Jh.derivative()._ad_dot(e)
+        hessian = Jh.hessian(e)
+        dHddu = hessian._ad_dot(e)
+        min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
+        assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
-    z = Function(Z)
-    z.interpolate(lambda x: (3 * np.sin(x[1]), -5 * (x[0] ** 2)))
-    f = Function(Z)
-    f.interpolate(lambda x: (1e3 * x[0] ** 2, 1e2 * np.sin(x[1])))
-    f.x.array[:] *= 10_030
-    f.x.scatter_forward()
-    Jh(z)
-    dJdm = Jh.derivative()._ad_dot(f)
-    hessian = Jh.hessian(f)
-    dHddu = hessian._ad_dot(f)
-    min_rate = pyadjoint.taylor_test(Jh, z, f, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+        z = Function(Z)
+        z.interpolate(lambda x: (3 * np.sin(x[1]) + x[1] * x[0], -5 * (x[0]) + (1 - x[1])))
+        f = Function(Z)
+        f.interpolate(lambda x: (x[1] ** 2, x[0] ** 2))  # NOTE: Has to be divergence free
+        f.x.array[:] *= 102
+        f.x.scatter_forward()
+        Jh(z)
+        dJdm = Jh.derivative()._ad_dot(f)
+        hessian = Jh.hessian(f)
+        dHddu = hessian._ad_dot(f)
+        min_rate = pyadjoint.taylor_test(Jh, z, f, dJdm=dJdm, Hm=dHddu)
+        assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
 
 @pytest.mark.parametrize("use_mixed_space", [True, False])
@@ -151,7 +156,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     dx = ufl.Measure("dx", domain=mesh)
 
     mu = Function(Z, name="viscosity")
-    mu.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+    mu.interpolate(lambda x: 3.0 + 0.5 * np.sin(np.pi * x[0]))
 
     uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
 
@@ -215,37 +220,42 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
 
     control = pyadjoint.Control(mu)
     Jh = pyadjoint.ReducedFunctional(J, control)
-    d = Function(Z)
-    d.interpolate(lambda x: 1.0 + 0.3 * np.cos(np.pi * x[1]))
-    e = Function(Z)
-    e.interpolate(lambda x: 0.2 * np.sin(3 * x[0]))
+    with pyadjoint.stop_annotating():
+        d = Function(Z)
+        d.interpolate(lambda x: 25.0 + 0.3 * np.cos(np.pi * x[1]))
+        e = Function(Z)
+        e.interpolate(lambda x: 0.1 * np.sin(3 * x[0]))
+        e.x.array[:] *= 20  # NOTE: min(d)-max(e) > 0
 
-    min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
-    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+        min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
+        assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), (
+            f"Expected convergence rate close to 1.0, got {min_rate}"
+        )
 
-    Jh.derivative()
-    min_rate = pyadjoint.taylor_test(Jh, d, e)
-    assert np.isclose(min_rate, 2.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 2.0, got {min_rate}"
+        Jh.derivative()
+        min_rate = pyadjoint.taylor_test(Jh, d, e)
+        assert np.isclose(min_rate, 2.0, rtol=1e-1, atol=1e-1), (
+            f"Expected convergence rate close to 2.0, got {min_rate}"
+        )
 
-    Jh(d)
-    e.x.array[:] *= 300
-    dJdm = Jh.derivative()._ad_dot(e)
-    hessian = Jh.hessian(e)
-    dHddu = hessian._ad_dot(e)
-    min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+        Jh(d)
+        dJdm = Jh.derivative()._ad_dot(e)
+        hessian = Jh.hessian(e)
+        dHddu = hessian._ad_dot(e)
+        min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
+        assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
-    # A second, independent evaluation point/direction: a cached-but-unrefreshed
-    # adjoint/TLM/Hessian operator (see tests/test_tlm_update.py) could pass the
-    # check above yet still be silently wrong here.
-    mu2 = Function(Z)
-    mu2.interpolate(lambda x: 2.0 + np.sin(x[1]))
-    h2 = Function(Z)
-    h2.interpolate(lambda x: 0.5 * np.cos(4 * x[0]))
-    Jh(mu2)
-    h2.x.array[:] *= 103
-    dJdm = Jh.derivative()._ad_dot(h2)
-    hessian = Jh.hessian(h2)
-    dHddu = hessian._ad_dot(h2)
-    min_rate = pyadjoint.taylor_test(Jh, mu2, h2, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+        # A second, independent evaluation point/direction: a cached-but-unrefreshed
+        # adjoint/TLM/Hessian operator (see tests/test_tlm_update.py) could pass the
+        # check above yet still be silently wrong here.
+        mu2 = Function(Z)
+        mu2.interpolate(lambda x: 20.0 + np.sin(x[1]))
+        h2 = Function(Z)
+        h2.interpolate(lambda x: 0.5 * np.cos(4 * x[0]))  # NOTE: min(mu2)-max(h2) > 0
+        h2.x.array[:] *= 1e1
+        Jh(mu2)
+        dJdm = Jh.derivative()._ad_dot(h2)
+        hessian = Jh.hessian(h2)
+        dHddu = hessian._ad_dot(h2)
+        min_rate = pyadjoint.taylor_test(Jh, mu2, h2, dJdm=dJdm, Hm=dHddu)
+        assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
