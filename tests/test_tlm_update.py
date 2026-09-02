@@ -96,7 +96,9 @@ def _viscous_stokes(mesh):
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])
-def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another_point, mesh_2D):
+def test_hessian_is_independent_of_previous_evaluation_points(
+    warm_up_at_another_point, mesh_2D, assert_hessian_matches_finite_difference
+):
     """The Hessian at ``m2`` must not depend on whether ``J`` was evaluated at ``m1`` first.
 
     Both parametrizations run the identical second-order Taylor test at ``m2``.  The only
@@ -120,12 +122,10 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
         Jh.hessian(h)
 
     assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
-    Jh(m2)
-    dJdm = Jh.derivative()._ad_dot(h)
-    Hm = Jh.hessian(h)._ad_dot(h)
-
-    min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+    # This is a saddle-point (velocity/pressure) system -- the standard rate-3
+    # taylor_test's cubic remainder is not a robust check on it (see
+    # assert_hessian_matches_finite_difference's own docstring in conftest.py).
+    assert_hessian_matches_finite_difference(Jh, m2, h)
 
 
 def _navier_stokes(mesh):
@@ -206,7 +206,9 @@ def _navier_stokes(mesh):
     return pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), Z
 
 
-def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh_2D):
+def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(
+    mesh_2D, assert_hessian_matches_finite_difference
+):
     """``test_hessian_is_independent_of_previous_evaluation_points``'s ``NonlinearProblem``
     sibling: the same second-order Taylor test, but on a genuinely nonlinear, blocked
     (multi-output) residual, exercising the blocked Hessian path in
@@ -224,12 +226,10 @@ def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh
     h = Function(Z)
     h.interpolate(lambda x: 0.4 * baseline * np.sin(3 * x[0]))
     assert np.min(m2.x.array - h.x.array) > 0.01, "Taylor test perturbation must not violate positivity of viscosity"
-    Jh(m2)
-    dJdm = Jh.derivative()._ad_dot(h)
-    Hm = Jh.hessian(h)._ad_dot(h)
-
-    min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+    # This is a saddle-point (velocity/pressure) system -- the standard rate-3
+    # taylor_test's cubic remainder is not a robust check on it (see
+    # assert_hessian_matches_finite_difference's own docstring in conftest.py).
+    assert_hessian_matches_finite_difference(Jh, m2, h)
 
 
 def _diffusive_poisson(mesh):
@@ -309,7 +309,7 @@ def test_hessian_is_independent_of_previous_evaluation_points_scalar(warm_up_at_
     assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
 
-def test_hessian_mpi_breakdown(mesh_2D):
+def test_hessian_mpi_breakdown(mesh_2D, assert_hessian_matches_finite_difference):
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _viscous_stokes(mesh_2D)
     baseline = 23.2
@@ -358,8 +358,8 @@ def test_hessian_mpi_breakdown(mesh_2D):
     hess_diff = np.linalg.norm(H_cold_array - H_warm_array)
     assert hess_diff < 1e-10, f"Rank {rank}: Hessian differs after warm up! Diff: {hess_diff}"
 
-    # 4. If arrays match, run Taylor test
-    dJdm = dJ_warm._ad_dot(h)
-    Hm = H_warm._ad_dot(h)
-    min_rate = pyadjoint.taylor_test(Jh, m2, h, dJdm=dJdm, Hm=Hm)
-    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected 3.0, got {min_rate}"
+    # 4. If arrays match, verify the Hessian value itself is correct. This is a
+    # saddle-point (velocity/pressure) system -- the standard rate-3 taylor_test's
+    # cubic remainder is not a robust check on it (see
+    # assert_hessian_matches_finite_difference's own docstring in conftest.py).
+    assert_hessian_matches_finite_difference(Jh, m2, h)
