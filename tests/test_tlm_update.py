@@ -12,7 +12,6 @@ not actually MPI-specific, despite the name: it checks that solving at one contr
 between two evaluations at another value doesn't perturb the second evaluation's result).
 """
 
-
 from mpi4py import MPI
 
 import basix.ufl
@@ -214,7 +213,7 @@ def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(mesh
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _navier_stokes(mesh_2D)
 
-    baseline = 10.0
+    baseline = 0.08
     m2 = Function(Z)
     m2.interpolate(lambda x: baseline + 0.2 * baseline * np.cos(np.pi * x[1]))
     # Ensure min(m2) - max(h) > 0, so that the Taylor test's finite-difference perturbation doesn't
