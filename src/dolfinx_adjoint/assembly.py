@@ -21,8 +21,8 @@ def assemble_scalar(form: ufl.Form, **kwargs):
             Includes ``"ad_block_tag"`` to tag the block in the adjoint tape,
             ``"annotate"`` to control whether the assembly is annotated in the adjoint tape,
             ``"jit_options"`` for JIT compilation options,
-            and ``"form_compiler_options"`` for form compiler options and ``"entity_map"`` for assembling with Arguments
-            and coefficients form meshes that has some relation.
+            ``"form_compiler_options"`` for form compiler options, and ``"entity_maps"`` for
+            assembling with Arguments and coefficients form meshes that has some relation.
     """
     ad_block_tag = kwargs.pop("ad_block_tag", None)
 
@@ -56,7 +56,7 @@ def assemble_scalar(form: ufl.Form, **kwargs):
 def error_norm(
     u_ex: ufl.core.expr.Expr,
     u: ufl.core.expr.Expr,
-    norm_type=typing.Literal["L2", "H1"],
+    norm_type: typing.Literal["L2", "H1"] = "L2",
     jit_options: dict | None = None,
     form_compiler_options: dict | None = None,
     entity_map: dict[dolfinx.mesh.Mesh, npt.NDArray[numpy.int32]] | None = None,
