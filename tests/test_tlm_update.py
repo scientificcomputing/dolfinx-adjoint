@@ -103,17 +103,20 @@ def test_hessian_is_independent_of_previous_evaluation_points(warm_up_at_another
     pyadjoint.get_working_tape().clear_tape()
     Jh, Z = _viscous_stokes(mesh_2D)
 
+    baseline = 10
     m1, m2 = Function(Z), Function(Z)
-    m1.interpolate(lambda x: 15.0 + 0.5 * np.sin(np.pi * x[0]))
-    m2.interpolate(lambda x: 25.0 + 0.5 * np.cos(np.pi * x[1]))
+    m1.interpolate(lambda x: 4 * baseline + 0.1 * baseline * np.sin(np.pi * x[0]))
+    m2.interpolate(lambda x: 3 * baseline + 0.5 * baseline * np.cos(np.pi * x[1]))
     h = Function(Z)
-    h.interpolate(lambda x: 10.0 + 3.2 * np.sin(3 * x[0]))
+    h.interpolate(lambda x: baseline + 0.8 * baseline * np.sin(3 * x[0]))
+    assert np.min(m1.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
 
     if warm_up_at_another_point:
         Jh(m1)
         Jh.derivative()
         Jh.hessian(h)
 
+    assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
     Jh(m2)
     dJdm = Jh.derivative()._ad_dot(h)
     Hm = Jh.hessian(h)._ad_dot(h)
