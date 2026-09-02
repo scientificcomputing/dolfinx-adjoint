@@ -19,24 +19,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        label: [
-          "stable",
-          "nightly"
-        ]
+        label: ["stable", "nightly"]
 
     env:
       OMPI_ALLOW_RUN_AS_ROOT: 1
       OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1
       PRTE_MCA_rmaps_default_mapping_policy: :oversubscribe
+      PIP_NO_BUILD_ISOLATION: 0
     steps:
       - uses: actions/checkout@v7
 
       - name: Install package
-        run: python3 -m pip install .[test] --no-build-isolation
+        run: python3 -m pip install .[test]
 
       - name: Run tests
         run: python3 -m pytest -vs .
-
 
       - name: Run tests parallel
         run: mpirun -n 2 python3 -m pytest -vs tests/

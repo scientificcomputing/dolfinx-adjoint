@@ -3,7 +3,7 @@ name: Build documentation
 on:
   push:
     branches:
-    - "**"
+      - "**"
   workflow_call:
   workflow_dispatch:
 
@@ -13,9 +13,9 @@ env:
   PYVISTA_JUPYTER_BACKEND: "html"
   LIBGL_ALWAYS_SOFTWARE: 1
   DISPLAY: ":99.0"
+  PIP_NO_BUILD_ISOLATION: 0
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
     container: ghcr.io/fenics/dolfinx/lab:nightly
@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install git+https://github.com/funsim/moola.git
-          python3 -m pip install ".[docs]" --no-build-isolation
+          python3 -m pip install ".[docs]"
 
       - name: Build docs
         run: jupyter book build -W .
