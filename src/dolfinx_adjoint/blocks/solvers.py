@@ -1390,17 +1390,24 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self._entity_maps = entity_maps
         self._bcs = bcs if bcs is not None else []
 
-        # Boundary control (differentiating w.r.t. a Dirichlet bc's value) is not
-        # supported for NonlinearProblem: unlike LinearProblemBlock, this block never
-        # adds a bc as a tape dependency, so pyadjoint would otherwise silently return
-        # a zero gradient for it rather than erroring. Raise clearly instead -- use
-        # LinearProblem if the bc's value genuinely needs to be a control.
+        # Add dependencies from the boundary conditions
         for bc in self._bcs:
             if hasattr(bc, "block_variable"):
-                raise NotImplementedError(
-                    "Boundary control (a tracked Dirichlet bc value) is not supported for "
-                    "NonlinearProblem -- use LinearProblem instead."
-                )
+                self.add_dependency(bc, no_duplicates=True)
+
+        # Which output block each bc constrains, for evaluate_adj_component/
+        # evaluate_hessian_component's DirichletBC branch to index into the
+        # (possibly per-block) boundary reaction with -- computed once here, since a
+        # bc's block assignment is static for this Block's lifetime. Reuses dolfinx's
+        # own bcs_by_block rather than a hand-rolled containment check, matching the
+        # grouping HomogeneousBCLinearProblem.solve() already relies on.
+        self._bc_block_index: dict[dolfinx.fem.DirichletBC, int] = {}
+        if isinstance(self._u, list) and self._bcs:
+            spaces = [ui.function_space for ui in self._u]
+            grouped = dolfinx.fem.bcs.bcs_by_block(spaces, self._bcs)
+            for block_idx, bcs_in_block in enumerate(grouped):
+                for bc in bcs_in_block:
+                    self._bc_block_index[bc] = block_idx
 
         # No forward/adjoint solver is built here: this block shares the ones
         # owned by self.get_reference_problem() (see NonlinearProblem in ../solvers.py),

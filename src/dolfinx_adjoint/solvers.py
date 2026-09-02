@@ -419,9 +419,7 @@ class _ProblemBase(abc.ABC):
             The (possibly newly built) adjoint_solution_placeholder.
         """
         if self._adjoint_solution_placeholder is None:
-            # NOTE: Cant we just use self._u.function_space or loop over it here?
-            # It seems silly to call get_or_build_tlm_rhs_templates
-            _, _, state_placeholder = self._get_or_build_tlm_rhs_templates()
+            _, state_placeholder = self._get_or_build_residual_template()
             if isinstance(self._u, list):
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)

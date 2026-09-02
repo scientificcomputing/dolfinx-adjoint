@@ -24,7 +24,7 @@ def mesh_2D():
 
 
 @pytest.mark.parametrize("use_mixed_space", [True, False])
-def test_solver(use_mixed_space: bool, mesh_2D):
+def test_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches_finite_difference):
     pyadjoint.get_working_tape().clear_tape()
     mesh = mesh_2D
     el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
@@ -249,6 +249,103 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches
             "Taylor test perturbation must not violate positivity of viscosity"
         )
         assert_hessian_matches_finite_difference(Jh, mu2, h2)
+
+
+def test_nonlinear_blocked_dirichletbc_control(mesh_2D, assert_hessian_matches_finite_difference):
+    """As ``test_nonlinear_solver``, but with a tracked Dirichlet bc value (rather than
+    the viscosity) as the control -- exercises the newly-supported ``NonlinearProblem``
+    boundary-control path (``NonlinearProblemBlock``'s bc-dependency registration in
+    ``blocks/solvers.py``) on a *blocked* mixed velocity/pressure system.
+
+    Because the convective term makes ``F`` genuinely nonlinear in the state, ``J`` is
+    not exactly quadratic in the bc value here -- unlike every bc-control test on a
+    linear PDE elsewhere in this suite (``test_blocked_dirichletbc_control_on_second_block``,
+    ``test_blocked_dirichletbc_control_with_entity_maps``) -- so the standard rate-3
+    Hessian Taylor test is a real signal, matching
+    ``test_nonlinear_problem.py::test_scalar_dirichletbc_control``.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = mesh_2D
+    el_u = basix.ufl.element("P", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
+    el_p = basix.ufl.element("P", mesh.basix_cell(), 1)
+    V = dolfinx.fem.functionspace(mesh, el_u)
+    Q = dolfinx.fem.functionspace(mesh, el_p)
+    dx = ufl.Measure("dx", domain=mesh)
+
+    # Fixed (untracked, not the control here) viscosity -- a plain dolfinx.fem.Constant
+    # never appears in ufl.Form.coefficients(), so it is never registered as a tape
+    # dependency, matching how test_solver's own fixed bc value is untracked.
+    mu = dolfinx.fem.Constant(mesh, 0.08)
+    uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
+
+    x = ufl.SpatialCoordinate(mesh)
+    f = 10.0 * ufl.as_vector((ufl.sin(ufl.pi * x[1]), ufl.cos(ufl.pi * x[0])))
+
+    v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
+    F = [
+        ufl.inner(mu * ufl.grad(uh), ufl.grad(v)) * dx
+        + ufl.inner(ufl.dot(ufl.grad(uh), uh), v) * dx
+        + ufl.inner(ph, ufl.div(v)) * dx
+        - ufl.inner(f, v) * dx,
+        ufl.inner(q, ufl.div(uh)) * dx,
+    ]
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+
+    g = Function(V, name="bc_value")
+    g.interpolate(lambda x: (0.1 * np.sin(np.pi * x[1]), 0.1 * np.cos(np.pi * x[0])))
+    bc = dirichletbc(g, boundary_dofs, V=V)
+
+    # Explicit, tight SNES tolerances: a Taylor test replays the same NonlinearProblem at
+    # many nearby control values in a row, which is exactly the SNES warm-start pattern
+    # that can produce a false DIVERGED_LINE_SEARCH without them (see
+    # test_nonlinear_solver's own forward_options, and dolfinx-adjoint-knowledge's
+    # solver-reuse notes).
+    forward_options = {
+        "snes_type": "newtonls",
+        "snes_error_if_not_converged": True,
+        "snes_atol": 1e-12,
+        "snes_rtol": 1e-12,
+    }
+    forward_options.update(direct_solve)
+    problem = NonlinearProblem(
+        F,
+        u=[uh, ph],
+        bcs=[bc],
+        # Distinct from other NonlinearProblems in this suite (see
+        # test_nonlinear_solver's own prefix comment) so tight SNES options here never
+        # collide with a default-prefixed solver elsewhere.
+        petsc_options_prefix="dxa_blocked_nonlinear_bc_control_",
+        petsc_options=forward_options,
+        adjoint_petsc_options=direct_solve,
+        tlm_petsc_options=direct_solve,
+    )
+    problem.solve()
+
+    # Quartic in the state and with no constant offset, for the same round-off-avoidance
+    # reason as test_nonlinear_solver's objective.
+    J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
+    Jh = pyadjoint.ReducedFunctional(J, pyadjoint.Control(g))
+
+    g0 = Function(V)
+    g0.x.array[:] = g.x.array
+    h = Function(V)
+    h.interpolate(lambda x: (0.3 * np.cos(2 * np.pi * x[0]), 0.2 * np.sin(3 * np.pi * x[1])))
+
+    Jh(g0)
+    min_rate = pyadjoint.taylor_test(Jh, g0, h, dJdm=0)
+    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+
+    Jh(g0)
+    min_rate = pyadjoint.taylor_test(Jh, g0, h)
+    assert np.isclose(min_rate, 2.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 2.0, got {min_rate}"
+
+    # The standard fixed-epsilon rate-3 taylor_test is not a robust check on this
+    # particular saddle-point (Taylor-Hood velocity/pressure) system -- see
+    # assert_hessian_matches_finite_difference's own docstring (conftest.py) for why.
+    assert_hessian_matches_finite_difference(Jh, g0, h)
 
 
 def test_blocked_dirichletbc_control_on_second_block(mesh_2D):
