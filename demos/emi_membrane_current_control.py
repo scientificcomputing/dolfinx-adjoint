@@ -169,9 +169,8 @@ dGamma = ufl.Measure(
 
 # ## Function spaces and variational formulation
 # The state spaces $V_i$, $V_e$ are piecewise-linear Lagrange spaces on $\Omega_i$,
-# $\Omega_e$ respectively. The control $I_m$ lives in a piecewise-constant space on the
-# membrane $Q(\Gamma)$, mirroring the low-order, discontinuous control space used for the
-# source term in {py:mod}`demos/poisson_mother`.
+# $\Omega_e$ respectively. The control $I_m$ lives in a space of our choosing on the
+# membrane $Q(\Gamma)$.
 
 # +
 Vi = dolfinx.fem.functionspace(omega_i, ("Lagrange", 2))
@@ -210,6 +209,7 @@ a += T * (tr_ui - tr_ue) * tr_vi * dGamma
 sub_tag = dolfinx.mesh.transfer_meshtags_to_submesh(ft, omega_e, e_vertex_to_parent, exterior_to_parent)
 omega_e.topology.create_connectivity(omega_e.topology.dim - 1, omega_e.topology.dim)
 bc_dofs = dolfinx.fem.locate_dofs_topological(Ve, omega_e.topology.dim - 1, sub_tag.find(boundary_marker))
+
 # This BC value is deliberately a plain `dolfinx.fem.Constant`, not a
 # `dolfinx_adjoint.Constant`, unlike the physical parameters above: tracking it (via
 # `dolfinx_adjoint.dirichletbc`) breaks the adjoint gradient for this particular
@@ -217,6 +217,7 @@ bc_dofs = dolfinx.fem.locate_dofs_topological(Ve, omega_e.topology.dim - 1, sub_
 # rate drops from the correct ~1.0 to ~-1.4 as soon as the BC value is annotated. Since
 # the BC is fixed data, not a control, leaving it untracked is also the right modelling
 # choice, not just a workaround; the discrepancy is worth a closer look/report upstream.
+# This is hopefully fixed with PR #83.
 zero = dolfinx.fem.Constant(omega_e, 0.0)
 bc = dolfinx.fem.dirichletbc(zero, bc_dofs, Ve)
 # -
