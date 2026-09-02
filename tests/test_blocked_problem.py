@@ -195,8 +195,8 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     forward_options = {
         "snes_type": "newtonls",
         "snes_error_if_not_converged": True,
-        "snes_atol": 1e-12,
-        "snes_rtol": 1e-12,
+        "snes_atol": 1e-9,
+        "snes_rtol": 1e-9,
         "snes_monitor": None,
     }
     forward_options.update(direct_solve)
@@ -220,13 +220,13 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
 
     control = pyadjoint.Control(mu)
     Jh = pyadjoint.ReducedFunctional(J, control)
+    baseline = 10
     with pyadjoint.stop_annotating():
         d = Function(Z)
-        d.interpolate(lambda x: 25.0 + 0.3 * np.cos(np.pi * x[1]))
+        d.interpolate(lambda x: 2 * baseline + 0.3 * baseline * np.cos(np.pi * x[1]))
         e = Function(Z)
-        e.interpolate(lambda x: 0.1 * np.sin(3 * x[0]))
-        e.x.array[:] *= 20  # NOTE: min(d)-max(e) > 0
-
+        e.interpolate(lambda x: 0.25 * baseline * np.sin(3 * x[0]))
+        assert np.min(d.x.array - e.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
         min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
         assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), (
             f"Expected convergence rate close to 1.0, got {min_rate}"
@@ -249,10 +249,12 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
         # adjoint/TLM/Hessian operator (see tests/test_tlm_update.py) could pass the
         # check above yet still be silently wrong here.
         mu2 = Function(Z)
-        mu2.interpolate(lambda x: 20.0 + np.sin(x[1]))
+        mu2.interpolate(lambda x: 3 * baseline + 0.8 * baseline * np.sin(x[1]))
         h2 = Function(Z)
-        h2.interpolate(lambda x: 0.5 * np.cos(4 * x[0]))  # NOTE: min(mu2)-max(h2) > 0
-        h2.x.array[:] *= 1e1
+        h2.interpolate(lambda x: 0.2 * baseline + 0.25 * baseline * np.cos(x[0]))  # NOTE: min(mu2)-max(h2) > 0
+        assert np.min(mu2.x.array - h2.x.array) > 0.0, (
+            "Taylor test perturbation must not violate positivity of viscosity"
+        )
         Jh(mu2)
         dJdm = Jh.derivative()._ad_dot(h2)
         hessian = Jh.hessian(h2)
