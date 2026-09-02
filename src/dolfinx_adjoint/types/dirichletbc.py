@@ -16,18 +16,15 @@ def _pack_bc_value(g, V: dolfinx.fem.FunctionSpace, annotate: bool) -> Function:
     """Interpolate a Dirichlet bc value into the constrained space `V`, always via
     :py:class:`~dolfinx_adjoint.blocks.interpolation.ExprInterpolationBlock` -- even when
     `g` is already a bare :py:class:`~dolfinx_adjoint.Function`/:py:class:`~dolfinx_adjoint.Constant`,
-    via ``ufl.as_ufl(g)`` (a no-op wrap for either: both are already valid UFL terminals).
+    via ``ufl.as_ufl(g)`` (a no-op wrap for either).
 
     This is what makes :py:class:`~dolfinx_adjoint.blocks.dirichletbc.DirichletBCBlock`'s
     own adjoint/Hessian trivial: its single dependency is always this packed Function,
-    living on `V` regardless of what `g` was -- a plain value, a
-    :py:class:`~dolfinx_adjoint.Constant` broadcasting from its own private real space, or
-    a genuinely nonlinear multi-coefficient expression.
+    living on `V` regardless of what `g` was, and
     :py:class:`~dolfinx_adjoint.blocks.interpolation.ExprInterpolationBlock`'s existing,
-    general adjoint/Hessian machinery (matrix-free interpolation-operator transpose
-    action) already computes the correct sensitivity for all three cases -- including a
-    `Constant`'s broadcast-sum, which is exactly the transpose of interpolating a single
-    real-space dof across every dof of `V`.
+    general adjoint/Hessian machinery already computes the correct sensitivity for every
+    case. See dolfinx-adjoint-knowledge's scratch/boundary-control/spec.md ("Every bc
+    value is packed through ExprInterpolationBlock") for the full rationale.
     """
     expr = ufl.as_ufl(g)
     with stop_annotating():
