@@ -195,8 +195,8 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     forward_options = {
         "snes_type": "newtonls",
         "snes_error_if_not_converged": True,
-        "snes_atol": 1e-8,
-        "snes_rtol": 1e-8,
+        "snes_atol": 1e-12,
+        "snes_rtol": 1e-12,
         "snes_monitor": None,
     }
     forward_options.update(direct_solve)
