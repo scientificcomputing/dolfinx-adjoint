@@ -259,9 +259,10 @@ truth_problem.solve()
 # -
 
 # The desired state can stay a plain {py:class}`dolfinx.fem.Function`, not a
-# {py:class}`dolfinx_adjoint.Function`: `AssembleBlock` only records coefficients that are
-# already tape-tracked as dependencies, so a plain Function is simply left untracked
-# rather than raising -- exactly what we want here, since `d_e` is fixed "hidden truth"
+# {py:class}`dolfinx_adjoint.Function`: {py:class}`AssembleBlock<dolfinx_adjoint.blocks.AssembleBlock>`
+# only records coefficients that are already tape-tracked as dependencies,
+# so a plain Function is simply left untracked rather than raising --
+# exactly what we want here, since `d_e` is fixed "hidden truth"
 # data, not something to differentiate through. We copy the values over directly rather
 # than through a tracked assignment for the same reason.
 
@@ -273,7 +274,7 @@ d_e.x.scatter_forward()
 # As opposed to standard DOLFINx code, the control and state are created as
 # {py:class}`dolfinx_adjoint.Function` so that they are tracked
 # on the computational tape. A zero initial guess for $I_m$ would make the optimization
-# trivially easy (as noted in `demos/poisson_mother`), so we start from a small, diffuse,
+# trivially easy (as noted in [Poisson Mother](./poisson_mother)), so we start from a small, diffuse,
 # non-zero guess instead.
 
 # +
@@ -305,8 +306,9 @@ print(f"Initial error in control variable I_m: {err_Im_initial:.3e}")
 
 # The functional is assembled with {py:func}`dolfinx_adjoint.assemble_scalar`. Each term
 # is written with a measure native to a single mesh ($\Omega_e$ for the tracking term,
-# $\Gamma$ for the regularization term), so neither needs an `entity_maps` argument --
-# which conveniently sidesteps a gap in how `assemble_scalar` currently threads
+# $\Gamma$ for the regularization term), so neither needs an {py:class}`entity_maps<dolfinx.mesh.EntityMap>`
+# argument -- which conveniently sidesteps a gap in how
+# {py:func}`assemble_scalar<dolfinx_adjoint.assemble_scalar>` currently threads
 # `entity_maps` through to the recorded tape block (only the initial compiled form sees
 # it, not the block used on replay). The two terms live on genuinely different meshes, so
 # they cannot be summed into a single UFL form before assembly (the form compiler only
