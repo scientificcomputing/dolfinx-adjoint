@@ -40,8 +40,23 @@ def test_constant_hessian():
     bc = dolfinx_adjoint.dirichletbc(uD, boundary_dofs)
 
     # Solve and tape the PDE
+    ksp_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+        "ksp_monitor": None,
+    }
     u_sol = dolfinx_adjoint.Function(V, name="State")
-    problem = dolfinx_adjoint.LinearProblem(a, L, bcs=[bc], u=u_sol)
+    problem = dolfinx_adjoint.LinearProblem(
+        a,
+        L,
+        bcs=[bc],
+        u=u_sol,
+        petsc_options=ksp_options,
+        adjoint_petsc_options=ksp_options,
+        tlm_petsc_options=ksp_options,
+    )
     problem.solve()
 
     # ==========================================
@@ -129,7 +144,22 @@ def test_constant_hessian_linear_source():
     bc = dolfinx_adjoint.dirichletbc(u_bc, boundary_dofs)
 
     u_sol = dolfinx_adjoint.Function(V)
-    problem = dolfinx_adjoint.LinearProblem(a, L, bcs=[bc], u=u_sol)
+    ksp_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+        "ksp_monitor": None,
+    }
+    problem = dolfinx_adjoint.LinearProblem(
+        a,
+        L,
+        bcs=[bc],
+        u=u_sol,
+        petsc_options=ksp_options,
+        adjoint_petsc_options=ksp_options,
+        tlm_petsc_options=ksp_options,
+    )
     problem.solve()
 
     J_form = 0.5 * ufl.inner(u_sol, u_sol) * ufl.dx
@@ -172,7 +202,22 @@ def test_constant_hessian_linear_operator():
     bc = dolfinx_adjoint.dirichletbc(u_bc, boundary_dofs)
 
     u_sol = dolfinx_adjoint.Function(V)
-    problem = dolfinx_adjoint.LinearProblem(a, L, bcs=[bc], u=u_sol)
+    ksp_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+        "ksp_monitor": None,
+    }
+    problem = dolfinx_adjoint.LinearProblem(
+        a,
+        L,
+        bcs=[bc],
+        u=u_sol,
+        petsc_options=ksp_options,
+        adjoint_petsc_options=ksp_options,
+        tlm_petsc_options=ksp_options,
+    )
     problem.solve()
 
     J_form = 0.5 * ufl.inner(u_sol, u_sol) * ufl.dx

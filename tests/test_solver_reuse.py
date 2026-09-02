@@ -199,13 +199,17 @@ def test_nonlinear_recompute_does_not_corrupt_original_control():
     bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
     bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
 
-    options = {
-        "snes_error_if_not_converged": True,
+    direct_options = {
+        "ksp_monitor": None,
         "ksp_type": "preonly",
         "pc_type": "lu",
         "pc_factor_mat_solver_type": "mumps",
+        "ksp_error_if_not_converged": True,
     }
-    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    options = {
+        "snes_error_if_not_converged": True,
+    }
+    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=direct_options)
     problem.solve()
 
     d = pyadjoint.AdjFloat(0.2)
@@ -319,13 +323,18 @@ def test_nonlinear_adjoint_lhs_compiled_once():
     bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
     bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
 
-    options = {
-        "snes_error_if_not_converged": True,
+    direct_options = {
+        "ksp_monitor": None,
         "ksp_type": "preonly",
         "pc_type": "lu",
         "pc_factor_mat_solver_type": "mumps",
+        "ksp_error_if_not_converged": True,
     }
-    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+    options = {
+        "snes_error_if_not_converged": True,
+    }
+    options.update(direct_options)
+    problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=direct_options)
     problem.solve()
 
     d = pyadjoint.AdjFloat(0.2)
@@ -626,16 +635,20 @@ def test_nonlinear_problem_released_by_refcounting_not_gc():
     boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
     bc_val = dolfinx.fem.Constant(mesh, np.dtype(dolfinx.default_scalar_type).type(1.0))
     bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
-
-    options = {
-        "snes_error_if_not_converged": True,
+    direct_options = {
+        "ksp_monitor": None,
         "ksp_type": "preonly",
         "pc_type": "lu",
         "pc_factor_mat_solver_type": "mumps",
+        "ksp_error_if_not_converged": True,
     }
+    options = {
+        "snes_error_if_not_converged": True,
+    }
+    options.update(direct_options)
     gc.disable()
     try:
-        problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=options)
+        problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=direct_options)
         problem.solve()
 
         problem_ref = weakref.ref(problem)
@@ -732,23 +745,21 @@ def test_nonlinear_problem_rebuilt_after_garbage_collection():
 
     options = {
         "snes_error_if_not_converged": True,
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "pc_factor_mat_solver_type": "mumps",
     }
-    adjoint_options = {
+    direct_options = {
         "ksp_type": "preonly",
         "pc_type": "lu",
         "ksp_error_if_not_converged": True,
         "pc_factor_mat_solver_type": "mumps",
     }
+    options.update(direct_options)
 
     problem = NonlinearProblem(
         F1,
         u=u1,
         bcs=[bc],
         petsc_options=options,
-        adjoint_petsc_options=adjoint_options,
+        adjoint_petsc_options=direct_options,
         petsc_options_prefix="dxa_nonlinear_rebuild_test_",
     )
     problem.solve()
@@ -847,31 +858,28 @@ def test_nonlinear_blocked_problem_templates_compiled_once():
     dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets)
     zero = dolfinx.fem.Constant(mesh, np.zeros(mesh.geometry.dim, dtype=dolfinx.default_scalar_type))
     bc = dolfinx.fem.dirichletbc(zero, dofs, V)
-
+    ksp_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
     forward_options = {
         "snes_type": "newtonls",
         "snes_error_if_not_converged": True,
         "snes_atol": 1e-9,
         "snes_rtol": 1e-9,
         "snes_stol": 1e-12,
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "pc_factor_mat_solver_type": "mumps",
     }
-    adjoint_options = {
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "ksp_error_if_not_converged": True,
-        "pc_factor_mat_solver_type": "mumps",
-    }
+    forward_options.update(ksp_options)
     problem = NonlinearProblem(
         [F0, F1],
         u=[uh, ph],
         bcs=[bc],
         petsc_options_prefix="dxa_blocked_nonlinear_reuse_test_",
         petsc_options=forward_options,
-        adjoint_petsc_options=adjoint_options,
-        tlm_petsc_options=adjoint_options,
+        adjoint_petsc_options=ksp_options,
+        tlm_petsc_options=ksp_options,
     )
     problem.solve()
 
@@ -913,4 +921,81 @@ def test_nonlinear_blocked_problem_templates_compiled_once():
 
     assert problem._get_or_build_hessian_templates() is hessian_templates, (
         "blocked Hessian templates were rebuilt after evaluating at a new point"
+    )
+
+
+def test_recompute_checkpoint_and_tlm_value_preserve_overloaded_function_type():
+    """A block's recomputed checkpoint and TLM value must stay the overloaded
+    ``dolfinx_adjoint`` ``Function``, never silently downgrade to the plain
+    ``dolfinx.fem.Function`` a bare ``.copy()`` would produce.
+
+    Regression test for ``_ProblemBlockBase.recompute_component``/
+    ``LinearProblemBlock.__init__`` (and the ``NonlinearProblemBlock`` equivalent)
+    switching from ``.copy()`` -- which is hardcoded, in ``dolfinx.fem.Function``, to
+    always return the plain base class regardless of the source's concrete type -- to
+    ``Function._ad_create_checkpoint()``, which correctly preserves it.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 4, 4)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+
+    uh = Function(V, name="state")
+    v = ufl.TestFunction(V)
+    u_trial = ufl.TrialFunction(V)
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] ** 2)
+
+    a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
+
+    petsc_options = {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
+    problem.solve()
+
+    # create_block_variable() (called by problem.solve()'s own tape recording)
+    # stores the new BlockVariable back onto uh itself, so uh.block_variable is
+    # exactly the one LinearProblemBlock will recompute into below.
+    output_bv = uh.block_variable
+
+    # Using uh as an AssembleBlock coefficient here is what first turns its
+    # block_variable into a dependency of another block, which is what triggers
+    # pyadjoint to freeze a real checkpoint for it (BlockVariable.will_add_as_dependency
+    # -> save_output -> Function._ad_create_checkpoint) -- exercised by every ordinary
+    # J = assemble_scalar(f(uh) * dx) call, not something special-cased for this test.
+    J = assemble_scalar(uh * uh * ufl.dx)
+    control = pyadjoint.Control(m)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+
+    assert isinstance(output_bv.checkpoint, Function), (
+        "the checkpoint frozen when uh was first used as AssembleBlock's dependency "
+        "should already be the overloaded Function"
+    )
+
+    # Re-evaluating at a new point forces LinearProblemBlock.prepare_recompute_component/
+    # recompute_component; the checkpoint above already exists, so this exercises the
+    # in-place-reuse branch (mirroring InterpolationBlock/Firedrake's GenericSolveBlock).
+    m2 = Function(V)
+    m2.interpolate(lambda x: 2.0 + np.sin(x[0]))
+    Jh(m2)
+    assert isinstance(output_bv.saved_output, Function), (
+        "recompute_component's checkpoint reuse must preserve the overloaded Function type"
+    )
+
+    # A Hessian evaluation drives a TLM sweep first, exercising evaluate_tlm_component.
+    dm = Function(V)
+    dm.interpolate(lambda x: np.cos(np.pi * x[0]))
+    Jh.hessian(dm)
+    assert isinstance(output_bv.tlm_value, Function), (
+        "evaluate_tlm_component's returned tlm_value must be the overloaded Function type"
     )

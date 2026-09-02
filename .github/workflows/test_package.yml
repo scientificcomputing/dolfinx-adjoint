@@ -15,7 +15,15 @@ on:
 jobs:
   test-code:
     runs-on: ubuntu-latest
-    container: ghcr.io/fenics/dolfinx/dolfinx:nightly
+    container: ghcr.io/fenics/dolfinx/dolfinx:${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [
+          "stable",
+          "nightly"
+        ]
+
     env:
       OMPI_ALLOW_RUN_AS_ROOT: 1
       OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1

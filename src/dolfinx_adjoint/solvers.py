@@ -9,12 +9,12 @@ import pyadjoint
 import ufl
 from dolfinx.fem.function import Function as _Function
 
-from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock, _ProblemBlockBase
+from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock, _ProblemBlockBase, collect_coefficients
 from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
+from .typing_utils import NestedSequence
 from .ufl_utils import (
     assign_mixed_parts,
-    collect_coefficients,
     compute_adjoint,
     get_sorted_arguments,
     recursive_replace,
@@ -107,13 +107,13 @@ class HessianTemplates(typing.NamedTuple):
             per-dependency (not per-row) shape as ``fixed``.
     """
 
-    soa_self: dolfinx.fem.Form | list[dolfinx.fem.Form]
+    soa_self: NestedSequence[dolfinx.fem.Form]
     soa_cross: dict
     fixed: dict
     cross: dict
 
 
-def _pad_blocks_by_part(form: ufl.form.BaseForm, test_funcs: typing.Sequence[ufl.Argument]) -> list[ufl.form.BaseForm]:
+def _pad_blocks_by_part(form: ufl.Form, test_funcs: typing.Sequence[ufl.Argument]) -> list[ufl.Form | ufl.ZeroBaseForm]:
     """Split a blocked one-form into one entry per ``test_funcs`` part, in part order.
 
     {py:func}`ufl.extract_blocks` only returns an entry for a part that actually appears in
@@ -128,9 +128,10 @@ def _pad_blocks_by_part(form: ufl.form.BaseForm, test_funcs: typing.Sequence[ufl
     no parts for {py:func}`ufl.extract_blocks` to find, so every row is padded to zero directly
     instead.
     """
-    padded: list[ufl.form.BaseForm] = [ufl.ZeroBaseForm((test,)) for test in test_funcs]
+    padded: list[ufl.Form | ufl.ZeroBaseForm] = [ufl.ZeroBaseForm((test,)) for test in test_funcs]
     if form.empty():
         return padded
+    assert isinstance(form, ufl.Form)
     for block in ufl.extract_blocks(form):
         args = block.arguments()
         assert len(args) == 1, "Expected a single test function in the block."
@@ -147,7 +148,7 @@ def _build_soa_self_template(
     jit_options: dict | None,
     form_compiler_options: dict | None,
     entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None,
-) -> dolfinx.fem.Form:
+) -> NestedSequence[dolfinx.fem.Form]:
     """Build the SOA self-term ``adjoint(d2F/du2) . adjoint_solution``.
 
     The same computation for both {py:class}`~dolfinx_adjoint.LinearProblem` and
@@ -164,7 +165,7 @@ def _build_soa_self_template(
         soa_self_form = ufl.ZeroBaseForm((dFdu_template.arguments()[0],))
     else:
         soa_self_form = ufl.action(ufl.adjoint(d2Fdu2), adjoint_solution_placeholder)
-    return dolfinx.fem.form(
+    return dolfinx.fem.form(  # type: ignore[call-overload]
         soa_self_form,
         jit_options=jit_options,
         form_compiler_options=form_compiler_options,
@@ -264,7 +265,7 @@ class _ProblemBase(abc.ABC):
         self._tlm_solver: HomogeneousBCLinearProblem | None = None
         self._residual_template: ufl.Form | None = None
         self._residual_state_placeholder: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None
-        self._dFdu_template: ufl.Form | typing.Sequence | None = None
+        self._dFdu_template: ufl.Form | None = None
         self._dFdu_adj_template: ufl.Form | typing.Sequence | None = None
         self._tlm_rhs_templates: dict | None = None
         self._tlm_seed_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {}
@@ -296,7 +297,7 @@ class _ProblemBase(abc.ABC):
             a blocked problem).
         """
 
-    def _get_or_build_dFdu_template(self) -> ufl.Form | typing.Sequence:
+    def _get_or_build_dFdu_template(self) -> ufl.Form:
         """Build (once) and return dF/du, evaluated at the residual template's state placeholder."""
         # Shared by both classes: derived from _get_or_build_residual_template by
         # symbolic differentiation (free at compile time) rather than
@@ -418,7 +419,7 @@ class _ProblemBase(abc.ABC):
             assert isinstance(dFdu_adj_template, ufl.Form)
 
             blocked = isinstance(self._u, list)
-            soa_self: dolfinx.fem.Form | list[dolfinx.fem.Form]
+            soa_self: NestedSequence[dolfinx.fem.Form]
             if blocked:
                 # One placeholder Function per output block, mirroring how
                 # _get_or_build_hessian_templates's scalar branch below uses a
@@ -452,7 +453,7 @@ class _ProblemBase(abc.ABC):
                 # happened to eliminate entirely.
                 soa_self = [
                     dolfinx.fem.form(
-                        form_i,
+                        form_i,  # type: ignore[arg-type]
                         jit_options=self._jit_options,
                         form_compiler_options=self._form_compiler_options,
                         entity_maps=self._entity_maps,
@@ -508,7 +509,7 @@ class _ProblemBase(abc.ABC):
                     if blocked:
                         soa_cross_templates[c] = [
                             dolfinx.fem.form(
-                                form_i,
+                                form_i,  # type: ignore[arg-type]
                                 jit_options=self._jit_options,
                                 form_compiler_options=self._form_compiler_options,
                                 entity_maps=self._entity_maps,
@@ -791,9 +792,10 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
             coefficients |= collect_coefficients(P)
             if set(u_list).issubset(coefficients):
                 raise ValueError("The unknown `u` should not be part of the coefficients of a linear problem.")
-
+        # Has to be sorted when creating placeholders, as function creation is a collective operation
+        sorted_coefficients = sorted(coefficients, key=lambda c: c.ufl_id())
         self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
-            c: dolfinx.fem.Function(c.function_space) for c in coefficients
+            c: dolfinx.fem.Function(c.function_space) for c in sorted_coefficients
         }
         a_R, L_R, P_R = recursive_replace((a, L, P), self._value_placeholders)  # type: ignore[misc]
         super().__init__(
