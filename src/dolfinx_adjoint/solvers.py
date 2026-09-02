@@ -8,10 +8,11 @@ import dolfinx.fem.petsc
 import pyadjoint
 import ufl
 from dolfinx.fem.function import Function as _Function
-from .typing_utils import NestedSequence
+
 from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock, _ProblemBlockBase, collect_coefficients
 from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
+from .typing_utils import NestedSequence
 from .ufl_utils import (
     assign_mixed_parts,
     compute_adjoint,
