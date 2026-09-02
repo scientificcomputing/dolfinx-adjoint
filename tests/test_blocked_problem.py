@@ -99,11 +99,12 @@ def test_solver(use_mixed_space: bool, mesh_2D):
     control = pyadjoint.Control(f)
     Jh = pyadjoint.ReducedFunctional(J, control)
     with pyadjoint.stop_annotating():
+        baseline = 100
         d = Function(Z)
-        d.interpolate(lambda x: (10 * x[0], x[1]))
+        d.interpolate(lambda x: (baseline * x[0], 2 * baseline * x[1]))
 
         e = Function(Z)
-        e.interpolate(lambda x: (np.sin(x[1]), x[0] ** 2))
+        e.interpolate(lambda x: (10 * baseline * np.sin(x[1]), 3 * baseline * x[0] ** 2))
         min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
         assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), (
             f"Expected convergence rate close to 1.0, got {min_rate}"
@@ -117,8 +118,6 @@ def test_solver(use_mixed_space: bool, mesh_2D):
 
         # Scale perturbation for hessian
         Jh(d)
-        e.x.array[:] *= 201
-        e.x.scatter_forward()
         dJdm = Jh.derivative()._ad_dot(e)
         hessian = Jh.hessian(e)
         dHddu = hessian._ad_dot(e)
@@ -126,10 +125,13 @@ def test_solver(use_mixed_space: bool, mesh_2D):
         assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
 
         z = Function(Z)
-        z.interpolate(lambda x: (3 * np.sin(x[1]) + x[1] * x[0], -5 * (x[0]) + (1 - x[1])))
+        z.interpolate(
+            lambda x: (5 * baseline * np.sin(x[1]) + 0.3 * baseline * x[1] * x[0], -2 * baseline * (x[0]) + (1 - x[1]))
+        )
         f = Function(Z)
-        f.interpolate(lambda x: (x[1] ** 2, x[0] ** 2))  # NOTE: Has to be divergence free
-        f.x.array[:] *= 102
+        f.interpolate(
+            lambda x: (0.8 * baseline * x[1] ** 2, 2 * baseline * x[0] ** 2)
+        )  # NOTE: Has to be divergence free
         f.x.scatter_forward()
         Jh(z)
         dJdm = Jh.derivative()._ad_dot(f)
@@ -156,7 +158,8 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
     dx = ufl.Measure("dx", domain=mesh)
 
     mu = Function(Z, name="viscosity")
-    mu.interpolate(lambda x: 3.0 + 0.5 * np.sin(np.pi * x[0]))
+    baseline = 0.08
+    mu.interpolate(lambda x: baseline + 0.5 * baseline * np.sin(np.pi * x[0]))
 
     uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
 
@@ -220,12 +223,12 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
 
     control = pyadjoint.Control(mu)
     Jh = pyadjoint.ReducedFunctional(J, control)
-    baseline = 10
+    baseline = 0.08
     with pyadjoint.stop_annotating():
         d = Function(Z)
         d.interpolate(lambda x: 2 * baseline + 0.3 * baseline * np.cos(np.pi * x[1]))
         e = Function(Z)
-        e.interpolate(lambda x: 0.25 * baseline * np.sin(3 * x[0]))
+        e.interpolate(lambda x: 0.5 * baseline * np.sin(3 * x[0]))
         assert np.min(d.x.array - e.x.array) > 0.0, "Taylor test perturbation must not violate positivity of viscosity"
         min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
         assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), (
@@ -251,7 +254,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D):
         mu2 = Function(Z)
         mu2.interpolate(lambda x: 3 * baseline + 0.8 * baseline * np.sin(x[1]))
         h2 = Function(Z)
-        h2.interpolate(lambda x: 0.2 * baseline + 0.25 * baseline * np.cos(x[0]))  # NOTE: min(mu2)-max(h2) > 0
+        h2.interpolate(lambda x: 0.4 * baseline + 0.9 * baseline * np.cos(x[0]))  # NOTE: min(mu2)-max(h2) > 0
         assert np.min(mu2.x.array - h2.x.array) > 0.0, (
             "Taylor test perturbation must not violate positivity of viscosity"
         )
