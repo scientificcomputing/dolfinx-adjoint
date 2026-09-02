@@ -270,7 +270,7 @@ d_e.x.scatter_forward()
 
 # ## The dolfinx-adjoint control problem
 # As opposed to standard DOLFINx code, the control and state are created as
-# {py:class}`dolfinx_adjoint.Function<dolfinx_adjoint.Function>` so that they are tracked
+# {py:class}`dolfinx_adjoint.Function` so that they are tracked
 # on the computational tape. A zero initial guess for $I_m$ would make the optimization
 # trivially easy (as noted in `demos/poisson_mother`), so we start from a small, diffuse,
 # non-zero guess instead.
@@ -353,17 +353,15 @@ assert np.isclose(min_rate, 2.0, rtol=2e-1, atol=2e-1), min_rate
 # -
 
 # ## Verifying the Hessian
-# `moola.NewtonCG` (used below) exploits second-order information, so we verify the
-# Hessian too -- but a rate-3 Taylor test, as `tests/test_blocked_problem.py` uses, does
-# not apply here. `Im` enters only the *right-hand side* `L` of the (linear) state
-# equation, never the bilinear form `a`, so $u_e(I_m)$ depends *linearly* on the control,
-# and $J(I_m) = \tfrac12\|u_e(I_m) - d_e\|^2 + \tfrac{\alpha}{2}\|I_m\|^2$ is therefore
-# *exactly quadratic* in $I_m$: its Taylor expansion has no cubic term to converge to, so
-# the 2nd-order-corrected remainder is pure floating-point roundoff at every perturbation
-# size (confirmed experimentally: the rate is not close to 3 for any perturbation
-# amplitude we tried, small or large). We instead check the stronger, more direct property
-# this predicts -- the remainder after subtracting the gradient *and* Hessian correction
-# should already be at floating-point-noise level, not just asymptotically for small $h$.
+# {py:class}`moola.NewtonCG` (used below) exploits second-order information, so we verify
+# the Hessian too -- but not with a rate-3 Taylor test. `Im` enters only the
+# *right-hand side* `L` of the (linear) state equation, never the bilinear form `a`, so
+# $u_e(I_m)$ depends *linearly* on the control, and
+# $J(I_m) = \tfrac12\|u_e(I_m) - d_e\|^2 + \tfrac{\alpha}{2}\|I_m\|^2$ is *exactly
+# quadratic* in $I_m$: its Taylor expansion has no cubic term, so the remainder after
+# subtracting the gradient *and* Hessian correction is already at floating-point-noise
+# level for any perturbation size, not just asymptotically as $h\to 0$. That is the
+# (stronger, more direct) property we check below instead of a convergence rate.
 
 # +
 J0 = float(Jhat(Im_eval))
