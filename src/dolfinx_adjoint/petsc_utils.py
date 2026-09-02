@@ -99,19 +99,17 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
             dolfinx.fem.petsc.assemble_matrix(self._P_mat, self._preconditioner, bcs=self.bcs)  # type: ignore
             self._P_mat.assemble()
 
-        # Tangent-linear boundary control: self._A's bc columns are already eliminated by
-        # the assemble_matrix(bcs=self.bcs) call above, so simply setting the boundary dofs
-        # of self._b to the perturbation direction (as the pass below does) would leave
-        # u_dot's *interior* dofs at whatever the caller's own RHS contribution already put
-        # there -- zero, if (as here) there is none -- discarding the perturbation's actual
-        # propagation through the PDE into the interior. apply_lifting recomputes exactly
-        # that propagation directly from the (unmodified) form self._a, exactly as the
-        # forward solve's own lifting step does for the state itself; it must run *before*
-        # the bc dofs are set to their final values (its own alpha=1.0 default expects x0=0
-        # there, matching the b_loc.set(0.0)/zeroed-accumulation state prepare_evaluate_tlm
-        # already left this vector in). Dofs not covered by any entry in self.tlm_bcs (an
-        # untracked bc, or a tracked one with no tangent-linear value this call) contribute
-        # no lifting here, correctly matching u_dot=0 there.
+        # Tangent-linear boundary control: self._A's bc columns are already eliminated, so
+        # simply setting self._b's boundary dofs to the perturbation direction would leave
+        # u_dot's interior dofs at whatever the caller's own RHS already put there,
+        # discarding the perturbation's propagation through the PDE. apply_lifting
+        # recomputes that propagation from the (unmodified) form self._a -- it must run
+        # *before* the bc dofs are set to their final values (its own alpha=1.0 default
+        # expects x0=0, matching the zeroed state prepare_evaluate_tlm leaves this vector
+        # in). Dofs not covered by self.tlm_bcs (untracked, or no tangent-linear value this
+        # call) correctly get no lifting, matching u_dot=0 there. See
+        # dolfinx-adjoint-knowledge's scratch/boundary-control/spec.md for the full
+        # derivation.
         if self.tlm_bcs:
             if isinstance(self._u, list):
                 bcs_lift = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore
@@ -123,12 +121,12 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
         if self.bcs is not None:
             if isinstance(self._u, list):
                 # `bc.set()` on the monolithic blocked vector has no block-offset
-                # translation: for a bc constraining any block other than the first, its
-                # raw (block-local) dof indices land in the wrong block. Route through
-                # bcs_by_block/set_bc unconditionally for blocked problems -- mirroring
-                # the base LinearProblem.solve()'s own isinstance(self.u, Sequence) branch
-                # -- rather than a try/except RuntimeError, which dolfinx.fem.DirichletBC.set()
-                # never raises (it silently skips out-of-range dofs instead).
+                # translation: a bc constraining any block other than the first would land
+                # its raw (block-local) dof indices in the wrong block. Route through
+                # bcs_by_block/set_bc unconditionally for blocked problems, mirroring the
+                # base LinearProblem.solve()'s own isinstance(self.u, Sequence) branch (see
+                # dolfinx-adjoint-knowledge's scratch/boundary-control/issues/01 for the
+                # bug this fixes).
                 bcs0 = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.bcs)  # type: ignore
                 dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=0.0)
             else:
