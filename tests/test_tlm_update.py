@@ -29,6 +29,7 @@ direct_solve = {
     "pc_type": "lu",
     "ksp_error_if_not_converged": True,
     "pc_factor_mat_solver_type": "mumps",
+    "ksp_monitor": None,
 }
 
 
@@ -177,6 +178,7 @@ def _navier_stokes(mesh):
         # step can make backtracking line search report DIVERGED_LINE_SEARCH.  An
         # explicit absolute tolerance lets it recognize "already converged" and
         # exit immediately instead.
+        "snes_monitor": None,
         "snes_atol": 1e-8,
         "snes_rtol": 1e-8,
     }
@@ -315,8 +317,8 @@ def test_hessian_mpi_breakdown(mesh_2D):
     m2.interpolate(lambda x: 4 * baseline + 0.2 * baseline * np.cos(np.pi * x[1]))
     h = Function(Z)
     h.interpolate(lambda x: -0.8 * baseline * np.cos(x[1]) * np.sin(3 * x[0]))
-    assert np.min(m1.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positive viscosity"
-    assert np.min(m2.x.array - h.x.array) > 0.0, "Taylor test perturbation must not violate positive viscosity"
+    assert np.min(m1.x.array - h.x.array) > 0.05, "Taylor test perturbation must not violate positive viscosity"
+    assert np.min(m2.x.array - h.x.array) > 0.05, "Taylor test perturbation must not violate positive viscosity"
     # === COLD START ===
     J_cold = float(Jh(m2))
     dJ_cold = Jh.derivative()
