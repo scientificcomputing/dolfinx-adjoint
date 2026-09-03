@@ -118,8 +118,14 @@ def test_time_dependent_bc_replay():
 
     # Use native dolfinx here! PyAdjoint traces the bc_func inside it.
     bc = dirichletbc(bc_func, boundary_dofs)
-
-    problem = LinearProblem(a, L, bcs=[bc], u=uh)
+    petsc_options = {
+        "ksp_monitor": None,
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "ksp_error_if_not_converged": True,
+        "pc_factor_mat_solver_type": "mumps",
+    }
+    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
 
     J = 0.0
 
@@ -136,3 +142,24 @@ def test_time_dependent_bc_replay():
     J_replay = Jhat(m)
 
     assert np.isclose(J_replay, J_forward, atol=1e-10, rtol=1e-10)
+
+    # Gradient/Taylor equivalence through the multi-solve() loop: replaying,
+    # differentiating, and perturbing a control across several timesteps on
+    # one shared LinearProblem must give the same Taylor convergence as
+    # before the solver/form-reuse refactor (see the module-level plan in
+    # dolfinx-adjoint-knowledge's solver-reuse spec, "Behaviour is
+    # unchanged").
+    # J is dominated by the (non-controlled) time-varying Dirichlet value, so
+    # J's sensitivity to m is comparatively small: scale the perturbation up
+    # so that pyadjoint.taylor_test's fixed step sizes resolve the quadratic
+    # remainder well above solver/roundoff noise (matching the disproportionate
+    # perturbation-to-control scaling already used in
+    # test_nonlinear_problem.py's own taylor tests).
+    pert = Function(V)
+    pert.interpolate(lambda x: 20.0 * np.cos(x[1] * np.pi))
+
+    Jhat(m)
+    pyadjoint.taylor_test(Jhat, m, pert, dJdm=0)
+    Jhat(m)
+    min_rate_grad = pyadjoint.taylor_test(Jhat, m, pert)
+    assert np.isclose(min_rate_grad, 2.0, rtol=1e-2, atol=5e-2), f"Expected 2.0, got {min_rate_grad}"

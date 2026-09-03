@@ -25,8 +25,12 @@ def function_from_vector(
 ) -> dolfinx.fem.Function:
     """Create a new Function from a vector.
 
-    :arg V: The function space
-    :arg vector: The vector data.
+    Arguments:
+        V: The function space
+        vector: The vector data.
+    Returns:
+        A new {py:class}`dolfinx.fem.Function` instance that has been assigned the
+        values from the vector (deep-copy)
     """
     ret = dolfinx.fem.Function(V, dtype=vector.array.dtype)
     ret.x.array[:] = vector.array[:]
@@ -34,7 +38,13 @@ def function_from_vector(
 
 
 def gather(vector: dolfinx.la.Vector) -> npt.NDArray[numpy.number]:
-    """Gather a vector on all processes."""
+    """Gather a vector on all processes.
+
+    Args:
+        vector: The vector to gather.
+    Returns:
+        A numpy array containing the gathered vector.
+    """
     local_size = vector.index_map.size_local * vector.block_size
     comm = vector.index_map.comm
     data = comm.allgather(vector.array[:local_size])
@@ -59,6 +69,7 @@ def assign_linear_combination(value: ufl.core.expr.Expr, function: dolfinx.fem.F
     function.x.array[:] = 0.0
     floatifier = Floatify()
     for weight, func in pairs:
+        assert isinstance(func, dolfinx.fem.Function), "All operands in the linear combination must be Functions."
         if not func.function_space == function.function_space:
             raise ValueError("Function spaces of all functions in the linear combination must match for assignment.")
         function.x.array[:] += floatifier.process(weight) * func.x.array[:]

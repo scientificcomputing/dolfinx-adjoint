@@ -41,13 +41,13 @@ conda install -c conda-forge dolfinx-adjoint
 To install the latest development version directly from the repository, use:
 
 ```bash
-python3 -m pip install git+[https://github.com/scientificcomputing/dolfinx-adjoint.git](https://github.com/scientificcomputing/dolfinx-adjoint.git)
+python3 -m pip install git+https://github.com/scientificcomputing/dolfinx-adjoint.git
 ```
 
 If you plan to actively modify the code, clone the repository and install the optional dependencies for testing, development, and documentation generation:
 
 ```bash
-git clone [https://github.com/scientificcomputing/dolfinx-adjoint.git](https://github.com/scientificcomputing/dolfinx-adjoint.git)
+git clone https://github.com/scientificcomputing/dolfinx-adjoint.git
 cd dolfinx-adjoint
 python3 -m pip install -e ".[all]"
 ```
