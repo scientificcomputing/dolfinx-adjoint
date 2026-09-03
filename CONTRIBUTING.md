@@ -52,12 +52,12 @@ for, so linking them makes everything resolve in place:
 ```bash
 git clone git@github.com:scientificcomputing/dolfinx-adjoint-knowledge.git ../dolfinx-adjoint-knowledge
 
-ln -s ../dolfinx-adjoint-knowledge/CONTEXT.md   CONTEXT.md
-ln -s ../dolfinx-adjoint-knowledge/CLAUDE.md    CLAUDE.md
-ln -s ../dolfinx-adjoint-knowledge/scratch      .scratch
-ln -s ../dolfinx-adjoint-knowledge/references   references
-ln -s ../../dolfinx-adjoint-knowledge/adr       docs/adr
-ln -s ../../dolfinx-adjoint-knowledge/agents    docs/agents
+ln -sf ../dolfinx-adjoint-knowledge/CONTEXT.md   CONTEXT.md
+ln -sf ../dolfinx-adjoint-knowledge/CLAUDE.md    CLAUDE.md
+ln -sf ../dolfinx-adjoint-knowledge/scratch      .scratch
+ln -sf ../dolfinx-adjoint-knowledge/references   references
+ln -sf ../../dolfinx-adjoint-knowledge/adr       docs/adr
+ln -sf ../../dolfinx-adjoint-knowledge/agents    docs/agents
 
 # Keep them out of this repository's history. `.git/info/exclude` is per-clone and is not
 # itself versioned, so this has to be done again in every clone. Do not give the patterns a
