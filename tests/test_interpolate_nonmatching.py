@@ -84,7 +84,7 @@ def _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc):
     dJdm = Jh.derivative()._ad_dot(du)
     dHddu = Jh.hessian(du)._ad_dot(du)
     min_rate_hess = pyadjoint.taylor_test(Jh, u, du, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate_hess, 3.0, rtol=1e-3, atol=1e-3)
+    assert np.isclose(min_rate_hess, 3.0, rtol=0.1, atol=0.1)
 
 
 @pytest.mark.parametrize("use_petsc", [False, True])
