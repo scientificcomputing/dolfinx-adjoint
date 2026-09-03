@@ -51,7 +51,10 @@ petsc_options = {
 def solve_heat(schedule=None, disk=False):
     """Tape the heat equation over `num_steps` timesteps, optionally under a schedule.
 
-    Returns the reduced functional and the controls, one control per timestep.
+    Returns the reduced functional, the controls -- one per timestep -- and the
+    `LinearProblem`. The problem is returned only so the caller can keep it alive: replaying a
+    timestep needs it, and if it has been collected by then an equivalent one is rebuilt at
+    some cost.
     """
     tape = pyadjoint.Tape()
     pyadjoint.set_working_tape(tape)
@@ -73,9 +76,14 @@ def solve_heat(schedule=None, disk=False):
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     f = dolfinx_adjoint.Function(V, name="source")
-    u_0 = dolfinx_adjoint.Function(V, name="solution")
+    uh = dolfinx_adjoint.Function(V, name="solution")
+    u_prev = dolfinx_adjoint.Function(V, name="previous")
 
-    F = ((u - u_0) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
+    # The unknown and the previous state are separate functions, and the state update is an
+    # explicit, tape-recorded assignment. Solving into a function the form also reads would
+    # leave the tape with no record of where the previous state came from, so recomputing a
+    # timestep under a schedule would use whatever happens to be in it at replay time.
+    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
     a, L = ufl.system(F)
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -86,13 +94,13 @@ def solve_heat(schedule=None, disk=False):
     problem = dolfinx_adjoint.LinearProblem(
         a,
         L,
-        u=u_0,
+        u=uh,
         bcs=[bc],
         petsc_options=petsc_options,
         adjoint_petsc_options=petsc_options,
     )
 
-    j = 0.5 * float(dt) * dolfinx_adjoint.assemble_scalar((u_0 - d) ** 2 * ufl.dx)
+    j = 0.5 * float(dt) * dolfinx_adjoint.assemble_scalar((uh - d) ** 2 * ufl.dx)
 
     # `iter(...)` because timestepper calls next() on what it is given, and the default
     # progress bar passes it straight through. Setting tape.progress_bar works too.
@@ -100,15 +108,16 @@ def solve_heat(schedule=None, disk=False):
         t_val = float(dt) * (i + 1)
         dolfinx_adjoint.assign(t_val, t)
         dolfinx_adjoint.assign(ctrls[i], f)
+        dolfinx_adjoint.assign(uh, u_prev)
 
         problem.solve()
 
         weight = 0.5 if i == num_steps - 1 else 1.0
-        j += weight * float(dt) * dolfinx_adjoint.assemble_scalar((u_0 - d) ** 2 * ufl.dx)
+        j += weight * float(dt) * dolfinx_adjoint.assemble_scalar((uh - d) ** 2 * ufl.dx)
 
     controls = list(ctrls.values())
     rf = pyadjoint.ReducedFunctional(j, [pyadjoint.Control(c) for c in controls])
-    return rf, controls
+    return rf, controls, problem
 
 
 # ## Checkpointing does not change the answer
@@ -116,11 +125,11 @@ def solve_heat(schedule=None, disk=False):
 # A schedule only changes when state is stored and recomputed. The functional and its gradient
 # are unchanged, which is worth checking explicitly the first time you enable one.
 
-rf_plain, controls_plain = solve_heat()
+rf_plain, controls_plain, problem_plain = solve_heat()
 J_plain = rf_plain(controls_plain)
 grad_plain = [np.copy(g.x.array) for g in rf_plain.derivative()]
 
-rf_ckpt, controls_ckpt = solve_heat(Revolve(num_steps, 3))
+rf_ckpt, controls_ckpt, problem_ckpt = solve_heat(Revolve(num_steps, 3))
 J_ckpt = rf_ckpt(controls_ckpt)
 grad_ckpt = [np.copy(g.x.array) for g in rf_ckpt.derivative()]
 
@@ -149,7 +158,7 @@ with pyadjoint.stop_annotating():
         h.interpolate(lambda x, k=k: np.sin((k + 1) * np.pi * x[0]) * np.cos(np.pi * x[1]))
         directions.append(h)
 
-rf_ckpt, controls_ckpt = solve_heat(Revolve(num_steps, 3))
+rf_ckpt, controls_ckpt, problem_ckpt = solve_heat(Revolve(num_steps, 3))
 rate = pyadjoint.taylor_test(rf_ckpt, controls_ckpt, directions)
 assert rate > 1.9
 
@@ -171,7 +180,7 @@ assert rate > 1.9
 
 from checkpoint_schedules import SingleDiskStorageSchedule  # noqa: E402
 
-rf_disk, controls_disk = solve_heat(SingleDiskStorageSchedule(), disk=True)
+rf_disk, controls_disk, problem_disk = solve_heat(SingleDiskStorageSchedule(), disk=True)
 J_disk = rf_disk(controls_disk)
 grad_disk = [np.copy(g.x.array) for g in rf_disk.derivative()]
 
