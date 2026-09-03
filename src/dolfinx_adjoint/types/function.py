@@ -13,6 +13,7 @@ from pyadjoint.overloaded_type import (
     register_overloaded_type,
 )
 from pyadjoint.tape import no_annotations
+from ufl.core.ufl_id import attach_ufl_id
 
 from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
@@ -36,6 +37,7 @@ def _create_function(
     return Function(V, x=x, annotate=False)
 
 
+@attach_ufl_id
 class Function(dolfinx.fem.Function, FloatingType):
     """A class overloading `dolfinx.fem.Function` to support it being used as a control variable
     in the adjoint framework.
@@ -52,11 +54,13 @@ class Function(dolfinx.fem.Function, FloatingType):
     def __init__(
         self,
         V: dolfinx.fem.FunctionSpace,
-        x: typing.Optional[dolfinx.la.Vector] = None,
-        name: typing.Optional[str] = None,
+        x: dolfinx.la.Vector | None = None,
+        name: str | None = None,
         dtype: npt.DTypeLike = dolfinx.default_scalar_type,
         **kwargs,
     ):
+        ufl_id = kwargs.pop("ufl_id", None)
+        self._ufl_id = self._init_ufl_id(ufl_id)
         super(Function, self).__init__(
             V,
             x,
@@ -115,7 +119,7 @@ class Function(dolfinx.fem.Function, FloatingType):
             return checkpoint.restore()
         return checkpoint
 
-    def _ad_dot(self, other: typing.Self, options: typing.Optional[dict] = None):
+    def _ad_dot(self, other: typing.Self, options: dict | None = None):
         """Compute the inner product of the current function with ``other`` in the Riesz representation.
 
         Args:
@@ -175,9 +179,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         return r
 
     @no_annotations
-    def _ad_convert_riesz(
-        self, value: dolfinx.la.Vector, riesz_map: typing.Optional[dict] = None
-    ) -> dolfinx.fem.Function:
+    def _ad_convert_riesz(self, value: dolfinx.la.Vector, riesz_map: dict | None = None) -> dolfinx.fem.Function:
         """Convert a vector to a Riesz representation of the function."""
         options = {} if riesz_map is None else riesz_map
         riesz_representation = options.get("riesz_representation", "l2")
@@ -261,6 +263,7 @@ class Function(dolfinx.fem.Function, FloatingType):
         return self._x
 
 
+@attach_ufl_id
 class Constant(Function):
     """A class overloading {py:class}`dolfinx.fem.Constant`
     to support it being used as a control variable in
@@ -286,7 +289,11 @@ class Constant(Function):
         self,
         domain: dolfinx.mesh.Mesh,
         c: float | numpy.floating | complex | numpy.complexfloating | typing.Sequence | numpy.ndarray,
+        name: str | None = None,
+        ufl_id: int | None = None,
     ):
+        self._ufl_id = self._init_ufl_id(ufl_id)
+
         value_shape = numpy.shape(c)
         try:
             el = basix.ufl.real_element(domain.basix_cell(), value_shape=numpy.shape(c))
@@ -299,7 +306,7 @@ class Constant(Function):
                 raise ImportError("scifem is required to use Constant 'pip install scifem") from e
 
             V = scifem.create_real_functionspace(domain, value_shape=value_shape)
-        super().__init__(V)
+        super().__init__(V, name=name)
         self.x.array[:] = c
 
     @property

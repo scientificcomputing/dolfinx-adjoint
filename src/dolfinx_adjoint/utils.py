@@ -25,8 +25,12 @@ def function_from_vector(
 ) -> dolfinx.fem.Function:
     """Create a new Function from a vector.
 
-    :arg V: The function space
-    :arg vector: The vector data.
+    Arguments:
+        V: The function space
+        vector: The vector data.
+    Returns:
+        A new {py:class}`dolfinx.fem.Function` instance that has been assigned the
+        values from the vector (deep-copy)
     """
     ret = dolfinx.fem.Function(V, dtype=vector.array.dtype)
     ret.x.array[:] = vector.array[:]
@@ -34,7 +38,13 @@ def function_from_vector(
 
 
 def gather(vector: dolfinx.la.Vector) -> npt.NDArray[numpy.number]:
-    """Gather a vector on all processes."""
+    """Gather a vector on all processes.
+
+    Args:
+        vector: The vector to gather.
+    Returns:
+        A numpy array containing the gathered vector.
+    """
     local_size = vector.index_map.size_local * vector.block_size
     comm = vector.index_map.comm
     data = comm.allgather(vector.array[:local_size])

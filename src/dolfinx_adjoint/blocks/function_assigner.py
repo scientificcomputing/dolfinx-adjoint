@@ -1,5 +1,3 @@
-import typing
-
 import dolfinx
 import numpy as np
 import numpy.typing as npt
@@ -49,7 +47,7 @@ class FunctionAssignBlock(Block):
         self,
         other: np.inexact | int | float | _Function | ufl.core.expr.Expr,
         func: _Function,
-        ad_block_tag: typing.Optional[str] = None,
+        ad_block_tag: str | None = None,
     ):
         super().__init__(ad_block_tag=ad_block_tag)
 

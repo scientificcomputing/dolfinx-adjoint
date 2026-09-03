@@ -41,19 +41,27 @@ sphinx:
       .py:
         - jupytext.reads
         - fmt: py
+    suppress_warnings: ["mystnb.unknown_mime_type"]
+    codeautolink_concat_default: True
     intersphinx_mapping:
+      basix : ["https://docs.fenicsproject.org/basix/main/python/", null]
+      ffcx : ["https://docs.fenicsproject.org/ffcx/main/", null]
+      ufl : ["https://docs.fenicsproject.org/ufl/main/", null]
+      dolfinx : ["https://docs.fenicsproject.org/dolfinx/main/python/", null]
+      scifem: ["http://scientificcomputing.github.io/scifem/", null]
+      petsc4py: ["https://petsc.org/release/petsc4py/", null]
+      mpi4py: ["https://mpi4py.readthedocs.io/en/stable", null]
+      numpy: ["https://numpy.org/doc/stable/", null]
+      pyvista: ["https://docs.pyvista.org/", null]
+      packaging: ["https://packaging.pypa.io/en/stable/", null]
       checkpoint_schedules: ["https://www.firedrakeproject.org/checkpoint_schedules/", null]
       pyadjoint: ["https://www.dolfin-adjoint.org/en/latest/", null]
-      dolfinx: ["https://docs.fenicsproject.org/dolfinx/main/python", null]
-      ufl: ["https://docs.fenicsproject.org/ufl/main/", null]
       h5py: ["https://docs.h5py.org/en/stable/", null]
-      numpy: ["https://numpy.org/doc/stable/", null]
-      mpi4py: ["https://mpi4py.readthedocs.io/en/stable", null]
-      petsc4py: ["https://petsc.org/release/petsc4py", null]
 
   extra_extensions:
   - 'sphinx.ext.autodoc'
   - 'sphinx.ext.napoleon'
   - 'sphinx.ext.viewcode'
   - 'sphinx.ext.intersphinx'
+  - 'sphinx_codeautolink'
 exclude_patterns: [".pytest_cache/*"]
