@@ -9,11 +9,13 @@ authors = [{ name = "Jørgen S. Dokken", email = "dokken@simula.no" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
+# 3.12 for the PEP 695 `type X[T] = ...` aliases in src/dolfinx_adjoint/typing_utils.py.
+# That is syntax, not a library feature, so on anything older the package does not import at
+# all -- declaring a lower floor would not widen support, only move the failure.
 requires-python = ">=3.12"
 dependencies = [
       "fenics-dolfinx>=0.10.0",
       "pyadjoint-ad>=2025.10.0",
-      "typing_extensions; python_version < '3.11'",
       "packaging>=24.2",
       # Storage for checkpoint schedules that keep state on disk. Build it against MPI to get
       # one shared checkpoint file; without that each process writes its own.
