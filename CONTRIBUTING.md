@@ -32,6 +32,78 @@ Note that for a pull request to be accepted, it has to pass all the tests on CI,
 - `pytest`: Successfull execution of all tests in the `tests` folder.
 
 
+## Design notes, and working with coding agents
+
+The reasoning behind the design — a domain glossary, architecture decision records, feature
+specs, the papers the algorithms follow, and memory for coding agents — is kept in a separate,
+internal repository,
+[dolfinx-adjoint-knowledge](https://github.com/scientificcomputing/dolfinx-adjoint-knowledge),
+so that this one stays free of files most contributors do not need.
+
+**None of it is required.** You can build, test and contribute without it, and nothing in the
+package imports or reads it.
+
+### Linking it in
+
+If you have access, clone it *beside* this repository and link it in from the repository root.
+The paths it provides are the ones this project's tooling and agent instructions already look
+for, so linking them makes everything resolve in place:
+
+```bash
+git clone git@github.com:scientificcomputing/dolfinx-adjoint-knowledge.git ../dolfinx-adjoint-knowledge
+
+ln -sf ../dolfinx-adjoint-knowledge/CONTEXT.md   CONTEXT.md
+ln -sf ../dolfinx-adjoint-knowledge/CLAUDE.md    CLAUDE.md
+ln -sf ../dolfinx-adjoint-knowledge/scratch      .scratch
+ln -sf ../dolfinx-adjoint-knowledge/references   references
+ln -sf ../../dolfinx-adjoint-knowledge/adr       docs/adr
+ln -sf ../../dolfinx-adjoint-knowledge/agents    docs/agents
+
+# Keep them out of this repository's history. `.git/info/exclude` is per-clone and is not
+# itself versioned, so this has to be done again in every clone. Do not give the patterns a
+# trailing slash: `.scratch/` matches a directory and stops matching once it is a symlink.
+printf '%s\n' CONTEXT.md CLAUDE.md .scratch references docs/adr docs/agents >> .git/info/exclude
+```
+
+The development container mounts only this repository, so these links point outside the mount
+and are not readable from inside it. That is harmless — building and testing touch only `src/`,
+`tests/` and `demos/`.
+
+### What an agent picks up once it is linked
+
+[Claude Code](https://claude.com/claude-code) reads most of this on its own:
+
+| Path          | What it gives the agent                                                    |
+| ------------- | -------------------------------------------------------------------------- |
+| `CLAUDE.md`   | Project instructions, read automatically at the start of every session.     |
+| `CONTEXT.md`  | The domain glossary: the words this project uses, and the ones it avoids.   |
+| `docs/adr/`   | Why things are the way they are, so decisions are not silently re-litigated.|
+| `docs/agents/`| Where issues live, and the triage vocabulary the skills expect.             |
+| `.scratch/`   | Specs and issues, one directory per feature.                                |
+| `references/` | The papers to follow rather than improvising.                              |
+
+Agent memory is stored per project outside the repository, and is symlinked to the knowledge
+repository so that it is versioned rather than left in a cache directory:
+
+```bash
+# The directory name is the absolute path to your checkout with "/" replaced by "-"
+ln -s "$PWD/../dolfinx-adjoint-knowledge/memory" \
+      ~/.claude/projects/"$(pwd | tr / -)"/memory
+```
+
+### Skills
+
+The repository-scoped skills the agent instructions refer to — `grilling`, `domain-modeling`,
+`code-review`, `to-spec` and others — are vendored under `.agents/skills/`, exposed to Claude
+Code through `.claude/skills/`, and pinned in `skills-lock.json`. They come from
+[mattpocock/skills](https://github.com/mattpocock/skills) and are not part of the knowledge
+repository, since they are upstream content rather than anything specific to this project.
+
+`setup-matt-pocock-skills` scaffolds the per-repository configuration those skills assume — the
+issue tracker layout, the triage vocabulary and the domain doc paths, which is what
+`docs/agents/` contains. It configures the repository; it does not install the skills.
+
+
 ### Our Pledge
 
 In the interest of fostering an open and welcoming environment, we as
