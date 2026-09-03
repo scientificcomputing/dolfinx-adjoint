@@ -355,3 +355,45 @@ def test_disk_schedule_without_enabling_is_refused():
     """A disk-using schedule with no disk backend configured fails loudly, and says why."""
     with pytest.raises(CheckpointError, match="enable_disk_checkpointing"):
         _tape_heat_equation(4, SingleDiskStorageSchedule())
+
+
+def test_enabling_on_a_second_tape_leaves_the_first_alone():
+    """Each tape owns its own checkpoint file, so configuring one does not break another.
+
+    Enabling disk checkpointing used to close and unlink whichever file was open, which is the
+    wrong lifetime: the first tape's `SnapshotCheckpoint`s still point into that file, and
+    re-evaluating its reduced functional then died reading a closed HDF5 handle.
+    """
+    n_steps = 4
+    rf_first, controls_first, _ = _tape_heat_equation(n_steps, SingleDiskStorageSchedule(), disk=True)
+    first_tape = pyadjoint.get_working_tape()
+    expected = _gradient(rf_first, controls_first)
+
+    rf_second, controls_second, _ = _tape_heat_equation(n_steps, SingleDiskStorageSchedule(), disk=True)
+    _gradient(rf_second, controls_second)
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
+    for i, (a, e) in enumerate(zip(_gradient(rf_first, controls_first), expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing(first_tape)
+
+
+def test_disabling_targets_the_tape_it_is_given():
+    """Tearing down a tape that is no longer the working one removes its files, and only its.
+
+    Passing no tape at all would pop the key off the working tape -- here the second one --
+    leaving the first still holding a checkpointer whose file is gone. That still satisfies
+    pyadjoint's "disk storage is configured" check, so the failure would only surface later,
+    at the first restore.
+    """
+    rf, controls, _ = _tape_heat_equation(4, SingleDiskStorageSchedule(), disk=True)
+    first_tape = pyadjoint.get_working_tape()
+    _gradient(rf, controls)
+
+    pyadjoint.set_working_tape(pyadjoint.Tape())
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing(first_tape)
+
+    assert dolfinx_adjoint.checkpointing._PACKAGE_KEY not in first_tape._package_data
+    with pytest.raises(CheckpointError, match="enable_disk_checkpointing"):
+        _tape_heat_equation(4, SingleDiskStorageSchedule())

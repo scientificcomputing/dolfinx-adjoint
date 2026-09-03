@@ -34,10 +34,14 @@ if typing.TYPE_CHECKING:
 __all__ = ["enable_disk_checkpointing", "disable_disk_checkpointing", "SnapshotCheckpoint"]
 
 #: Key under which the disk checkpointer registers itself in ``Tape._package_data``.
+#:
+#: That dictionary is the only place a checkpointer is held. It is deliberately not also
+#: tracked in a module global: a checkpoint file must outlive every
+#: {py:class}`SnapshotCheckpoint` written into it, and those belong to one tape's block
+#: variables. A global would make the file's lifetime follow whichever tape was configured
+#: most recently instead, so enabling disk checkpointing on a second tape would close the
+#: first tape's file out from under a reduced functional that is still perfectly usable.
 _PACKAGE_KEY = "dolfinx_adjoint"
-
-#: The active checkpointer, or None when disk checkpointing is not enabled.
-_checkpointer: "_DiskCheckpointer | None" = None
 
 # Message pyadjoint shows when a schedule wants disk storage but none is configured.
 pyadjoint.checkpointing.disk_checkpointing_callback[_PACKAGE_KEY] = (
@@ -325,6 +329,12 @@ class _DiskCheckpointer(TapePackageData):
         self._storing = False
 
 
+def _checkpointer_for(tape) -> "_DiskCheckpointer | None":
+    """Return the checkpointer registered on ``tape``, or None if it has none."""
+    checkpointer = tape._package_data.get(_PACKAGE_KEY)
+    return checkpointer if isinstance(checkpointer, _DiskCheckpointer) else None
+
+
 def maybe_disk_checkpoint(function: Function) -> SnapshotCheckpoint | None:
     """Store ``function`` on disk if disk checkpointing is active, otherwise return None.
 
@@ -338,9 +348,10 @@ def maybe_disk_checkpoint(function: Function) -> SnapshotCheckpoint | None:
     Returns:
         A handle to the stored values, or None to keep them in memory.
     """
-    if _checkpointer is None or not _checkpointer.storing:
+    checkpointer = _checkpointer_for(get_working_tape())
+    if checkpointer is None or not checkpointer.storing:
         return None
-    return _checkpointer.store(function)
+    return checkpointer.store(function)
 
 
 def enable_disk_checkpointing(
@@ -349,10 +360,16 @@ def enable_disk_checkpointing(
     cleanup: bool = True,
     use_mpio: bool | None = None,
 ) -> None:
-    """Store checkpoints on disk rather than in memory.
+    """Store the working tape's checkpoints on disk rather than in memory.
 
     Must be called before any operation is recorded on the working tape, and before enabling a
     checkpoint schedule on it.
+
+    Disk checkpointing is a property of one tape, not of the process: enabling it on a second
+    tape leaves the first tape's checkpoints, and the file holding them, alone. Each tape's
+    files live until {py:func}`disable_disk_checkpointing` is called with that tape as the
+    working tape, or until the process exits -- nothing can close them implicitly, because
+    closing a shared file is collective and so cannot be driven by garbage collection.
 
     Args:
         dirname: Directory to hold the checkpoint files. A temporary directory is created if
@@ -365,18 +382,17 @@ def enable_disk_checkpointing(
             running on more than one process with an MPI-enabled h5py, and falls back to one
             file per process otherwise. Pass False to force the per-process layout.
     """
-    global _checkpointer
-
-    if _checkpointer is not None:
-        # Enabling twice would otherwise strand the previous files, open and undeleted.
-        disable_disk_checkpointing()
-
     tape = get_working_tape()
     if tape.get_blocks():
         raise RuntimeError(
             "Disk checkpointing must be enabled before any blocks are added to the tape, "
             "so that every checkpoint is stored the same way."
         )
+    if _checkpointer_for(tape) is not None:
+        # Re-enabling on the same tape, to change the directory or the layout. Closing the old
+        # files is safe here and only here: the guard above has just established that this tape
+        # holds no blocks, so it holds no checkpoint that could still point into them.
+        disable_disk_checkpointing(tape)
 
     comm = MPI.COMM_WORLD if comm is None else comm
     if use_mpio is None:
@@ -407,19 +423,27 @@ def enable_disk_checkpointing(
             directory.mkdir(parents=True, exist_ok=True)
         comm.Barrier()
 
-    _checkpointer = _DiskCheckpointer(directory, comm, use_mpio, cleanup, owns_directory)
-    tape._package_data[_PACKAGE_KEY] = _checkpointer
+    tape._package_data[_PACKAGE_KEY] = _DiskCheckpointer(directory, comm, use_mpio, cleanup, owns_directory)
 
 
-def disable_disk_checkpointing() -> None:
-    """Stop storing checkpoints on disk and delete the checkpoint files.
+def disable_disk_checkpointing(tape=None) -> None:
+    """Stop storing a tape's checkpoints on disk and delete its checkpoint files.
+
+    Every {py:class}`SnapshotCheckpoint` written by this tape becomes unreadable, so call it
+    only once nothing will evaluate a reduced functional built on the tape again.
 
     Collective: every process must call it, because closing a shared checkpoint file is.
-    """
-    global _checkpointer
 
-    tape = get_working_tape()
-    tape._package_data.pop(_PACKAGE_KEY, None)
-    if _checkpointer is not None:
-        _checkpointer.close()
-    _checkpointer = None
+    Args:
+        tape: The tape to stop checkpointing to disk. Defaults to the working tape. Pass one
+            explicitly to tear down a tape that is no longer current -- popping the key off
+            whichever tape happens to be working instead would leave the real owner holding a
+            checkpointer whose file is gone, which still satisfies pyadjoint's "disk storage is
+            configured" check and so fails much later, at the first restore.
+    """
+    tape = get_working_tape() if tape is None else tape
+    checkpointer = _checkpointer_for(tape)
+    if checkpointer is None:
+        return
+    del tape._package_data[_PACKAGE_KEY]
+    checkpointer.close()
