@@ -11,7 +11,7 @@ from dolfinx.mesh import create_unit_cube, create_unit_square
 from dolfinx_adjoint import Function, assemble_scalar, interpolate_nonmatching
 
 
-def _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc):
+def _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc, assert_hessian_matches_finite_difference):
     """Helper function to test Adjoint symmetry and Taylor convergence."""
     pyadjoint.get_working_tape().clear_tape()
 
@@ -80,26 +80,22 @@ def _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc):
     assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2)
 
     # Hessian check: expect rate = 3.0 (Linear operator Hessian is 0, so Taylor series is exact)
-    Jh(u)
-    dJdm = Jh.derivative()._ad_dot(du)
-    dHddu = Jh.hessian(du)._ad_dot(du)
-    min_rate_hess = pyadjoint.taylor_test(Jh, u, du, dJdm=dJdm, Hm=dHddu)
-    assert np.isclose(min_rate_hess, 3.0, rtol=0.1, atol=0.1)
+    assert_hessian_matches_finite_difference(Jh, u, du)
 
 
 @pytest.mark.parametrize("use_petsc", [False, True])
-def test_nonmatching_3D_to_2D(use_petsc):
+def test_nonmatching_3D_to_2D(use_petsc, assert_hessian_matches_finite_difference):
     """Tests interpolating from a 3D volume to a 2D surface."""
     mesh_from = create_unit_cube(MPI.COMM_WORLD, 4, 4, 4)
     mesh_to = create_unit_square(MPI.COMM_WORLD, 8, 8)
 
-    _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc)
+    _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc, assert_hessian_matches_finite_difference)
 
 
 @pytest.mark.parametrize("use_petsc", [False, True])
-def test_nonmatching_2D_to_2D(use_petsc):
+def test_nonmatching_2D_to_2D(use_petsc, assert_hessian_matches_finite_difference):
     """Tests interpolating from a 2D surface to a 2D surface."""
     mesh_from = create_unit_square(MPI.COMM_WORLD, 8, 8)
     mesh_to = create_unit_square(MPI.COMM_WORLD, 4, 4)
 
-    _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc)
+    _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc, assert_hessian_matches_finite_difference)
