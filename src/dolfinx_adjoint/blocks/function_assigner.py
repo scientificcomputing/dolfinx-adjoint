@@ -233,10 +233,13 @@ class FunctionAssignBlock(Block):
         # Mutate the live output object in place -- required so that a native, identity-bound
         # consumer built once from it (e.g. a dolfinx.fem.DirichletBC's "g") sees the update --
         # but return a *separate*, freshly isolated checkpoint for the tape's own bookkeeping.
-        # Returning the same mutated object as the checkpoint (as this used to do) is exactly
-        # the shortcut ADR-0001 rules out: under a checkpoint schedule, an earlier recompute's
-        # snapshot of this output may still be needed by a later step, and mutating it in place
-        # silently corrupts that snapshot instead of replacing it.
+        # Returning the same mutated object as the checkpoint, as this used to do, is only safe
+        # without a schedule. Under one, pyadjoint's TimeStep.checkpoint stores the very same
+        # object for a global dependency rather than a copy of it, and restore_from_checkpoint
+        # hands that object straight back, so mutating it in place silently corrupts a snapshot
+        # a later step still needs instead of replacing it. See the note on
+        # _ProblemBlockBase.recompute_component for why the copy is not made conditional on a
+        # schedule being active: it is measurably too cheap to be worth the second code path.
         live = block_variable.output
         if isinstance(prepared, dolfinx.fem.Function):
             live.x.array[:] = prepared.x.array[:]

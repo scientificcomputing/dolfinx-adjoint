@@ -549,6 +549,17 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             {py:mod}`~dolfinx_adjoint.checkpointing`) on every recompute after the
             first, and would corrupt any earlier checkpoint that a schedule such as
             {py:class}`~checkpoint_schedules.Revolve` still holds a live reference to.
+
+        Note:
+            This allocates a function on every recompute, where reusing the existing
+            checkpoint in place would not. Reinstating that reuse behind a "no schedule is
+            active" test was considered and rejected on measurement: across an evaluation
+            and its adjoint of a 40-step heat equation, all
+            ``_ad_create_checkpoint`` calls together account for 2.9 ms of 263 ms, and
+            end-to-end the two are indistinguishable. That is not worth a second code path
+            whose safety rests on an invariant about pyadjoint's internals -- that
+            ``TimeStep.checkpoint`` aliases ``BlockVariable._checkpoint`` for global
+            dependencies, and ``restore_from_checkpoint`` hands the same object back.
         """
         if isinstance(prepared, Function):
             assert idx == 0
