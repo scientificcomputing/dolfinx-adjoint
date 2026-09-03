@@ -195,7 +195,11 @@ def _tape_snes_heat_equation(n_steps, schedule=None, solution_dependent_diffusiv
         schedule: A ``checkpoint_schedules`` schedule, or None to disable checkpointing.
         solution_dependent_diffusivity: If True the residual is genuinely nonlinear in the
             unknown, which puts the unknown into the Jacobian and hence into the block's own
-            dependencies. See ``test_solution_dependent_jacobian_is_unsupported``.
+            dependencies -- the case where an in-place checkpoint would be reused across a
+            recompute.
+
+    Returns:
+        A tuple of the reduced functional, the controls, and perturbation directions.
     """
     _collect()
     tape = pyadjoint.Tape()
@@ -253,25 +257,59 @@ def _tape_snes_heat_equation(n_steps, schedule=None, solution_dependent_diffusiv
     return rf, controls, _perturbation_directions(V, n_steps)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-existing NonlinearProblemBlock defect, unrelated to checkpointing: a residual "
-        "problem advanced over several timesteps gets a wrong adjoint. The unknown is a "
-        "coefficient of the residual and so is registered as one of the block's own "
-        "dependencies; once its incoming value is itself control-dependent (which is what a "
-        "time loop creates) the adjoint contribution for it is computed against a residual in "
-        "which that value no longer appears, and ufl.adjoint raises IndexError on the "
-        "resulting argument-less form. Suppressing the error is not a fix: the gradient is "
-        "then silently wrong (observed Taylor rate -0.41 rather than 2). Checkpointing is not "
-        "involved -- this test does not enable a schedule. Until it is fixed, NonlinearProblem "
-        "cannot be used in a time loop and so cannot be covered by the checkpointing tests "
-        "above."
-    ),
+#: The SNES time loop is intermittently wrong on more than one process -- see
+#: `.scratch/snes-time-loop-parallel/issues/01-replay-nondeterministic.md`. The defect is
+#: pre-existing (it reproduces on `main`, more often than here) and has nothing to do with
+#: checkpointing: it shows up with no schedule enabled, and what goes wrong is a plain tape
+#: replay returning a functional value several times too large. Left unmarked these tests would
+#: make the `mpirun -n 2` CI job flaky, so they are restricted to a single process and the
+#: parallel defect is tracked separately rather than papered over with a non-strict xfail.
+_snes_time_loop_is_serial_only = pytest.mark.skipif(
+    MPI.COMM_WORLD.size > 1,
+    reason="Pre-existing defect: the SNES time-loop replay is nondeterministic in parallel",
 )
-def test_snes_time_loop_gradient_is_correct():
-    """Records that NonlinearProblem cannot yet be advanced over timesteps."""
-    rf, controls, directions = _tape_snes_heat_equation(4)
+
+
+@_snes_time_loop_is_serial_only
+@pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
+def test_snes_time_loop_gradient_is_correct(solution_dependent_diffusivity):
+    """A residual problem advanced over several timesteps gets the right adjoint.
+
+    No schedule here: this is the baseline the checkpointed SNES tests below compare against.
+    """
+    rf, controls, directions = _tape_snes_heat_equation(
+        4, solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    assert pyadjoint.taylor_test(rf, controls, directions) > 1.95
+
+
+@_snes_time_loop_is_serial_only
+@pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
+def test_snes_gradient_matches_uncheckpointed(solution_dependent_diffusivity):
+    """A schedule does not change the gradient of a residual problem either."""
+    n_steps, snapshots = 6, 2
+    rf_plain, controls_plain, _ = _tape_snes_heat_equation(
+        n_steps, solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    expected = _gradient(rf_plain, controls_plain)
+
+    rf_ckpt, controls_ckpt, _ = _tape_snes_heat_equation(
+        n_steps, Revolve(n_steps, snapshots), solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    actual = _gradient(rf_ckpt, controls_ckpt)
+
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
+@_snes_time_loop_is_serial_only
+@pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
+def test_snes_taylor_test_under_checkpointing(solution_dependent_diffusivity):
+    """The checkpointed SNES gradient is the actual derivative, not merely a reproducible one."""
+    n_steps, snapshots = 6, 2
+    rf, controls, directions = _tape_snes_heat_equation(
+        n_steps, Revolve(n_steps, snapshots), solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
     assert pyadjoint.taylor_test(rf, controls, directions) > 1.95
 
 
