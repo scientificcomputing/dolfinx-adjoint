@@ -113,6 +113,9 @@ class _CheckpointFile:
         self._handle = h5py.File(path, "w", **kwargs)
         self._next_index = 0
         self._closed = False
+        # Which dataset each checkpoint still in use was written to. Weak, so that a checkpoint
+        # the tape has replaced drops out by itself and `collect` can reclaim its dataset.
+        self._live: weakref.WeakValueDictionary[str, SnapshotCheckpoint] = weakref.WeakValueDictionary()
 
     @property
     def path(self) -> pathlib.Path:
@@ -151,6 +154,40 @@ class _CheckpointFile:
         """
         dataset = self._handle.create_dataset(key, (n_global,), dtype=values.dtype)
         dataset[offset : offset + values.size] = values
+
+    def track(self, key: str, checkpoint: SnapshotCheckpoint) -> None:
+        """Record that ``checkpoint`` is the reader of the dataset ``key``."""
+        self._live[key] = checkpoint
+
+    def collect(self) -> int:
+        """Unlink every dataset no checkpoint reads any more.
+
+        HDF5 does not shrink the file, but it does hand the freed space to the file's own
+        allocator, so later datasets reuse it and the file settles at the size of the
+        checkpoints actually in use instead of growing with every evaluation.
+
+        Collective when the file is shared, so call it only where every process arrives
+        together -- which today means {py:meth}`_DiskCheckpointer.reset` alone.
+
+        Returns:
+            How many datasets were unlinked.
+        """
+        if self._closed:
+            return 0
+        live = set(self._live.keys())
+        if self._shared_file and self._comm.size > 1:
+            # Two reasons to agree on this across processes rather than decide it locally.
+            # Deleting from a shared file modifies metadata, which HDF5 requires every process
+            # to do together and with the same arguments. And which checkpoints are dead is a
+            # question about each process's own reference counts, which need not have dropped
+            # at the same moment. Taking the union answers both: a dataset goes only once no
+            # process can still read it, and every process drops the same ones.
+            live = set().union(*self._comm.allgather(live))
+        # Sorted so that the deletions happen in the same order everywhere.
+        dead = sorted(set(self._handle.keys()) - live)
+        for key in dead:
+            del self._handle[key]
+        return len(dead)
 
     def read(self, key: str, n_local: int, offset: int) -> np.ndarray:
         """Read this process's values back out of a dataset.
@@ -283,7 +320,9 @@ class _DiskCheckpointer(TapePackageData):
         n_local, n_global, offset = _layout(function, self._file.shared_file, self._comm)
         key = self._file.next_key()
         self._file.write(key, function.x.array, n_global, offset)
-        return SnapshotCheckpoint(self._file, key, function, n_local, offset)
+        checkpoint = SnapshotCheckpoint(self._file, key, function, n_local, offset)
+        self._file.track(key, checkpoint)
+        return checkpoint
 
     # -- TapePackageData ------------------------------------------------------------------
 
@@ -295,8 +334,21 @@ class _DiskCheckpointer(TapePackageData):
         # Deliberately not rolling to a new file. pyadjoint resets package data before
         # recomputing the forward, but then restores the initial condition from a checkpoint
         # written while taping, so data from before the reset is still live. Rolling the file
-        # here deletes it and the restore fails. Checkpoints therefore accumulate in one file
-        # for as long as disk checkpointing is enabled, and are removed together at teardown.
+        # here deletes it and the restore fails.
+        #
+        # One file for the whole run instead, with the datasets nothing reads any more
+        # reclaimed here. Reclaiming rather than rolling because a recompute writes a fresh
+        # checkpoint for each state it passes and drops the previous one, so without this the
+        # file grows by a whole sweep's worth of state on every evaluation of the reduced
+        # functional -- which over an optimisation loop is exactly the unbounded growth that
+        # putting checkpoints on disk was meant to avoid.
+        #
+        # This is the one place it can happen: unlinking from a shared file is collective, and
+        # this is the only hook pyadjoint calls on every process together. It lags by one
+        # evaluation, since the checkpoints written by the previous one are still referenced
+        # by the tape's block variables when this runs, and are only dropped as the coming
+        # recompute overwrites them.
+        self._file.collect()
         self._storing = False
 
     def checkpoint(self):

@@ -357,6 +357,31 @@ def test_disk_schedule_without_enabling_is_refused():
         _tape_heat_equation(4, SingleDiskStorageSchedule())
 
 
+def test_checkpoint_file_does_not_grow_with_repeated_evaluations():
+    """Datasets nothing reads any more are reclaimed, so the file settles at a fixed size.
+
+    Each evaluation writes a fresh checkpoint for every state it recomputes and drops the
+    previous one. Without reclamation the file grew by a whole sweep's worth of state per
+    evaluation, which over an optimisation loop is the unbounded growth that putting
+    checkpoints on disk was supposed to avoid.
+    """
+    rf, controls, _ = _tape_heat_equation(6, SingleDiskStorageSchedule(), disk=True)
+    tape = pyadjoint.get_working_tape()
+    checkpoint_file = dolfinx_adjoint.checkpointing._checkpointer_for(tape)._file
+
+    counts = []
+    for _ in range(4):
+        rf(controls)
+        rf.derivative()
+        counts.append(len(checkpoint_file._handle.keys()))
+
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
+    # The first evaluation may still hold the taping sweep's datasets: reclamation runs at the
+    # start of an evaluation, so it always lags the one before it. From then on it is flat.
+    assert counts[1:] == counts[1:2] * 3, f"dataset count kept changing: {counts}"
+
+
 def test_enabling_on_a_second_tape_leaves_the_first_alone():
     """Each tape owns its own checkpoint file, so configuring one does not break another.
 
