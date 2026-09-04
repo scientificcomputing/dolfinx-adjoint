@@ -6,6 +6,7 @@ from importlib.metadata import metadata
 import pyadjoint as _pyad
 
 from .assembly import assemble_scalar, error_norm
+from .checkpointing import enable_disk_checkpointing
 from .function import assign
 from .interpolation import interpolate, interpolate_nonmatching
 from .solvers import LinearProblem, NonlinearProblem
@@ -30,6 +31,7 @@ __all__ = [
     "NonlinearProblem",
     "assemble_scalar",
     "assign",
+    "enable_disk_checkpointing",
     "error_norm",
     "__version__",
     "__author__",

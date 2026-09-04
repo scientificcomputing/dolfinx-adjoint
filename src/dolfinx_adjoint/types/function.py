@@ -17,6 +17,7 @@ from ufl.core.ufl_id import attach_ufl_id
 
 from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
+from ..checkpointing import SnapshotCheckpoint, maybe_disk_checkpoint
 from ..utils import function_from_vector, gather
 
 
@@ -91,12 +92,19 @@ class Function(dolfinx.fem.Function, FloatingType):
         return cls(obj.function_space, obj.x, obj.name)
 
     @property
-    def index_map(self) -> dolfinx.cpp.la.IndexMap:  # type: ignore [name-defined]
+    def index_map(self) -> dolfinx.common.IndexMap:
         """Return the index map of the function's vector."""
         return self.x.index_map
 
     @no_annotations
     def _ad_create_checkpoint(self):
+        # While a schedule is storing to disk, hand back a reference to the stored values
+        # rather than the values themselves. This is the only seam pyadjoint offers for
+        # choosing where checkpoint data lives.
+        stored = maybe_disk_checkpoint(self)
+        if stored is not None:
+            return stored
+
         # Note: self.copy() (dolfinx.fem.Function.copy) always returns a plain
         # dolfinx.fem.Function regardless of self's concrete type, so wrapping it with
         # create_overloaded_object would silently downcast a Constant checkpoint to a
@@ -107,6 +115,8 @@ class Function(dolfinx.fem.Function, FloatingType):
         return checkpoint
 
     def _ad_restore_at_checkpoint(self, checkpoint):
+        if isinstance(checkpoint, SnapshotCheckpoint):
+            return checkpoint.restore()
         return checkpoint
 
     def _ad_dot(self, other: typing.Self, options: dict | None = None):

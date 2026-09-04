@@ -54,6 +54,9 @@ sphinx:
       numpy: ["https://numpy.org/doc/stable/", null]
       pyvista: ["https://docs.pyvista.org/", null]
       packaging: ["https://packaging.pypa.io/en/stable/", null]
+      checkpoint_schedules: ["https://www.firedrakeproject.org/checkpoint_schedules/", null]
+      pyadjoint: ["https://www.dolfin-adjoint.org/en/latest/", null]
+      h5py: ["https://docs.h5py.org/en/stable/", null]
 
   extra_extensions:
   - 'sphinx.ext.autodoc'

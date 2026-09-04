@@ -6,6 +6,7 @@ parts:
     chapters:
     - file: "demos/poisson_mother.py"
     - file: "demos/time_distributed_control.py"
+    - file: "demos/time_distributed_control_checkpointing.py"
     - file: "demos/demo_nonmatching_grids.py"
     - file: "demos/emi_membrane_current_control.py"
   - caption: Python API

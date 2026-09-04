@@ -539,14 +539,27 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         Returns:
             An isolated copy of this output, so this tape block's own checkpoint
             stays stable even if the shared Problem's unknown is later overwritten
-            by another block's recompute. Reuses ``block_variable.checkpoint`` in
-            place when one already exists (mirroring
-            {py:class}`~dolfinx_adjoint.blocks.interpolation.InterpolationBlock`'s
-            recompute and Firedrake's equivalent ``GenericSolveBlock.recompute_component``),
-            since {py:meth}`~dolfinx_adjoint.types.function.Function._ad_create_checkpoint`
+            by another block's recompute. Always goes through
+            {py:meth}`~dolfinx_adjoint.types.function.Function._ad_create_checkpoint`
             -- not a bare ``.copy()``, which always returns a plain, non-overloaded
-            ``dolfinx.fem.Function`` regardless of the source's concrete type -- is what
-            correctly builds a *new* one when none exists yet.
+            ``dolfinx.fem.Function`` regardless of the source's concrete type, and not
+            a reuse of ``block_variable.checkpoint`` in place, which would silently
+            bypass the disk-checkpointing seam that ``_ad_create_checkpoint`` provides
+            (see ``maybe_disk_checkpoint`` in
+            {py:mod}`~dolfinx_adjoint.checkpointing`) on every recompute after the
+            first, and would corrupt any earlier checkpoint that a schedule such as
+            {py:class}`~checkpoint_schedules.Revolve` still holds a live reference to.
+
+        Note:
+            This allocates a function on every recompute, where reusing the existing
+            checkpoint in place would not. Reinstating that reuse behind a "no schedule is
+            active" test was considered and rejected on measurement: across an evaluation
+            and its adjoint of a 40-step heat equation, all
+            ``_ad_create_checkpoint`` calls together account for 2.9 ms of 263 ms, and
+            end-to-end the two are indistinguishable. That is not worth a second code path
+            whose safety rests on an invariant about pyadjoint's internals -- that
+            ``TimeStep.checkpoint`` aliases ``BlockVariable._checkpoint`` for global
+            dependencies, and ``restore_from_checkpoint`` hands the same object back.
         """
         if isinstance(prepared, Function):
             assert idx == 0
@@ -554,11 +567,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         else:
             assert isinstance(prepared, typing.Sequence)
             source = prepared[idx]
-        checkpoint = block_variable.checkpoint
-        if isinstance(checkpoint, Function):
-            checkpoint.x.array[:] = source.x.array[:]
-            checkpoint.x.scatter_forward()
-            return checkpoint
         return source._ad_create_checkpoint()
 
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):

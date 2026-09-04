@@ -132,3 +132,6 @@ _build/
 
 *.dot
 *.bp
+
+# git worktrees used for isolated feature branches
+/.worktrees/

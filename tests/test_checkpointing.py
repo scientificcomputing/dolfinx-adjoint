@@ -1,0 +1,424 @@
+"""Checkpointing of time-dependent adjoint computations.
+
+The forward model is a heat equation advanced over a number of tape timesteps, with one
+control per timestep. Every test compares a checkpointed run against the same run with
+checkpointing disabled: a checkpoint schedule only changes *when* forward state is stored
+and recomputed, never the value of the derivative.
+"""
+
+import gc
+
+from mpi4py import MPI
+from petsc4py import PETSc
+
+import dolfinx
+import h5py
+import numpy as np
+import pyadjoint
+import pytest
+import ufl
+from checkpoint_schedules import Revolve, SingleDiskStorageSchedule
+from pyadjoint.checkpointing import CheckpointError
+
+import dolfinx_adjoint
+
+_PETSC_OPTIONS = {
+    "ksp_type": "preonly",
+    "pc_type": "lu",
+    "ksp_error_if_not_converged": True,
+}
+
+
+@pytest.fixture(autouse=True)
+def isolated_tape():
+    """Keep these tests from leaking tape state into the rest of the suite.
+
+    Two things would otherwise escape. The working tape: pyadjoint's Tape.clear_tape() resets
+    the checkpoint manager but leaves `_eagerly_checkpoint_outputs` and `latest_checkpoint` set,
+    so a tape that has once been checkpointed keeps checkpointing outputs eagerly even after
+    being cleared. And the PETSc options database: LinearProblem writes its options there under
+    a fixed default prefix and does not remove them, so a later solver constructed without
+    explicit options silently inherits whatever these tests set.
+    """
+    previous_tape = pyadjoint.get_working_tape()
+    previous_options = dict(PETSc.Options().getAll())
+    _collect()
+    try:
+        yield
+    finally:
+        _collect()
+        dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+        pyadjoint.set_working_tape(previous_tape)
+        options = PETSc.Options()
+        for key in set(options.getAll()) - set(previous_options):
+            options.delValue(key)
+
+
+def _collect():
+    """Collect garbage now, so that it happens at the same moment on every process.
+
+    Discarded tapes hold blocks, and each block owns a dolfinx LinearProblem whose __del__
+    destroys PETSc objects -- which is collective. Blocks sit in reference cycles, so they are
+    freed by the cyclic collector rather than by refcounting, and that runs when each process
+    happens to cross an allocation threshold, not in step. Whichever process collects first
+    then enters a collective the others are not in, and the run deadlocks. Collecting
+    deliberately, at points every process reaches together, keeps those destructors in step.
+    """
+    gc.collect()
+
+
+def _perturbation_directions(V, n):
+    """Perturbation directions for a Taylor test.
+
+    Built by interpolating analytic expressions rather than from random numbers: the
+    directions must agree across processes, and per-rank random values do not.
+    """
+    # Not part of the model, so keep them off the tape.
+    directions = []
+    with pyadjoint.stop_annotating():
+        for k in range(n):
+            h = dolfinx_adjoint.Function(V, name=f"direction_{k}")
+            h.interpolate(lambda x, k=k: np.sin((k + 1) * np.pi * x[0]) * np.cos(np.pi * x[1]))
+            directions.append(h)
+    return directions
+
+
+def _tape_heat_equation(n_steps, schedule=None, disk=False, use_mpio=None):
+    """Tape a heat equation with one control per tape timestep.
+
+    Args:
+        n_steps: Number of tape timesteps to advance.
+        schedule: A ``checkpoint_schedules`` schedule, or None to disable checkpointing.
+        disk: Whether to store checkpoints on disk.
+        use_mpio: Passed through to ``enable_disk_checkpointing``, selecting the file layout.
+
+    Returns:
+        A tuple of the reduced functional, the controls, and perturbation directions.
+    """
+    _collect()
+    tape = pyadjoint.Tape()
+    pyadjoint.set_working_tape(tape)
+    # Both of these must happen before anything is recorded on this tape.
+    if disk:
+        dolfinx_adjoint.enable_disk_checkpointing(use_mpio=use_mpio)
+    if schedule is not None:
+        tape.enable_checkpointing(schedule)
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))  # type: ignore[arg-type]
+
+    dt = 0.1
+    nu = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0e-2))
+
+    controls = []
+    for i in range(n_steps):
+        c = dolfinx_adjoint.Function(V, name=f"control_{i}")
+        c.interpolate(lambda x, i=i: 0.5 + 0.1 * (i + 1) * x[0])
+        controls.append(c)
+
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    f = dolfinx_adjoint.Function(V, name="source")
+    uh = dolfinx_adjoint.Function(V, name="solution")
+    u_prev = dolfinx_adjoint.Function(V, name="previous")
+
+    # The unknown and the previous state must be distinct functions: the block that solves
+    # for uh must not also depend on uh through its own form, or recompute under a checkpoint
+    # schedule would read whatever value happens to be in uh at replay time instead of the
+    # checkpointed one. The state update is therefore an explicit, tape-recorded assignment,
+    # matching _tape_snes_heat_equation below.
+    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
+    a, L = ufl.system(F)
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(0.0, boundary_dofs, V)
+
+    problem = dolfinx_adjoint.LinearProblem(
+        a,
+        L,
+        u=uh,
+        bcs=[bc],
+        petsc_options=_PETSC_OPTIONS,
+        adjoint_petsc_options=_PETSC_OPTIONS,
+    )
+
+    J = dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+    # NOTE: `iter(...)` is required. Tape.timestepper calls next() on what it is given,
+    # so a bare range() raises TypeError even though pyadjoint's own docstring shows one.
+    for i in tape.timestepper(iter(range(n_steps))):
+        dolfinx_adjoint.assign(controls[i], f)
+        problem.solve()
+        dolfinx_adjoint.assign(uh, u_prev)
+        J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+
+    rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    return rf, controls, _perturbation_directions(V, n_steps)
+
+
+def _gradient(rf, controls):
+    rf(controls)
+    return [np.copy(g.x.array) for g in rf.derivative()]
+
+
+@pytest.mark.parametrize("n_steps, snapshots", [(6, 2), (10, 3)])
+def test_gradient_matches_uncheckpointed(n_steps, snapshots):
+    """A checkpoint schedule does not change the gradient."""
+    rf_plain, controls_plain, _ = _tape_heat_equation(n_steps)
+    expected = _gradient(rf_plain, controls_plain)
+
+    rf_ckpt, controls_ckpt, _ = _tape_heat_equation(n_steps, Revolve(n_steps, snapshots))
+    actual = _gradient(rf_ckpt, controls_ckpt)
+
+    assert len(actual) == len(expected)
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
+@pytest.mark.parametrize("n_steps, snapshots", [(6, 2), (10, 3)])
+def test_taylor_test_under_checkpointing(n_steps, snapshots):
+    """The checkpointed gradient is the actual derivative, not merely a reproducible one."""
+    rf, controls, directions = _tape_heat_equation(n_steps, Revolve(n_steps, snapshots))
+    rate = pyadjoint.taylor_test(rf, controls, directions)
+    assert rate > 1.95
+
+
+def _tape_snes_heat_equation(n_steps, schedule=None, solution_dependent_diffusivity=False):
+    """Tape a heat equation solved as a residual problem via SNES.
+
+    Unlike the linear model this cannot step in place: the unknown and the previous state
+    must be distinct functions, so the state update is an explicit assignment.
+
+    Args:
+        n_steps: Number of tape timesteps to advance.
+        schedule: A ``checkpoint_schedules`` schedule, or None to disable checkpointing.
+        solution_dependent_diffusivity: If True the residual is genuinely nonlinear in the
+            unknown, which puts the unknown into the Jacobian and hence into the block's own
+            dependencies -- the case where an in-place checkpoint would be reused across a
+            recompute.
+
+    Returns:
+        A tuple of the reduced functional, the controls, and perturbation directions.
+    """
+    _collect()
+    tape = pyadjoint.Tape()
+    pyadjoint.set_working_tape(tape)
+    if schedule is not None:
+        tape.enable_checkpointing(schedule)
+
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))  # type: ignore[arg-type]
+    dt = 0.1
+
+    controls = []
+    for i in range(n_steps):
+        c = dolfinx_adjoint.Function(V, name=f"control_{i}")
+        c.interpolate(lambda x, i=i: 0.5 + 0.1 * (i + 1) * x[0])
+        controls.append(c)
+
+    v = ufl.TestFunction(V)
+    f = dolfinx_adjoint.Function(V, name="source")
+    uh = dolfinx_adjoint.Function(V, name="solution")
+    u_prev = dolfinx_adjoint.Function(V, name="previous")
+
+    nu = (1 + uh**2) if solution_dependent_diffusivity else 1.0
+    F = ((uh - u_prev) / dt * v + nu * ufl.inner(ufl.grad(uh), ufl.grad(v)) - f * v) * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(0.0, boundary_dofs, V)
+
+    snes_options = {
+        "snes_type": "newtonls",
+        "snes_linesearch_type": "none",
+        "snes_error_if_not_converged": True,
+        "snes_atol": 1e-14,
+        "snes_rtol": 1e-14,
+    }
+    snes_options.update(_PETSC_OPTIONS)
+    problem = dolfinx_adjoint.NonlinearProblem(
+        F,
+        uh,
+        bcs=[bc],
+        petsc_options=snes_options,
+        adjoint_petsc_options=_PETSC_OPTIONS,
+    )
+
+    J = dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+    for i in tape.timestepper(iter(range(n_steps))):
+        dolfinx_adjoint.assign(controls[i], f)
+        problem.solve()
+        dolfinx_adjoint.assign(uh, u_prev)
+        J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+
+    rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    return rf, controls, _perturbation_directions(V, n_steps)
+
+
+#: The SNES time loop is intermittently wrong on more than one process -- see
+#: `.scratch/snes-time-loop-parallel/issues/01-replay-nondeterministic.md`. The defect is
+#: pre-existing (it reproduces on `main`, more often than here) and has nothing to do with
+#: checkpointing: it shows up with no schedule enabled, and what goes wrong is a plain tape
+#: replay returning a functional value several times too large. Left unmarked these tests would
+#: make the `mpirun -n 2` CI job flaky, so they are restricted to a single process and the
+#: parallel defect is tracked separately rather than papered over with a non-strict xfail.
+_snes_time_loop_is_serial_only = pytest.mark.skipif(
+    MPI.COMM_WORLD.size > 1,
+    reason="Pre-existing defect: the SNES time-loop replay is nondeterministic in parallel",
+)
+
+
+@_snes_time_loop_is_serial_only
+@pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
+def test_snes_time_loop_gradient_is_correct(solution_dependent_diffusivity):
+    """A residual problem advanced over several timesteps gets the right adjoint.
+
+    No schedule here: this is the baseline the checkpointed SNES tests below compare against.
+    """
+    rf, controls, directions = _tape_snes_heat_equation(
+        4, solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    assert pyadjoint.taylor_test(rf, controls, directions) > 1.95
+
+
+@_snes_time_loop_is_serial_only
+@pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
+def test_snes_gradient_matches_uncheckpointed(solution_dependent_diffusivity):
+    """A schedule does not change the gradient of a residual problem either."""
+    n_steps, snapshots = 6, 2
+    rf_plain, controls_plain, _ = _tape_snes_heat_equation(
+        n_steps, solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    expected = _gradient(rf_plain, controls_plain)
+
+    rf_ckpt, controls_ckpt, _ = _tape_snes_heat_equation(
+        n_steps, Revolve(n_steps, snapshots), solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    actual = _gradient(rf_ckpt, controls_ckpt)
+
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
+@_snes_time_loop_is_serial_only
+@pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
+def test_snes_taylor_test_under_checkpointing(solution_dependent_diffusivity):
+    """The checkpointed SNES gradient is the actual derivative, not merely a reproducible one."""
+    n_steps, snapshots = 6, 2
+    rf, controls, directions = _tape_snes_heat_equation(
+        n_steps, Revolve(n_steps, snapshots), solution_dependent_diffusivity=solution_dependent_diffusivity
+    )
+    assert pyadjoint.taylor_test(rf, controls, directions) > 1.95
+
+
+@pytest.mark.parametrize(
+    "use_mpio",
+    [
+        None,
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(not h5py.get_config().mpi, reason="h5py is not built against MPI"),
+        ),
+    ],
+)
+def test_disk_gradient_matches_uncheckpointed(use_mpio):
+    """Storing checkpoints on disk does not change the gradient, in either file layout.
+
+    `use_mpio=None` picks the layout automatically, and resolves to the per-process one on a
+    single process, so `True` is passed explicitly to reach the shared MPI-IO file as well.
+    """
+    n_steps = 6
+    rf_plain, controls_plain, _ = _tape_heat_equation(n_steps)
+    expected = _gradient(rf_plain, controls_plain)
+
+    rf_disk, controls_disk, _ = _tape_heat_equation(n_steps, SingleDiskStorageSchedule(), disk=True, use_mpio=use_mpio)
+    actual = _gradient(rf_disk, controls_disk)
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
+def test_disk_taylor_test():
+    """The gradient from disk-stored checkpoints is the actual derivative."""
+    n_steps = 6
+    rf, controls, directions = _tape_heat_equation(n_steps, SingleDiskStorageSchedule(), disk=True)
+    rate = pyadjoint.taylor_test(rf, controls, directions)
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+    assert rate > 1.95
+
+
+def test_disk_schedule_without_enabling_is_refused():
+    """A disk-using schedule with no disk backend configured fails loudly, and says why."""
+    with pytest.raises(CheckpointError, match="enable_disk_checkpointing"):
+        _tape_heat_equation(4, SingleDiskStorageSchedule())
+
+
+def test_checkpoint_file_does_not_grow_with_repeated_evaluations():
+    """Datasets nothing reads any more are reclaimed, so the file settles at a fixed size.
+
+    Each evaluation writes a fresh checkpoint for every state it recomputes and drops the
+    previous one. Without reclamation the file grew by a whole sweep's worth of state per
+    evaluation, which over an optimisation loop is the unbounded growth that putting
+    checkpoints on disk was supposed to avoid.
+    """
+    rf, controls, _ = _tape_heat_equation(6, SingleDiskStorageSchedule(), disk=True)
+    tape = pyadjoint.get_working_tape()
+    checkpoint_file = dolfinx_adjoint.checkpointing._checkpointer_for(tape)._file
+
+    counts = []
+    for _ in range(4):
+        rf(controls)
+        rf.derivative()
+        counts.append(len(checkpoint_file._handle.keys()))
+
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
+    # The first evaluation may still hold the taping sweep's datasets: reclamation runs at the
+    # start of an evaluation, so it always lags the one before it. From then on it is flat.
+    assert counts[1:] == counts[1:2] * 3, f"dataset count kept changing: {counts}"
+
+
+def test_enabling_on_a_second_tape_leaves_the_first_alone():
+    """Each tape owns its own checkpoint file, so configuring one does not break another.
+
+    Enabling disk checkpointing used to close and unlink whichever file was open, which is the
+    wrong lifetime: the first tape's `SnapshotCheckpoint`s still point into that file, and
+    re-evaluating its reduced functional then died reading a closed HDF5 handle.
+    """
+    n_steps = 4
+    rf_first, controls_first, _ = _tape_heat_equation(n_steps, SingleDiskStorageSchedule(), disk=True)
+    first_tape = pyadjoint.get_working_tape()
+    expected = _gradient(rf_first, controls_first)
+
+    rf_second, controls_second, _ = _tape_heat_equation(n_steps, SingleDiskStorageSchedule(), disk=True)
+    _gradient(rf_second, controls_second)
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
+    for i, (a, e) in enumerate(zip(_gradient(rf_first, controls_first), expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing(first_tape)
+
+
+def test_disabling_targets_the_tape_it_is_given():
+    """Tearing down a tape that is no longer the working one removes its files, and only its.
+
+    Passing no tape at all would pop the key off the working tape -- here the second one --
+    leaving the first still holding a checkpointer whose file is gone. That still satisfies
+    pyadjoint's "disk storage is configured" check, so the failure would only surface later,
+    at the first restore.
+    """
+    rf, controls, _ = _tape_heat_equation(4, SingleDiskStorageSchedule(), disk=True)
+    first_tape = pyadjoint.get_working_tape()
+    _gradient(rf, controls)
+
+    pyadjoint.set_working_tape(pyadjoint.Tape())
+    dolfinx_adjoint.checkpointing.disable_disk_checkpointing(first_tape)
+
+    assert dolfinx_adjoint.checkpointing._PACKAGE_KEY not in first_tape._package_data
+    with pytest.raises(CheckpointError, match="enable_disk_checkpointing"):
+        _tape_heat_equation(4, SingleDiskStorageSchedule())
