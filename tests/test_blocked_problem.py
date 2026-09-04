@@ -133,6 +133,90 @@ def test_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches_finite_di
         assert_hessian_matches_finite_difference(Jh, z, f)
 
 
+def test_vector_valued_solver(mesh_2D):
+    """Regression test for a spurious block-extraction bug on plain vector-valued spaces.
+
+    Unlike ``test_solver``'s two parametrizations -- a genuine ``ufl.MixedFunctionSpace``
+    (``use_mixed_space=True``) and an explicit list-of-lists two-field system
+    (``use_mixed_space=False``, but still two separate function spaces and a
+    ``u=[uh, ph]`` list) -- this problem has a *single* state ``Function`` (not a list)
+    on one plain vector-*shaped* space (``("Lagrange", 1, (gdim,))``), exactly the shape
+    every vector-PDE problem (e.g. elasticity) uses.
+
+    Before the fix, ``compute_adjoint`` called ``ufl.extract_blocks`` unconditionally,
+    which still decomposes a shaped (non-mixed) argument into spurious blocks even
+    though there is no genuine block structure here. That first raised
+    ``AttributeError: 'FunctionSpace' object has no attribute '_cpp_object'`` (a bare
+    ``ufl.FunctionSpace`` lost its dolfinx wrapper during the spurious extraction), and
+    after passing ``replace_argument=False``, a PETSc size mismatch instead (each
+    spurious block still referenced the original, full-space ``Argument``, so the
+    assembled adjoint operator came out sized for several redundant copies of the
+    space). The fix threads ``blocked=isinstance(self._u, list)`` through
+    ``compute_adjoint`` so block-extraction only runs for a genuinely blocked/mixed
+    problem.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = mesh_2D
+    gdim = mesh.geometry.dim
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (gdim,)))
+    Z = dolfinx.fem.functionspace(mesh, ("DG", 0))
+
+    # The control multiplies the bilinear form (not just the right-hand side), as in
+    # a SIMP-style density-dependent stiffness -- the structure that first surfaced
+    # this bug in a linear-elasticity topology optimization demo.
+    kappa = Function(Z, name="control")
+    kappa.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
+
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+    x = ufl.SpatialCoordinate(mesh)
+    f = ufl.as_vector((ufl.sin(ufl.pi * x[1]), ufl.cos(ufl.pi * x[0])))
+    L = ufl.inner(f, v) * ufl.dx
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    bc_val = dolfinx.fem.Constant(mesh, np.zeros((gdim,), dtype=dolfinx.default_scalar_type))
+    bc = dolfinx.fem.dirichletbc(bc_val, boundary_dofs, V)
+
+    uh = Function(V, name="state")
+    problem = LinearProblem(
+        a,
+        L,
+        u=uh,
+        bcs=[bc],
+        petsc_options=direct_solve,
+        adjoint_petsc_options=direct_solve,
+        tlm_petsc_options=direct_solve,
+    )
+    problem.solve()
+
+    # Quartic in the state, for the same round-off-avoidance reason as test_solver's
+    # objective.
+    J = assemble_scalar(ufl.inner(uh, uh) ** 2 * ufl.dx)
+
+    control = pyadjoint.Control(kappa)
+    Jh = pyadjoint.ReducedFunctional(J, control)
+    d = Function(Z)
+    d.interpolate(lambda x: 1.0 + 0.3 * np.cos(np.pi * x[1]))
+    e = Function(Z)
+    e.interpolate(lambda x: 0.2 * np.sin(3 * x[0]))
+
+    min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=0)
+    assert np.isclose(min_rate, 1.0, rtol=1e-1, atol=1e-1), f"Expected convergence rate close to 1.0, got {min_rate}"
+
+    Jh.derivative()
+    min_rate = pyadjoint.taylor_test(Jh, d, e)
+    assert np.isclose(min_rate, 2.0, rtol=1e-2, atol=1e-2), f"Expected convergence rate close to 2.0, got {min_rate}"
+
+    Jh(d)
+    dJdm = Jh.derivative()._ad_dot(e)
+    hessian = Jh.hessian(e)
+    dHddu = hessian._ad_dot(e)
+    min_rate = pyadjoint.taylor_test(Jh, d, e, dJdm=dJdm, Hm=dHddu)
+    assert np.isclose(min_rate, 3.0, rtol=0.1, atol=0.1), f"Expected convergence rate close to 3.0, got {min_rate}"
+
+
 @pytest.mark.parametrize("use_mixed_space", [True, False])
 def test_nonlinear_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches_finite_difference):
     """As ``test_solver``, but for a blocked ``NonlinearProblem``: a Navier-Stokes-like
