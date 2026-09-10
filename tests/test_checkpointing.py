@@ -173,6 +173,162 @@ def test_taylor_test_under_checkpointing(V, n_steps, snapshots):
     assert rate > 1.95
 
 
+def _tape_bc_control_heat_equation(V, n_steps, schedule=None, disk=False):
+    """Tape a heat equation whose Dirichlet bc *value* is the control, one per timestep.
+
+    Nothing drives this model but its boundary data -- there is no source term -- so a bc
+    value that is not restored correctly at a replayed tape position changes the answer
+    outright rather than perturbing it.
+
+    A tracked bc is the one control a checkpoint cannot carry by itself:
+    ``DirichletBC._ad_create_checkpoint``/``_ad_restore_at_checkpoint``
+    (types/dirichletbc.py) both ``return self``, so its "checkpoint" aliases the live bc
+    object. What puts a given tape position's value into ``bc.g`` is
+    ``DirichletBCBlock.recompute_component``'s explicit resync, which a schedule has to
+    re-run at every replayed position for the recomputed states to be right.
+
+    Args:
+        n_steps: Number of tape timesteps to advance.
+        schedule: A ``checkpoint_schedules`` schedule, or None to disable checkpointing.
+        disk: Whether to store checkpoints on disk.
+
+    Returns:
+        A tuple of the reduced functional, the controls, and perturbation directions.
+    """
+    tape = pyadjoint.Tape()
+    pyadjoint.set_working_tape(tape)
+    if disk:
+        dolfinx_adjoint.enable_disk_checkpointing()
+    if schedule is not None:
+        tape.enable_checkpointing(schedule)
+
+    mesh = V.mesh
+    dt = 0.1
+    nu = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0e-2))
+
+    controls = []
+    for i in range(n_steps):
+        c = dolfinx_adjoint.Function(V, name=f"bc_control_{i}")
+        c.interpolate(lambda x, i=i: 0.5 + 0.1 * (i + 1) * x[0])
+        controls.append(c)
+
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    uh = dolfinx_adjoint.Function(V, name="solution")
+    u_prev = dolfinx_adjoint.Function(V, name="previous")
+    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v))) * ufl.dx
+    a, L = ufl.system(F)
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    # One tracked bc per timestep, so the boundary data genuinely varies along the tape: a
+    # bc left holding another position's value is then a wrong answer, not a no-op.
+    bcs = [dolfinx_adjoint.dirichletbc(c, boundary_dofs, V=V) for c in controls]
+
+    problem = dolfinx_adjoint.LinearProblem(
+        a,
+        L,
+        u=uh,
+        bcs=[bcs[0]],
+        petsc_options=_PETSC_OPTIONS,
+        adjoint_petsc_options=_PETSC_OPTIONS,
+    )
+
+    J = dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+    for i in tape.timestepper(iter(range(n_steps))):
+        # LinearProblem._make_block reads problem.bcs per solve, so each recorded block
+        # keeps its own timestep's bc while still sharing this Problem's solvers.
+        problem.bcs = [bcs[i]]
+        problem.solve()
+        dolfinx_adjoint.assign(uh, u_prev)
+        J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
+
+    rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    return rf, controls, _perturbation_directions(V, n_steps)
+
+
+def _bc_control_schedule(kind, n_steps):
+    """The two storage kinds a bc control has to survive: Revolve keeps state in memory
+    and recomputes it, SingleDiskStorageSchedule pushes it through the h5py backend."""
+    return Revolve(n_steps, 2) if kind == "revolve" else SingleDiskStorageSchedule()
+
+
+def _moved_off_taped_values(V, controls):
+    """``controls`` shifted away from the values they were taped at.
+
+    Re-evaluating at the taped values would leave ``bc.g`` already holding the right
+    thing, so only a re-evaluation somewhere else actually requires replay to restore it.
+    """
+    moved = []
+    with pyadjoint.stop_annotating():
+        for i, c in enumerate(controls):
+            m = dolfinx_adjoint.Function(V, name=f"moved_{i}")
+            m.interpolate(lambda x, i=i: 0.7 + 0.05 * (i + 2) * x[1])
+            m.x.array[:] = c.x.array + 0.3 * m.x.array
+            moved.append(m)
+    return moved
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param(
+            "revolve",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Pre-existing defect, not specific to bc controls: under a schedule the "
+                    "gradient is wrong whenever the reduced functional was last evaluated at a "
+                    "control value other than the taped one. Reproduces on main with an ordinary "
+                    "source control and an untracked bc, and the answer changes with the snapshot "
+                    "count; a pure-pyadjoint tape of the same shape is correct, so it is ours. "
+                    "The [disk] case is not known to be sound either -- it passes only because "
+                    "this check compares against the unscheduled run."
+                ),
+            ),
+        ),
+        "disk",
+    ],
+)
+def test_bc_control_gradient_matches_uncheckpointed(V, kind):
+    """A schedule does not change the gradient w.r.t. a Dirichlet bc *value* control."""
+    n_steps = 6
+    rf_plain, controls_plain, _ = _tape_bc_control_heat_equation(V, n_steps)
+    expected = _gradient(rf_plain, _moved_off_taped_values(V, controls_plain))
+
+    rf_ckpt, controls_ckpt, _ = _tape_bc_control_heat_equation(
+        V, n_steps, _bc_control_schedule(kind, n_steps), disk=(kind == "disk")
+    )
+    actual = _gradient(rf_ckpt, _moved_off_taped_values(V, controls_ckpt))
+    if kind == "disk":
+        dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
+@pytest.mark.parametrize("kind", ["revolve", "disk"])
+def test_bc_control_taylor_test_under_checkpointing(V, kind):
+    """The checkpointed bc-control gradient is the actual derivative.
+
+    Not redundant with the comparison above: the two catch different failures, as
+    disabling ``DirichletBCBlock.recompute_component``'s resync shows. That breaks the
+    unscheduled run in exactly the same way as the disk one, so comparing the two still
+    passes and only this Taylor test notices; a Revolve run instead diverges from the
+    unscheduled one while still converging at rate 2. Both directions were checked by
+    mutation, so keep both tests.
+    """
+    n_steps = 6
+    rf, controls, directions = _tape_bc_control_heat_equation(
+        V, n_steps, _bc_control_schedule(kind, n_steps), disk=(kind == "disk")
+    )
+    rate = pyadjoint.taylor_test(rf, controls, directions)
+    if kind == "disk":
+        dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
+    assert rate > 1.95
+
+
 def _tape_snes_heat_equation(V, n_steps, schedule=None, solution_dependent_diffusivity=False):
     """Tape a heat equation solved as a residual problem via SNES.
 
