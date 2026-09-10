@@ -14,7 +14,7 @@ import pyadjoint
 import ufl
 
 from ..types import Function
-from ..typing_utils import NestedSequence
+from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
 from ..ufl_utils import assign_mixed_parts, sum_form
 from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form
 
@@ -95,15 +95,15 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
     _problem_ref: weakref.ReferenceType["LinearProblem | NonlinearProblem"]
     _rebuilt_problem: "LinearProblem | NonlinearProblem | None" = None
     _bcs: typing.Sequence[dolfinx.fem.DirichletBC]
-    _u: Function | typing.Sequence[Function]
-    _adjoint_solutions: Function | typing.Sequence[Function]
-    _second_adjoint_solutions: Function | typing.Sequence[Function]
-    _tlm_solutions: Function | typing.Sequence[Function]
+    _u: MaybeBlocked[Function]
+    _adjoint_solutions: MaybeBlocked[Function]
+    _second_adjoint_solutions: MaybeBlocked[Function]
+    _tlm_solutions: MaybeBlocked[Function]
     _jit_options: dict | None
     _form_compiler_options: dict | None
     _entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None
-    _adj_sol_bdy: _SpecialVector | typing.Sequence[_SpecialVector] | None = None
-    _adj_sol2_bdy: _SpecialVector | typing.Sequence[_SpecialVector] | None = None
+    _adj_sol_bdy: MaybeBlocked[_SpecialVector] | None = None
+    _adj_sol2_bdy: MaybeBlocked[_SpecialVector] | None = None
 
     def get_reference_problem(self) -> "LinearProblem | NonlinearProblem":
         """Return this block's owning Problem, which owns the shared solvers.
@@ -174,7 +174,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         """
         return any(isinstance(dep.output, dolfinx.fem.DirichletBC) for dep in dependencies)
 
-    def _snapshot_rhs(self, rhs_vec: PETSc.Vec) -> np.ndarray | typing.Sequence[np.ndarray]:  # type: ignore[name-defined]
+    def _snapshot_rhs(self, rhs_vec: PETSc.Vec) -> MaybeBlocked[np.ndarray]:  # type: ignore[name-defined]
         """Take a local, per-output-block numpy snapshot of ``rhs_vec``'s current values.
 
         Robust to whether the shared solver's PETSc layout is ``nest`` or monolithic:
@@ -185,7 +185,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian` --
         reused here in reverse rather than assuming a flat/monolithic layout.
         """
-        # mypy infers ui: Function | Sequence[Function] here despite the isinstance
+        # mypy infers ui: MaybeBlocked[Function] here despite the isinstance
         # narrowing above (the same narrowing pattern used, unannotated, throughout this
         # module) -- an apparent quirk of this base class's attribute-type inference;
         # narrow explicitly rather than chase it further.
@@ -202,9 +202,9 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
     def _compute_boundary_reaction(
         self,
-        rhs_snapshot: np.ndarray | typing.Sequence[np.ndarray],
-        reaction_template: dolfinx.fem.Form | typing.Sequence[dolfinx.fem.Form],
-    ) -> _SpecialVector | typing.Sequence[_SpecialVector]:
+        rhs_snapshot: MaybeBlocked[np.ndarray],
+        reaction_template: MaybeBlocked[dolfinx.fem.Form],
+    ) -> MaybeBlocked[_SpecialVector]:
         r"""Compute ``adj_sol_bdy = rhs_snapshot - action(adjoint(dF/du), adjoint_solution)``,
         per output block, given a pre-homogenization snapshot of the adjoint/SOA equation's
         right-hand side (``rhs_snapshot``, from
@@ -247,7 +247,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
     def _mask_reaction_to_bc(
         self,
         bc: dolfinx.fem.DirichletBC,
-        reaction: _SpecialVector | typing.Sequence[_SpecialVector],
+        reaction: MaybeBlocked[_SpecialVector],
     ) -> _SpecialVector:
         """Mask a (possibly per-block) boundary reaction vector onto ``bc``'s own
         constrained dofs, zero elsewhere, returned on ``bc.function_space``.
@@ -606,7 +606,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
     def prepare_recompute_component(
         self, inputs: typing.Sequence[typing.Any], relevant_outputs: typing.Sequence[typing.Any]
-    ) -> Function | typing.Sequence[Function]:
+    ) -> MaybeBlocked[Function]:
         """Recompute the block's own forward solution(s) from its checkpointed dependencies and outputs.
 
         Each problem has replaced its own forms' coefficients with placeholders, which are populated
@@ -680,7 +680,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         inputs: typing.Iterable[Function],
         block_variable: pyadjoint.block_variable.BlockVariable,
         idx: int,
-        prepared: Function | typing.Sequence[Function],
+        prepared: MaybeBlocked[Function],
     ) -> Function:
         """Return an isolated copy of this block's own share of the already-recomputed state.
 
@@ -1036,9 +1036,9 @@ class LinearProblemBlock(_ProblemBlockBase):
     this subclass supplies the pieces genuinely specific to a linear ``a``/``L`` residual.
     """
 
-    _adjoint_solutions: Function | typing.Sequence[Function]
-    _tlm_solutions: Function | typing.Sequence[Function]
-    _second_adjoint_solutions: Function | typing.Sequence[Function]
+    _adjoint_solutions: MaybeBlocked[Function]
+    _tlm_solutions: MaybeBlocked[Function]
+    _second_adjoint_solutions: MaybeBlocked[Function]
 
     # 2. Overload for the SCALAR case
     @typing.overload
@@ -1085,12 +1085,12 @@ class LinearProblemBlock(_ProblemBlockBase):
 
     def __init__(
         self,
-        a: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
-        L: ufl.Form | typing.Sequence[ufl.Form],
+        a: MaybeBlockedMatrix[ufl.Form],
+        L: MaybeBlocked[ufl.Form],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: Function | typing.Sequence[Function] | None = None,
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        u: MaybeBlocked[Function] | None = None,
+        P: MaybeBlockedMatrix[ufl.Form] | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
@@ -1132,7 +1132,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         self._preconditioner = P
 
         # Create overloaded functions
-        self._u: Function | typing.Sequence[Function]
+        self._u: MaybeBlocked[Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
         elif u is None:
@@ -1299,10 +1299,10 @@ class NonlinearProblemBlock(_ProblemBlockBase):
     this subclass supplies the pieces genuinely specific to a nonlinear ``F`` residual.
     """
 
-    _adjoint_solutions: Function | typing.Sequence[Function]
-    _second_adjoint_solutions: Function | typing.Sequence[Function]
-    _tlm_solutions: Function | typing.Sequence[Function]
-    _rhs: ufl.Form | typing.Sequence[ufl.Form]
+    _adjoint_solutions: MaybeBlocked[Function]
+    _second_adjoint_solutions: MaybeBlocked[Function]
+    _tlm_solutions: MaybeBlocked[Function]
+    _rhs: MaybeBlocked[ufl.Form]
 
     @typing.overload
     def __init__(
@@ -1346,11 +1346,11 @@ class NonlinearProblemBlock(_ProblemBlockBase):
 
     def __init__(
         self,
-        F: ufl.Form | typing.Sequence[ufl.Form],
+        F: MaybeBlocked[ufl.Form],
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: Function | typing.Sequence[Function] | None = None,
-        J: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        u: MaybeBlocked[Function] | None = None,
+        J: MaybeBlockedMatrix[ufl.Form] | None = None,
+        P: MaybeBlockedMatrix[ufl.Form] | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
@@ -1381,7 +1381,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
 
         # Create overloaded functions
         assert u is not None, "Control variable(s) must be provided."
-        self._u: Function | typing.Sequence[Function]
+        self._u: MaybeBlocked[Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
             replace_dict = {u: self._u}

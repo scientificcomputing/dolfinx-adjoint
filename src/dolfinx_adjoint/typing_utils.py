@@ -4,3 +4,5 @@ import typing
 
 type NestedSequence[T] = T | typing.Sequence["NestedSequence[T]"]
 type NestedMutableSequence[T] = T | typing.MutableSequence["NestedMutableSequence[T]"]
+type MaybeBlocked[T] = T | typing.Sequence[T]
+type MaybeBlockedMatrix[T] = T | typing.Sequence[typing.Sequence[T]]
