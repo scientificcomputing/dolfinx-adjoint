@@ -459,24 +459,34 @@ class _ProblemBase(abc.ABC):
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
                 self._adjoint_solution_placeholder = [
-                    dolfinx.fem.Function(s.function_space) for s in state_list
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_adjoint")
+                    for s in state_list
                 ]
                 self._second_adjoint_solution_placeholder = [
-                    dolfinx.fem.Function(s.function_space) for s in state_list
+                    dolfinx.fem.Function(
+                        s.function_space, name=f"{s.name}_second_adjoint"
+                    )
+                    for s in state_list
                 ]
                 self._hessian_u_seed = [
-                    dolfinx.fem.Function(s.function_space) for s in state_list
+                    dolfinx.fem.Function(
+                        s.function_space, name=f"{s.name}_hessian_u_seed"
+                    )
+                    for s in state_list
                 ]
             else:
                 assert isinstance(state_placeholder, dolfinx.fem.Function)
                 self._adjoint_solution_placeholder = dolfinx.fem.Function(
-                    state_placeholder.function_space
+                    state_placeholder.function_space,
+                    name=f"{state_placeholder.name}_adjoint",
                 )
                 self._second_adjoint_solution_placeholder = dolfinx.fem.Function(
-                    state_placeholder.function_space
+                    state_placeholder.function_space,
+                    name=f"{state_placeholder.name}_second_adjoint",
                 )
                 self._hessian_u_seed = dolfinx.fem.Function(
-                    state_placeholder.function_space
+                    state_placeholder.function_space,
+                    name=f"{state_placeholder.name}_hessian_u_seed",
                 )
         assert self._adjoint_solution_placeholder is not None
         return self._adjoint_solution_placeholder
@@ -587,22 +597,10 @@ class _ProblemBase(abc.ABC):
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
                 test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
-                self._adjoint_solution_placeholder = [
-                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_adjoint")
-                    for s in state_list
-                ]
-                self._second_adjoint_solution_placeholder = [
-                    dolfinx.fem.Function(
-                        s.function_space, name=f"{s.name}_second_adjoint"
-                    )
-                    for s in state_list
-                ]
-                self._hessian_u_seed = [
-                    dolfinx.fem.Function(
-                        s.function_space, name=f"{s.name}_hessian_u_seed"
-                    )
-                    for s in state_list
-                ]
+                # Reuse the placeholders _ensure_hessian_placeholders already built:
+                # rebuilding them here would orphan the ones the (already compiled and
+                # cached) boundary-reaction templates hold, freezing a bc control's
+                # gradient at whatever value those held when the first Hessian was taken.
                 state_arg: typing.Any = state_list
 
                 # soa_self = adjoint(d2F/du2) . adjoint_solution -- the SOA
@@ -636,18 +634,8 @@ class _ProblemBase(abc.ABC):
                 ]
             else:
                 assert isinstance(state_placeholder, dolfinx.fem.Function)
-                self._adjoint_solution_placeholder = dolfinx.fem.Function(
-                    state_placeholder.function_space,
-                    name=f"{state_placeholder.name}_adjoint",
-                )
-                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(
-                    state_placeholder.function_space,
-                    name=f"{state_placeholder.name}_second_adjoint",
-                )
-                self._hessian_u_seed = dolfinx.fem.Function(
-                    state_placeholder.function_space,
-                    name=f"{state_placeholder.name}_hessian_u_seed",
-                )
+                # See the blocked branch above: the placeholders are built once, in
+                # _ensure_hessian_placeholders, and must not be replaced here.
                 state_arg = state_placeholder
 
                 soa_self = _build_soa_self_template(
