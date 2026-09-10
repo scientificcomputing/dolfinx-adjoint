@@ -310,7 +310,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         replace_map.update(_map_block_variables_to_form(form, self.get_outputs()))
         return replace_map
 
-    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> NestedSequence[Function]:
+    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> MaybeBlocked[Function]:
         """Assemble and solve the tangent-linear (TLM) system for this block.
 
         The TLM solver -- and the compiled LHS it solves with, shared verbatim with

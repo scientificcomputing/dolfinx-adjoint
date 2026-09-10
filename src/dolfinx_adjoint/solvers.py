@@ -17,7 +17,7 @@ from .blocks.solvers import (
 )
 from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
-from .typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
+from .typing_utils import MaybeBlocked, MaybeBlockedMatrix
 from .ufl_utils import (
     assign_mixed_parts,
     compute_adjoint,
@@ -113,7 +113,7 @@ class HessianTemplates(typing.NamedTuple):
             per-dependency (not per-row) shape as ``fixed``.
     """
 
-    soa_self: NestedSequence[dolfinx.fem.Form]
+    soa_self: MaybeBlocked[dolfinx.fem.Form]
     soa_cross: dict
     fixed: dict
     cross: dict
@@ -156,7 +156,7 @@ def _build_soa_self_template(
     jit_options: dict | None,
     form_compiler_options: dict | None,
     entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None,
-) -> NestedSequence[dolfinx.fem.Form]:
+) -> MaybeBlocked[dolfinx.fem.Form]:
     """Build the SOA self-term ``adjoint(d2F/du2) . adjoint_solution``.
 
     The same computation for both {py:class}`~dolfinx_adjoint.LinearProblem` and
@@ -289,8 +289,8 @@ class _ProblemBase(abc.ABC):
         self._adjoint_solution_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
         self._second_adjoint_solution_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
         self._hessian_u_seed: MaybeBlocked[dolfinx.fem.Function] | None = None
-        self._adjoint_reaction_template: dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form] | None = None
-        self._second_order_adjoint_reaction_template: dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form] | None = None
+        self._adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
+        self._second_order_adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
 
     @abc.abstractmethod
     def _get_or_build_residual_template(
@@ -464,7 +464,7 @@ class _ProblemBase(abc.ABC):
 
     def _get_or_build_adjoint_reaction_template(
         self,
-    ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
+    ) -> MaybeBlocked[dolfinx.fem.Form]:
         """Build (once) and return ``action(adjoint(dF/du), adjoint_solution_placeholder)``,
         compiled with **no bcs applied at all** -- the boundary-control gradient recipe. See
         `dolfinx-adjoint-knowledge`'s `scratch/boundary-control/spec.md` for the full
@@ -483,7 +483,7 @@ class _ProblemBase(abc.ABC):
 
     def _get_or_build_second_order_adjoint_reaction_template(
         self,
-    ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
+    ) -> MaybeBlocked[dolfinx.fem.Form]:
         """Build (once) and return ``action(adjoint(dF/du), second_adjoint_solution_placeholder)``
         -- the Hessian-side counterpart of `_get_or_build_adjoint_reaction_template`, sharing
         the same ``adjoint(dF/du)`` operator (the SOA equation's LHS is verbatim the
@@ -504,7 +504,7 @@ class _ProblemBase(abc.ABC):
     def _build_adjoint_reaction_template(
         self,
         adjoint_placeholder: MaybeBlocked[dolfinx.fem.Function],
-    ) -> dolfinx.fem.Form | NestedSequence[dolfinx.fem.Form]:
+    ) -> MaybeBlocked[dolfinx.fem.Form]:
         """Compile ``action(adjoint(dF/du), adjoint_placeholder)``, with no bcs applied.
 
         Shared builder for `_get_or_build_adjoint_reaction_template` (first-order) and
@@ -556,7 +556,7 @@ class _ProblemBase(abc.ABC):
             assert self._hessian_u_seed is not None
             assert self._adjoint_solution_placeholder is not None
             blocked = isinstance(self._u, list)
-            soa_self: NestedSequence[dolfinx.fem.Form]
+            soa_self: MaybeBlocked[dolfinx.fem.Form]
             if blocked:
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
