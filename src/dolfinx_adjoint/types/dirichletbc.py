@@ -83,6 +83,17 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         cpp_bc, bc_kwargs = build_cpp_bc_and_kwargs(g_packed, dofs, V_used)
         super().__init__(cpp_bc, **bc_kwargs)
 
+        # Pin the Python-level packed value. dolfinx 0.12 keeps it on the wrapper itself
+        # (FEniCS/dolfinx#4342) and its own ``g`` would return it, but 0.11's unwraps to
+        # the cpp Function -- and ``bc.g`` is documented above as the *packed Function*,
+        # which callers index, interpolate from and build UFL expressions out of. The
+        # ``g`` override below keeps that promise identical on every supported dolfinx.
+        # ``function_space`` is deliberately *not* overridden the same way: 0.11's own
+        # bcs_by_block and assemble_matrix read ``bc.function_space`` expecting the cpp
+        # space, so forcing the Python wrapper there would break dolfinx's internals.
+        # dolfinx_adjoint.compat.bcs_by_block normalises both flavours instead.
+        self._packed_g = g_packed
+
         FloatingType.__init__(
             self,
             g_packed,
@@ -96,6 +107,12 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
 
         if annotate:
             self._ad_annotate_block()
+
+    @property
+    def g(self) -> Function:  # type: ignore[override]
+        """The packed bc value: always the Python-level :py:class:`dolfinx_adjoint.Function`
+        on `V`, never dolfinx 0.11's cpp ``Function``. See :py:func:`_pack_bc_value`."""
+        return self._packed_g
 
     def _ad_create_checkpoint(self):
         return self

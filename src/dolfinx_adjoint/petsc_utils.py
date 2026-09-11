@@ -6,6 +6,8 @@ from petsc4py import PETSc
 
 import dolfinx.fem.petsc
 
+from .compat import bcs_by_block
+
 
 def solve_linear_problem(
     A: PETSc.Mat,  # type: ignore [name-defined]
@@ -112,7 +114,7 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
         # derivation.
         if self.tlm_bcs:
             if isinstance(self._u, list):
-                bcs_lift = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore
+                bcs_lift = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore[arg-type]
                 dolfinx.fem.petsc.apply_lifting(self._b, self._a, bcs=bcs_lift)  # type: ignore
             else:
                 dolfinx.fem.petsc.apply_lifting(self._b, [self._a], bcs=[self.tlm_bcs])  # type: ignore
@@ -127,7 +129,7 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
                 # base LinearProblem.solve()'s own isinstance(self.u, Sequence) branch (see
                 # dolfinx-adjoint-knowledge's scratch/boundary-control/issues/01 for the
                 # bug this fixes).
-                bcs0 = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.bcs)  # type: ignore
+                bcs0 = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.bcs)  # type: ignore[arg-type]
                 dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=0.0)
             else:
                 for bc in self.bcs:
@@ -138,7 +140,7 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
         # than the homogeneous 0 the pass above just wrote everywhere.
         if self.tlm_bcs:
             if isinstance(self._u, list):
-                bcs0 = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore
+                bcs0 = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore[arg-type]
                 dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=1.0)
             else:
                 for bc in self.tlm_bcs:

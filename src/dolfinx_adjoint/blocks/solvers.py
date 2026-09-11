@@ -13,6 +13,7 @@ import numpy as np
 import pyadjoint
 import ufl
 
+from ..compat import bcs_by_block
 from ..types import Function
 from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
 from ..ufl_utils import assign_mixed_parts, sum_form
@@ -1205,7 +1206,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         self._bc_block_index: dict[dolfinx.fem.DirichletBC, int] = {}
         if isinstance(self._u, list) and self._bcs:
             spaces = [ui.function_space for ui in self._u]
-            grouped = dolfinx.fem.bcs.bcs_by_block(spaces, self._bcs)
+            grouped = bcs_by_block(spaces, self._bcs)
             for block_idx, bcs_in_block in enumerate(grouped):
                 for bc in bcs_in_block:
                     self._bc_block_index[bc] = block_idx
@@ -1426,7 +1427,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self._bc_block_index: dict[dolfinx.fem.DirichletBC, int] = {}
         if isinstance(self._u, list) and self._bcs:
             spaces = [ui.function_space for ui in self._u]
-            grouped = dolfinx.fem.bcs.bcs_by_block(spaces, self._bcs)
+            grouped = bcs_by_block(spaces, self._bcs)
             for block_idx, bcs_in_block in enumerate(grouped):
                 for bc in bcs_in_block:
                     self._bc_block_index[bc] = block_idx
