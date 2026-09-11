@@ -2,14 +2,19 @@ format: jb-book
 root: README.md
 
 parts:
-  - caption: Examples
+  - caption: Introduction
     chapters:
     - file: "demos/poisson_mother.py"
-    - file: "demos/time_distributed_control.py"
-    - file: "demos/time_distributed_control_checkpointing.py"
+    - file: "demos/boundary_control.py"
+    - file: "demos/topology_optimization.py"
     - file: "demos/demo_nonmatching_grids.py"
     - file: "demos/emi_membrane_current_control.py"
-    - file: "demos/boundary_control.py"
+
+  - caption: Time-dependent PDE control
+    chapters:
+    - file: "demos/time_distributed_control.py"
+    - file: "demos/time_distributed_control_checkpointing.py"
+
   - caption: Python API
     chapters:
     - file: "docs/api"

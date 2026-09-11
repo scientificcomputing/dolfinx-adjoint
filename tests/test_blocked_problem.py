@@ -147,24 +147,9 @@ def test_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches_finite_di
 def test_vector_valued_solver(mesh_2D):
     """Regression test for a spurious block-extraction bug on plain vector-valued spaces.
 
-    Unlike ``test_solver``'s two parametrizations -- a genuine ``ufl.MixedFunctionSpace``
-    (``use_mixed_space=True``) and an explicit list-of-lists two-field system
-    (``use_mixed_space=False``, but still two separate function spaces and a
-    ``u=[uh, ph]`` list) -- this problem has a *single* state ``Function`` (not a list)
-    on one plain vector-*shaped* space (``("Lagrange", 1, (gdim,))``), exactly the shape
-    every vector-PDE problem (e.g. elasticity) uses.
-
-    Before the fix, ``compute_adjoint`` called ``ufl.extract_blocks`` unconditionally,
-    which still decomposes a shaped (non-mixed) argument into spurious blocks even
-    though there is no genuine block structure here. That first raised
-    ``AttributeError: 'FunctionSpace' object has no attribute '_cpp_object'`` (a bare
-    ``ufl.FunctionSpace`` lost its dolfinx wrapper during the spurious extraction), and
-    after passing ``replace_argument=False``, a PETSc size mismatch instead (each
-    spurious block still referenced the original, full-space ``Argument``, so the
-    assembled adjoint operator came out sized for several redundant copies of the
-    space). The fix threads ``blocked=isinstance(self._u, list)`` through
-    ``compute_adjoint`` so block-extraction only runs for a genuinely blocked/mixed
-    problem.
+    Previous tests didn't check {py:func}`ufl.extract_blocks` on
+    a single vector-valued space, only on a mixed space.
+    This test checks that we don't call extract_blocks on single-space forms.
     """
     pyadjoint.get_working_tape().clear_tape()
     mesh = mesh_2D
@@ -172,9 +157,8 @@ def test_vector_valued_solver(mesh_2D):
     V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (gdim,)))
     Z = dolfinx.fem.functionspace(mesh, ("DG", 0))
 
-    # The control multiplies the bilinear form (not just the right-hand side), as in
-    # a SIMP-style density-dependent stiffness -- the structure that first surfaced
-    # this bug in a linear-elasticity topology optimization demo.
+    # The control multiplies the bilinear form (not just the right-hand side),
+    # as in a SIMP-style density-dependent stiffness.
     kappa = Function(Z, name="control")
     kappa.interpolate(lambda x: 1.0 + 0.5 * np.sin(np.pi * x[0]))
 
@@ -202,8 +186,7 @@ def test_vector_valued_solver(mesh_2D):
     )
     problem.solve()
 
-    # Quartic in the state, for the same round-off-avoidance reason as test_solver's
-    # objective.
+    # Quartic in the state to get good Taylor test remainders
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * ufl.dx)
 
     control = pyadjoint.Control(kappa)

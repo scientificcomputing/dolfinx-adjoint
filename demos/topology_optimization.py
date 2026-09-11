@@ -2,41 +2,34 @@
 # *Section author: Jørgen S. Dokken ([dokken@simula.no](mailto:dokken@simula.no))*.
 #
 # This demo reproduces the 3D cantilever-beam topology optimization problem from
-# [Pasteur Labs' Mosaic benchmark suite][mosaic-results], using `dolfinx_adjoint` in
-# place of the original FEniCS/dolfin-adjoint solver. The mesh, material model,
-# boundary conditions and objective follow Mosaic's own reference implementation
-# exactly:
-#
-# - [`fenics-structural/tesseract_api.py`][mosaic-tesseract] — the FEniCS/dolfin-adjoint
-#   physics kernel this demo's weak form and compliance functional mirror.
-# - [`benchmarks/problems/structural_mesh/{physics,optimization,config}.py`][mosaic-benchmark] —
-#   the cantilever boundary-condition builder and the canonical run configuration
-#   (mesh resolution, material parameters, volume-fraction target) reproduced below.
+# [Pasteur Labs' Mosaic benchmark suite][mosaic-results], using
+# {py:mod}`dolfinx_adjoint` in place of the original FEniCS/dolfin-adjoint solver.
+# The mesh, material model, boundary conditions and objective follow Mosaic's own
+# reference implementation.
 #
 # The optimizer differs from Mosaic's own Adam-based recipe: this demo uses
 # `scipy.optimize.minimize(method="trust-constr")`, driven by a
-# `pyadjoint.ReducedFunctionalNumPy`, which — unlike Mosaic's Adam + manual clipping —
+# `pyadjoint.ReducedFunctionalNumPy`, which unlike Mosaic's Adam + manual clipping,
 # enforces the SIMP density bounds natively via `bounds=` while also using exact
-# Hessian-vector products from the adjoint/tangent-linear system (`hessp=`), something
-# Mosaic's first-order Adam recipe does not use at all.
+# Hessian-vector products from the adjoint/tangent-linear system (`hessp=`).
 #
 # The per-iteration density animation uses the pyvista GIF-writing pattern from
 # [`dolfinx-tutorial/chapter2/amr.py`][tutorial-amr].
 #
 # [mosaic-results]: https://docs.pasteurlabs.ai/projects/mosaic/stable/docs/results_structural_mesh.html
-# [mosaic-tesseract]: https://github.com/pasteurlabs/mosaic/blob/main/mosaic/tesseracts/structural-mesh/fenics-structural/tesseract_api.py
-# [mosaic-benchmark]: https://github.com/pasteurlabs/mosaic/tree/main/mosaic/benchmarks/problems/structural_mesh
 # [tutorial-amr]: https://github.com/jorgensd/dolfinx-tutorial/blob/c752d010ddbabf98b3e71e7a562f07ad7a738c26/chapter2/amr.py#L241
 
 # ## Problem definition
 #
-# We minimize the structural compliance $C = \mathbf F^\top \mathbf u$ of a linear
+# We minimize the structural compliance $C = \mathbf{F}^\top \mathbf{u}$ of a linear
 # elastic body $\Omega$ subject to
 #
 # $$
-# -\operatorname{div}(\sigma(\mathbf u)) = 0 \quad \text{in } \Omega, \qquad
-# \mathbf u = 0 \quad \text{on } \Gamma_D, \qquad
-# \sigma(\mathbf u)\cdot n = \mathbf t \quad \text{on } \Gamma_N,
+# \begin{align}
+# -\operatorname{div}(\sigma(\mathbf u)) &= 0 &&\text{in } \Omega,\\
+# \mathbf{u} &= 0 && \text{on } \Gamma_D, \\
+# \sigma(\mathbf u)\cdot n &= \mathbf{t} && \text{on } \Gamma_N,
+# \end{align}
 # $$
 #
 # with a SIMP-interpolated, density-dependent stiffness
@@ -48,15 +41,14 @@
 # and a soft volume-fraction penalty added to the objective,
 #
 # $$
-# \min_{x_\min \le \rho \le 1} \; J(\rho) = C(\rho) + w\,(\bar\rho - v_\mathrm{frac})^2,
-# \qquad \bar\rho = \frac{1}{|\Omega|}\int_\Omega \rho \, \mathrm{d}x.
+# \min_{x_\min \le \rho \le 1} \; J(\rho) &= C(\rho) + w\left(\bar\rho - v_\mathrm{frac}\right)^2,
+# \qquad \bar\rho = \frac{1}{|\Omega|}\int_\Omega \rho~\mathrm{d}x.
 # $$
 #
-# The domain is a $[0,2]\times[0,1]\times[0,1]$ cantilever beam meshed with HEX8
-# elements ($16\times2\times8$ elements), clamped at $x=0$. A prescribed total force
-# $F_\mathrm{total}$ is applied at $x=2$, either as a uniform downward traction over
-# the whole face, or as a concentrated upward traction on a single corner patch — both
-# cases are run below.
+# The domain is a $[0,Lx]\times[0,Ly]\times[0,Lz]$ cantilever beam meshed with hexahedral
+# element, clamped at $x=0$. A prescribed total force $F_\mathrm{total}$ is applied at $x=L$,
+# either as a uniform downward traction over the whole face, or as a concentrated upward traction
+# on a single corner patch.
 
 # ## Implementation
 #
@@ -87,9 +79,7 @@ pyvista.set_jupyter_backend("html")
 # -
 
 # ## Material and problem parameters
-#
-# These match Mosaic's canonical `optimization/topopt` run exactly (see
-# `mosaic/benchmarks/problems/structural_mesh/config.py`).
+# Parameters based on [Pasteur Labs' Mosaic benchmark suite][mosaic-results].
 
 # +
 Lx, Ly, Lz = 2.0, 1.0, 1.0
@@ -107,13 +97,11 @@ penalty_weight = 50.0  # volume-fraction penalty weight
 
 # ## Mesh and boundary conditions
 #
-# `build_mesh_and_bcs` mirrors Mosaic's own `_cantilever_bcs`
-# (`mosaic/benchmarks/problems/structural_mesh/physics.py`): all nodes at $x=0$ are
-# clamped, and the load on the $x=L_x$ face is either a uniform downward traction, or
-# a concentrated upward traction on the single corner patch $y\in[0,\Delta y]$,
-# $z\in[0,\Delta z]$. `dolfinx.mesh.locate_entities_boundary` selects a facet only when
-# *all* of its vertices satisfy the marker, matching the "all vertices in group"
-# semantics Mosaic's own node-mask approach uses.
+# We create a helper function {py:func}`build_mesh_and_bcs`
+# which sets up the mesh and marks the facets to apply the traction on four each use-case.
+# All nodes at $x=0$ are clamped, and the load on the $x=Lx$ face is either a
+# uniform downward traction, or a concentrated upward traction on the single corner patch
+# $y\in[0,\Delta y]$, $z\in[0,\Delta z]$.
 
 
 def build_mesh_and_bcs(nx: int, ny: int, nz: int, corner_load: bool):
@@ -141,9 +129,14 @@ def build_mesh_and_bcs(nx: int, ny: int, nz: int, corner_load: bool):
         traction = (0.0, 0.0, -F_total / (Ly * Lz))  # uniform, downward
 
     right_facets = np.sort(right_facets)
-    facet_tags = dolfinx.mesh.meshtags(msh, fdim, right_facets, np.full(len(right_facets), 1, dtype=np.int32))
-    ds = ufl.Measure("ds", domain=msh, subdomain_data=facet_tags)
-    return msh, left_facets, ds, np.array(traction, dtype=dolfinx.default_scalar_type)
+    facet_map = msh.topology.index_map(fdim)
+    num_facets = facet_map.size_local + facet_map.num_ghosts
+    markers = np.zeros(num_facets, dtype=np.int32)
+    markers[right_facets] = 1
+    markers[left_facets] = 2
+    local_indices = np.flatnonzero(markers).astype(np.int32)
+    facet_tags = dolfinx.mesh.meshtags(msh, fdim, local_indices, markers[local_indices])
+    return msh, facet_tags, np.array(traction, dtype=dolfinx.default_scalar_type)
 
 
 # ## Per-iteration density visualization and compliance history
@@ -152,14 +145,13 @@ def build_mesh_and_bcs(nx: int, ny: int, nz: int, corner_load: bool):
 # pyvista pattern from `dolfinx-tutorial/chapter2/amr.py`. Since a SIMP density field
 # lives in a `("DG", 0)` space, its dof array maps 1-to-1 onto the local cell
 # numbering, so it can be attached directly as `cell_data` on a grid built from the
-# mesh itself (not from the function space). The same callback also records the pure
-# compliance (not the volume-penalized objective) at each iteration, for the
-# compliance-vs-iteration convergence plot Mosaic's own results page shows.
+# mesh itself (not from the function space). We also record the compliance
+# (not the volume-penalized objective) at each iteration.
 #
-# `scipy.optimize.minimize` reports only the penalized objective
+# {py:func}`scipy.optimize.minimize` reports only the penalized objective
 # (`intermediate_result.fun`), so the pure compliance is recovered arithmetically:
 # since every cell of this structured box mesh has equal volume, the volume fraction is
-# exactly `rho.x.array.mean()`, so `compliance = fun - penalty_weight*(vol_frac - v_frac)**2`
+# exactly is the mean of rho, so `compliance = fun - penalty_weight*(vol_frac - v_frac)**2`
 # recovers it with no extra PDE solve.
 
 
@@ -183,7 +175,10 @@ def make_iteration_tracker(
         rho.x.array[:] = intermediate_result.x
         rho.x.scatter_forward()
         write_frame()
-        vol_frac = float(rho.x.array.mean())
+        num_dofs_local = rho.function_space.dofmap.index_map.size_local
+        local_vol_frac = np.sum(rho.x.array[:num_dofs_local])
+        vol = rho.function_space.mesh.comm.allreduce(local_vol_frac, op=MPI.SUM)
+        vol_frac = vol / rho.function_space.dofmap.index_map.size_global
         compliance_history.append(intermediate_result.fun - penalty_weight * (vol_frac - v_frac) ** 2)
 
     write_frame()  # record the initial, uniform density as frame 0
@@ -195,25 +190,20 @@ def make_iteration_tracker(
 # `run_topopt` builds the forward model once (SIMP weak form, linear solve, compliance
 # + volume-penalty objective), verifies the resulting adjoint gradient and Hessian with
 # 0th/1st/2nd-order Taylor tests, times a single tape recompute and a single adjoint
-# solve, then optimizes the density with a bound- and curvature-aware scipy solver.
-#
-# ```{note}
-# A `pyadjoint.ReducedFunctional` *replays* the tape it was built from — it does not
-# re-execute Python code. The forward model below therefore calls `problem.solve()`
-# with annotation on exactly once; every subsequent evaluation goes through
-# `Jhat(...)`/`Jhat.derivative()`/`Jhat.hessian(...)`. `problem` is also kept alive as a
-# local variable for as long as `Jhat` is used, since letting it go out of scope would
-# silently fall back to a much slower solver-rebuild path.
-# ```
+# solve.
 
 
-def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dict:
-    case_name = "corner_load" if corner_load else "full_face_load"
-    print(f"\n=== Running topology optimization: {case_name} ===")
+def run_topopt(
+    corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8
+) -> tuple[
+    pyadjoint.ReducedFunctional, dolfinx_adjoint.LinearProblem, pyadjoint.AdjFloat, dolfinx_adjoint.Function, dict
+]:
+    print(f"\n=== Running topology optimization: {corner_load=} ===")
 
     pyadjoint.get_working_tape().clear_tape()
 
-    msh, left_facets, ds, traction = build_mesh_and_bcs(nx, ny, nz, corner_load)
+    msh, facet_tags, traction = build_mesh_and_bcs(nx, ny, nz, corner_load)
+    ds = ufl.Measure("ds", domain=msh, subdomain_data=facet_tags)
     fdim = msh.topology.dim - 1
 
     # ### Function spaces and control
@@ -244,7 +234,7 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
     L = ufl.inner(t, v) * ds(1)
 
     # ### Dirichlet BC and forward solve (once)
-    bdofs = dolfinx.fem.locate_dofs_topological(V, fdim, left_facets)
+    bdofs = dolfinx.fem.locate_dofs_topological(V, fdim, facet_tags.find(2))
     bc = dolfinx.fem.dirichletbc(np.zeros(3, dtype=dolfinx.default_scalar_type), bdofs, V)
 
     petsc_options = {
@@ -266,7 +256,7 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
     t_forward_start = time.perf_counter()
     problem.solve()
     forward_time = time.perf_counter() - t_forward_start
-    print(f"[{case_name}] initial forward solve: {forward_time:.4e} s")
+    print(f"[{corner_load=}] initial forward solve: {forward_time:.4e} s")
 
     # ### Objective: compliance + volume-fraction penalty
     compliance = dolfinx_adjoint.assemble_scalar(ufl.action(L, uh))
@@ -277,10 +267,6 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
     Jhat = pyadjoint.ReducedFunctional(J, control)
 
     # ### Gradient and Hessian verification: 0th, 1st and 2nd-order Taylor tests
-    #
-    # Matches the convention used throughout `dxa/tests/` (e.g.
-    # `tests/test_linear_solver.py`, `demos/demo_nonmatching_grids.py`) rather than the
-    # (unused-in-this-repo) upstream `pyadjoint.taylor_to_dict` helper.
     with pyadjoint.stop_annotating():
         h = dolfinx_adjoint.Function(Q)
         rng = np.random.default_rng(seed=42)
@@ -288,15 +274,15 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
         h.x.scatter_forward()
 
         rate0 = pyadjoint.taylor_test(Jhat, rho, h, dJdm=0)
-        print(f"[{case_name}] 0th-order Taylor rate (expect ~1): {rate0:.4f}")
+        print(f"[{corner_load=}] 0th-order Taylor rate (expect ~1): {rate0:.4f}")
         rate1 = pyadjoint.taylor_test(Jhat, rho, h)
-        print(f"[{case_name}] 1st-order Taylor rate (expect ~2): {rate1:.4f}")
+        print(f"[{corner_load=}] 1st-order Taylor rate (expect ~2): {rate1:.4f}")
 
         Jhat(rho)
         dJdm = Jhat.derivative()._ad_dot(h)
         dHddu = Jhat.hessian(h)._ad_dot(h)
         rate2 = pyadjoint.taylor_test(Jhat, rho, h, dJdm=dJdm, Hm=dHddu)
-        print(f"[{case_name}] 2nd-order Taylor rate (expect ~3): {rate2:.4f}")
+        print(f"[{corner_load=}] 2nd-order Taylor rate (expect ~3): {rate2:.4f}")
 
     # ### Cost of one recompute vs. one adjoint solve
     #
@@ -305,21 +291,35 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
     t_recompute_start = time.perf_counter()
     Jhat(rho)
     recompute_time = time.perf_counter() - t_recompute_start
-    print(f"[{case_name}] one tape recompute (Jhat(rho)): {recompute_time:.4e} s")
+    print(f"[{corner_load=}] one tape recompute (Jhat(rho)): {recompute_time:.4e} s")
 
     t_derivative_start = time.perf_counter()
     Jhat.derivative()
     derivative_time = time.perf_counter() - t_derivative_start
-    print(f"[{case_name}] one adjoint solve (Jhat.derivative()): {derivative_time:.4e} s")
+    print(f"[{corner_load=}] one adjoint solve (Jhat.derivative()): {derivative_time:.4e} s")
+    timings = {"recompute_time": recompute_time, "derivative_time": derivative_time, "forward_time": forward_time}
+    return Jhat, problem, compliance, rho, timings
 
-    # ### Bound- and curvature-aware optimization
-    #
-    # `scipy.optimize.minimize(method="trust-constr")` is the scipy method that accepts
-    # *both* `bounds=` and a Hessian-vector product (`hessp=`); `pyadjoint.minimize`'s
-    # convenience wrapper only wires `hessp` automatically for `method="Newton-CG"`
-    # (which has no bounds support), so we drive `scipy.optimize.minimize` directly
-    # from a `pyadjoint.reduced_functional_numpy.ReducedFunctionalNumPy` — the same public class
-    # `pyadjoint.minimize` itself wraps every call in.
+
+# ### Bound- and curvature-aware optimization
+#
+# `scipy.optimize.minimize(method="trust-constr")` is the scipy method that accepts
+# *both* `bounds=` and a Hessian-vector product (`hessp=`); `pyadjoint.minimize`'s
+# convenience wrapper only wires `hessp` automatically for `method="Newton-CG"`
+# (which has no bounds support), so we drive `scipy.optimize.minimize` directly
+# from a `pyadjoint.reduced_functional_numpy.ReducedFunctionalNumPy` — the same public class
+# `pyadjoint.minimize` itself wraps every call in.
+
+
+def optimize(
+    rho: dolfinx_adjoint.Function,
+    Jhat: pyadjoint.ReducedFunctional,
+    problem: dolfinx_adjoint.LinearProblem,
+    compliance: pyadjoint.AdjFloat,
+    corner_load: bool,
+):
+    case_name = "corner_load" if corner_load else "full_face_load"
+    msh = rho.function_space.mesh
     plotter, callback, compliance_history = make_iteration_tracker(
         msh, rho, f"topopt_{case_name}.gif", float(compliance)
     )
@@ -367,9 +367,6 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
         "compliance": float(final_compliance),
         "vol_frac": float(final_vol_frac),
         "n_iterations": int(res.nit),
-        "forward_time": forward_time,
-        "recompute_time": recompute_time,
-        "derivative_time": derivative_time,
         "optim_time": optim_time,
         "compliance_history": compliance_history,
     }
@@ -380,7 +377,12 @@ def run_topopt(corner_load: bool, nx: int = 16, ny: int = 2, nz: int = 8) -> dic
 # Mosaic's canonical `optimization/topopt` run uses `corner_load=True`; we additionally
 # run the uniform full-face load for comparison.
 
-results = [run_topopt(corner_load=True), run_topopt(corner_load=False)]
+results = []
+for corner_load in [True, False]:
+    Jhat, problem, compliance, rho, timings = run_topopt(corner_load)
+    result = optimize(rho, Jhat, problem, compliance, corner_load)
+    result.update(timings)
+    results.append(result)
 
 # ## Summary
 
