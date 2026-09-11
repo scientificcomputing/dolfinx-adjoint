@@ -863,6 +863,10 @@ def test_nonlinear_blocked_problem_templates_compiled_once():
         "pc_type": "lu",
         "ksp_error_if_not_converged": True,
         "pc_factor_mat_solver_type": "mumps",
+        # Enclosed flow: velocity is pinned on the whole boundary and nothing fixes the
+        # pressure level, so the constant-pressure mode is in the Jacobian's nullspace and
+        # the LU is singular. MUMPS null-pivot detection.
+        "mat_mumps_icntl_24": 1,
     }
     forward_options = {
         "snes_type": "newtonls",

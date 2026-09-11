@@ -15,6 +15,17 @@ direct_solve = {
     "pc_type": "lu",
     "ksp_error_if_not_converged": True,
     "pc_factor_mat_solver_type": "mumps",
+    # Every velocity/pressure system in this module pins the velocity on the *whole*
+    # exterior boundary and imposes no pressure condition, so the flow is fully enclosed
+    # and the pressure is determined only up to a constant. A direct
+    # LU on a singular operator returns whichever solution pivoting happens to pick,
+    # which is why the derivative checks here failed intermittently in parallel. ICNTL(24)
+    # turns on MUMPS null-pivot detection so the factorization handles that mode
+    # deliberately rather than by accident. It is a mitigation, not a cure -- the real fix
+    # is a well-posed formulation -- so see dolfinx-adjoint-knowledge's
+    # scratch/blocked-nullspace/issues/01-enclosed-flow-pressure-nullspace.md before
+    # assuming a failure here is a bug in the adjoint.
+    "mat_mumps_icntl_24": 1,
 }
 
 
