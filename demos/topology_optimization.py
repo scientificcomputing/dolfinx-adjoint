@@ -166,7 +166,8 @@ def make_iteration_tracker(
     def write_frame():
         grid = pyvista.UnstructuredGrid(*dolfinx.plot.vtk_mesh(msh))
         grid.cell_data["rho"] = rho.x.array
-        actor = plotter.add_mesh(grid, scalars="rho", clim=(0.0, 1.0), cmap="viridis", show_edges=False)
+        filtered_grid = grid.threshold(0.5, scalars="rho")
+        actor = plotter.add_mesh(filtered_grid, scalars="rho", clim=(0.0, 1.0), cmap="viridis", show_edges=False)
         plotter.view_isometric()
         plotter.write_frame()
         plotter.remove_actor(actor)
@@ -349,15 +350,16 @@ def optimize(
 
     # Final compliance/volume fraction as plain floats.
     uh = problem.u
-    L = problem.L
+    L = problem._rhs
     final_compliance = dolfinx_adjoint.assemble_scalar(ufl.action(L, uh), annotate=False)
     final_vol_frac = dolfinx_adjoint.assemble_scalar(rho * ufl.dx, annotate=False) / (Lx * Ly * Lz)
 
     # Static screenshot of the converged density field.
     grid = pyvista.UnstructuredGrid(*dolfinx.plot.vtk_mesh(msh))
     grid.cell_data["rho"] = rho.x.array
+    filtered_grid = grid.threshold(0.5, scalars="rho")
     final_plotter = pyvista.Plotter(off_screen=pyvista.OFF_SCREEN)
-    final_plotter.add_mesh(grid, scalars="rho", clim=(0.0, 1.0), cmap="viridis", show_edges=False)
+    final_plotter.add_mesh(filtered_grid, scalars="rho", clim=(0.0, 1.0), cmap="viridis", show_edges=False)
     final_plotter.view_isometric()
     if pyvista.OFF_SCREEN:
         final_plotter.screenshot(f"topopt_{case_name}_final.png")
@@ -378,10 +380,11 @@ def optimize(
 #
 # Mosaic's canonical `optimization/topopt` run uses `corner_load=True`; we additionally
 # run the uniform full-face load for comparison.
+# We use the settings from Figure 32 of {cite}`top-rehmann2026mosaic`, which uses a 32x4x16 mesh.
 
 results = []
 for corner_load in [True, False]:
-    Jhat, problem, compliance, rho, timings = run_topopt(corner_load)
+    Jhat, problem, compliance, rho, timings = run_topopt(corner_load, nx=32, ny=4, nz=16)
     result = optimize(rho, Jhat, problem, compliance, corner_load)
     result.update(timings)
     results.append(result)
@@ -406,3 +409,12 @@ ax.legend()
 fig.savefig("topopt_compliance_convergence.png", dpi=150, bbox_inches="tight")
 if not pyvista.OFF_SCREEN:
     plt.show()
+
+
+# ## References
+#
+# ```{bibliography}
+# :filter: cited
+# :labelprefix:
+# :keyprefix: top-
+# ```
