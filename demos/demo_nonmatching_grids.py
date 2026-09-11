@@ -6,7 +6,7 @@
 #
 # Subject to the state equation on a fine grid (\Omega_s) and a control on a coarse grid (\Omega_c):
 #
-# $$ - \Delta y = I_{\Omega_c \to \Omega_s}(u + u^3) \quad \text{in } \Omega_s $$
+# $$ - \Delta y = I_{\Omega_c \to \Omega_s}(u + 0.1 u^3) \quad \text{in } \Omega_s $$
 
 from mpi4py import MPI
 

@@ -6,6 +6,8 @@ from petsc4py import PETSc
 
 import dolfinx.fem.petsc
 
+from .compat import bcs_by_block
+
 
 def solve_linear_problem(
     A: PETSc.Mat,  # type: ignore [name-defined]
@@ -65,6 +67,13 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
     name no longer singles out one of the two callers.
     """
 
+    #: Optional bcs whose *value* (not just dof pattern) should be written into ``self.b``
+    #: after the usual ``alpha=0.0`` homogenization -- the tangent-linear solve's mechanism
+    #: for a boundary-control perturbation (see ``solve()`` and
+    #: ``blocks/solvers.py::_ProblemBlockBase.prepare_evaluate_tlm``). ``None`` for the
+    #: adjoint solver, which never perturbs a bc's value, only its dofs.
+    tlm_bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None
+
     def solve(
         self,
     ) -> typing.Union[dolfinx.fem.Function, typing.Sequence[dolfinx.fem.Function]]:
@@ -92,13 +101,51 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
             dolfinx.fem.petsc.assemble_matrix(self._P_mat, self._preconditioner, bcs=self.bcs)  # type: ignore
             self._P_mat.assemble()
 
+        # Tangent-linear boundary control: self._A's bc columns are already eliminated, so
+        # simply setting self._b's boundary dofs to the perturbation direction would leave
+        # u_dot's interior dofs at whatever the caller's own RHS already put there,
+        # discarding the perturbation's propagation through the PDE. apply_lifting
+        # recomputes that propagation from the (unmodified) form self._a -- it must run
+        # *before* the bc dofs are set to their final values (its own alpha=1.0 default
+        # expects x0=0, matching the zeroed state prepare_evaluate_tlm leaves this vector
+        # in). Dofs not covered by self.tlm_bcs (untracked, or no tangent-linear value this
+        # call) correctly get no lifting, matching u_dot=0 there. See
+        # dolfinx-adjoint-knowledge's scratch/boundary-control/spec.md for the full
+        # derivation.
+        if self.tlm_bcs:
+            if isinstance(self._u, list):
+                bcs_lift = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore[arg-type]
+                dolfinx.fem.petsc.apply_lifting(self._b, self._a, bcs=bcs_lift)  # type: ignore
+            else:
+                dolfinx.fem.petsc.apply_lifting(self._b, [self._a], bcs=[self.tlm_bcs])  # type: ignore
+            self._b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)  # type: ignore
+
         if self.bcs is not None:
-            try:
+            if isinstance(self._u, list):
+                # `bc.set()` on the monolithic blocked vector has no block-offset
+                # translation: a bc constraining any block other than the first would land
+                # its raw (block-local) dof indices in the wrong block. Route through
+                # bcs_by_block/set_bc unconditionally for blocked problems, mirroring the
+                # base LinearProblem.solve()'s own isinstance(self.u, Sequence) branch (see
+                # dolfinx-adjoint-knowledge's scratch/boundary-control/issues/01 for the
+                # bug this fixes).
+                bcs0 = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.bcs)  # type: ignore[arg-type]
+                dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=0.0)
+            else:
                 for bc in self.bcs:
                     bc.set(self._b.array_w, alpha=0.0)
-            except RuntimeError:
-                bcs0 = dolfinx.fem.bcs.bcs_by_block(dolfinx.fem.forms.extract_spaces(self._L), self.bcs)  # type: ignore
-                dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=0.0)
+
+        # Overwrite (alpha=1.0, x0=None -> x[dof]=g) the state's tlm value at exactly the
+        # bcs in self.tlm_bcs' own dofs with g -- their perturbation direction -- rather
+        # than the homogeneous 0 the pass above just wrote everywhere.
+        if self.tlm_bcs:
+            if isinstance(self._u, list):
+                bcs0 = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore[arg-type]
+                dolfinx.fem.petsc.set_bc(self._b, bcs0, alpha=1.0)
+            else:
+                for bc in self.tlm_bcs:
+                    bc.set(self._b.array_w, alpha=1.0)
+
         self._b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)  # type: ignore
         # Solve linear system and update ghost values in the solution
         self._solver.solve(self._b, self._x)
