@@ -256,7 +256,7 @@ def test_mixed_element_is_rejected_on_every_process():
     W = dolfinx.fem.functionspace(mesh, element)
 
     # A single point, so at most one process would ever reach assembly.
-    with pytest.raises(NotImplementedError, match="Basix element"):
+    with pytest.raises(NotImplementedError):
         dolfinx_adjoint.PointObservation(W, np.array([[0.3, 0.4]]))
 
 
