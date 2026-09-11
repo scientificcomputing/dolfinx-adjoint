@@ -33,16 +33,16 @@ _PROBLEM_PREFIX_COUNTER = itertools.count()
 
 
 @typing.overload
-def find_or_create_then_overload(u: _Function | None, L: ufl.Form) -> _Function: ...
+def find_or_create_then_overload(u: _Function | None, L: ufl.BaseForm) -> _Function: ...
 @typing.overload
 def find_or_create_then_overload(
-    u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]
+    u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.BaseForm]
 ) -> typing.Sequence[_Function]: ...
 
 
 def find_or_create_then_overload(
     u: MaybeBlocked[_Function] | None,
-    L: MaybeBlocked[ufl.Form],
+    L: MaybeBlocked[ufl.BaseForm],
 ) -> MaybeBlocked[_Function]:
     """Find or create, then overload the unknown
     {py:class}`~dolfinx_adjoint.Function` ``u`` for a `*Problem`.
@@ -69,7 +69,7 @@ def find_or_create_then_overload(
         try:
             # Extract function space for unknown from the right hand
             # side of the equation.
-            assert isinstance(L, ufl.Form)
+            assert isinstance(L, ufl.BaseForm)
             return Function(L.arguments()[0].ufl_function_space())
         except AttributeError:
             assert isinstance(L, typing.Iterable)
@@ -837,7 +837,7 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
     def __init__(
         self,
         a: ufl.Form,
-        L: ufl.Form,
+        L: ufl.BaseForm,
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
         u: _Function | None = None,
@@ -856,7 +856,7 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
     def __init__(
         self,
         a: typing.Sequence[typing.Sequence[ufl.Form]],
-        L: typing.Sequence[ufl.Form],
+        L: typing.Sequence[ufl.BaseForm],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
         u: typing.Sequence[_Function] | None = None,
@@ -874,7 +874,7 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
     def __init__(
         self,
         a: MaybeBlockedMatrix[ufl.Form],
-        L: MaybeBlocked[ufl.Form],
+        L: MaybeBlocked[ufl.BaseForm],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
         u: MaybeBlocked[_Function] | None = None,
