@@ -44,6 +44,13 @@ def _interior_bump_values(x: np.ndarray) -> np.ndarray:
     return np.vstack((bump, bump))
 
 
+def _interior_bump(S: dolfinx.fem.FunctionSpace) -> dxa.Function:
+    """A displacement vanishing on the whole boundary, as a dxa Function."""
+    bump = dxa.Function(S)
+    bump.interpolate(_interior_bump_values)
+    return bump
+
+
 def _dilation(S: dolfinx.fem.FunctionSpace) -> dxa.Function:
     """A displacement direction that is a genuine shape change, and admissible at every step.
 
@@ -354,32 +361,113 @@ def test_shape_hessian_of_a_functional():
     _assert_mesh_is_valid(mesh, reference)
 
 
-def test_shape_hessian_through_a_solve_is_refused():
-    """A shape Hessian across a PDE solve must fail loudly, not return a wrong number.
+def test_shape_hessian_through_a_linear_problem(assert_hessian_matches_finite_difference):
+    """A second shape derivative across a PDE solve.
 
-    The tangent-linear right-hand side is built from templates compiled per residual
-    coefficient, and a mesh is not one, so its direction would be dropped silently.
+    Needs the whole second-order chain to carry a shape term: ``dF/dX[dX]`` in the
+    tangent-linear right-hand side, the mixed ``d2F/dudX`` and pure ``d2F/dX2`` contributions
+    to the second-order-adjoint right-hand side, and the Hessian-action output on the geometry
+    space. The mesh is registered as an ordinary differentiation target alongside the
+    residual's coefficients (``_ProblemBase._differentiation_targets``), differentiating
+    against ``ufl.SpatialCoordinate`` where a coefficient differentiates against its
+    placeholder, so all of that reuses the coefficient machinery.
     """
-    mesh, S, s, _ = _shape_setup(4)
+    mesh, S, s, reference = _shape_setup()
     V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
     u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
     X = ufl.SpatialCoordinate(mesh)
     problem = dxa.LinearProblem(
         ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
-        ufl.inner(ufl.sin(ufl.pi * X[0]), v) * ufl.dx,
+        ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
-        petsc_options_prefix="test_shape_hessian_refused_",
+        petsc_options_prefix="test_shape_hessian_linear_",
     )
     uh = problem.solve()
-    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
-    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
 
-    Jhat(s)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    assert_hessian_matches_finite_difference(Jhat, s, _interior_bump(S))
+    _assert_mesh_is_valid(mesh, reference)
+
+
+def test_shape_hessian_through_a_nonlinear_problem(assert_hessian_matches_finite_difference):
+    """The same, where ``dF/du`` genuinely depends on the state.
+
+    ``d2F/du2`` is structurally zero for a linear residual, so the linear test above never
+    exercises the ``soa_self`` term against a shape direction. A ``1 + u**2`` diffusivity --
+    strictly positive for every ``u``, so the problem stays coercive along the whole
+    perturbation -- does.
+    """
+    mesh, S, s, reference = _shape_setup()
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    uh = dxa.Function(V)
+    v = ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    F = (
+        ufl.inner((1 + uh**2) * ufl.grad(uh), ufl.grad(v)) * ufl.dx
+        - ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx
+    )
+    problem = dxa.NonlinearProblem(
+        F,
+        u=uh,
+        bcs=[_homogeneous_bc(V)],
+        petsc_options=_SNES,
+        petsc_options_prefix="test_shape_hessian_nonlinear_",
+    )
+    problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
+
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    assert_hessian_matches_finite_difference(Jhat, s, _interior_bump(S))
+    _assert_mesh_is_valid(mesh, reference)
+
+
+def test_shape_and_coefficient_hessian_together():
+    """A shape control and a coefficient control on one tape, to second order.
+
+    Exercises the ``cross`` templates in both directions -- the shape term differentiated
+    along the coefficient's tangent-linear direction and the coefficient term differentiated
+    along the shape's -- which a single-control test cannot reach.
+    """
+    mesh, S, s, reference = _shape_setup()
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    Q = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    m = dxa.Function(Q)
+    m.x.array[:] = 1.0
+
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(m * ufl.sin(ufl.pi * X[0]), v) * ufl.dx,
+        bcs=[_homogeneous_bc(V)],
+        petsc_options=_LU,
+        petsc_options_prefix="test_shape_hessian_joint_",
+    )
+    uh = problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
+
+    Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(s), pyadjoint.Control(m)])
+    hm = dxa.Function(Q)
+    hm.x.array[:] = 0.5
+    controls, directions = [s, m], [_interior_bump(S), hm]
+
+    # The conftest Hessian checker takes a single control, so the same central-difference
+    # check is done over the pair here: the directional second derivative is the sum over
+    # controls of <H_i[h], h_i>, and the gradient likewise.
+    def directional_gradient(scale: float) -> float:
+        Jhat([c._ad_add(d._ad_mul(scale)) for c, d in zip(controls, directions)])
+        return sum(g._ad_dot(d) for g, d in zip(Jhat.derivative(), directions))
+
+    Jhat(controls)
     Jhat.derivative()
-    with pytest.raises(NotImplementedError, match="not supported yet"):
-        Jhat.hessian(h)
+    Hh = sum(Hi._ad_dot(d) for Hi, d in zip(Jhat.hessian(directions), directions))
+    fd_eps = 1e-3
+    fd = (directional_gradient(fd_eps) - directional_gradient(-fd_eps)) / (2 * fd_eps)
+    Jhat(controls)
+    assert np.isclose(Hh, fd, rtol=1e-2, atol=1e-2), f"hessian {Hh} vs finite difference {fd}"
+    _assert_mesh_is_valid(mesh, reference)
 
 
 def test_gradient_is_correct_when_the_mesh_is_moved_twice():

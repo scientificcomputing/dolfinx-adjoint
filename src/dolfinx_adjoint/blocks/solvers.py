@@ -408,28 +408,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         vec.array[:] *= -1.0
         return vec
 
-    def _reject_higher_order_shape_derivative(self) -> None:
-        """Refuse a tangent-linear or Hessian evaluation that would need a shape term.
-
-        The tangent-linear right-hand side is assembled from templates compiled once per
-        *coefficient* of the residual, and a mesh is not one, so a mesh direction is
-        skipped by the loop that builds it -- yielding not an error but a quietly wrong
-        tangent-linear solution, and a quietly wrong Hessian on top of it. Failing here
-        keeps that from happening. The first-order adjoint, which takes its own route
-        through
-        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._shape_sensitivity`,
-        is unaffected.
-        """
-        for block_variable in self.get_dependencies():
-            if isinstance(block_variable.output, Mesh) and block_variable.tlm_value is not None:
-                raise NotImplementedError(
-                    "Tangent-linear and Hessian evaluations through a moved mesh are not "
-                    "supported yet; only the first-order shape derivative "
-                    "(ReducedFunctional.derivative) is. The tangent-linear model with "
-                    "respect to a shape control needs dF/dX in its right-hand side, which "
-                    "is not assembled."
-                )
-
     def _refresh_dFdu_state(self, problem: "LinearProblem | NonlinearProblem") -> None:
         """Refresh whichever coefficient stands in for "the state" in ``dF/du``, if any.
 
@@ -499,7 +477,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             already solved for. Passed through unchanged as ``prepared`` to every
             subsequent {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_tlm_component` call.
         """
-        self._reject_higher_order_shape_derivative()
         problem = self.get_reference_problem()
         tlm_solver = problem._get_or_build_tlm_solver()
         tlm_solver.bcs = self._bcs
@@ -935,7 +912,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         # block's own bcs on every call, since another block may have used
         # the same solver in between -- but never rebuild or recompile the
         # LHS itself.
-        self._reject_higher_order_shape_derivative()
         problem = self.get_reference_problem()
         adjoint_solver = problem._get_or_build_adjoint_solver()
         adjoint_solver.bcs = self._bcs
@@ -987,8 +963,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 if tlm_input is None:
                     continue
                 c = block_variable.output
-                if isinstance(c, dolfinx.mesh.Mesh):
-                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
                 if isinstance(c, dolfinx.fem.DirichletBC):
                     # A bc's SOA-rhs contribution is handled entirely via the boundary
                     # reaction computed after adjoint_solver.solve() below (d2F/dm2 =
@@ -1022,8 +996,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 if tlm_input is None:
                     continue
                 c = block_variable.output
-                if isinstance(c, dolfinx.mesh.Mesh):
-                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
                 if isinstance(c, dolfinx.fem.DirichletBC):
                     # A bc's SOA-rhs contribution is handled entirely via the boundary
                     # reaction computed after adjoint_solver.solve() below (d2F/dm2 =
@@ -1145,10 +1117,11 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             raise NotImplementedError("Hessian computation for Constant control not implemented yet.")
             # mesh = extract_mesh_from_form(F_form)
             # W = c._ad_function_space(mesh)
-        elif isinstance(c, dolfinx.mesh.Mesh):
-            raise NotImplementedError("Hessian computation for Mesh control not implemented yet.")
-            # X = dolfin.SpatialCoordinate(c)
-            # W = c._ad_function_space()
+        elif isinstance(c, Mesh):
+            # The shape terms differentiate w.r.t. ufl.SpatialCoordinate(c) rather than a
+            # placeholder Function (see _ProblemBase._differentiation_targets), so their
+            # one-forms test against the geometry space.
+            W = c._ad_function_space()
         else:
             assert isinstance(c, dolfinx.fem.Function)
             W = c.function_space
