@@ -289,7 +289,13 @@ def _moved_off_taped_values(V, controls):
     return moved
 
 
-@_needs_pyadjoint_control_checkpoint_fix
+@pytest.mark.parametrize(
+    "kind",
+    # Only the in-memory case ever hit the pyadjoint defect; the disk case passed
+    # throughout, so it stays an unconditional assertion rather than being swept under
+    # the same marker.
+    [pytest.param("revolve", marks=_needs_pyadjoint_control_checkpoint_fix), "disk"],
+)
 def test_bc_control_gradient_matches_uncheckpointed(V, kind):
     """A schedule does not change the gradient w.r.t. a Dirichlet bc *value* control."""
     n_steps = 6
@@ -303,7 +309,10 @@ def test_bc_control_gradient_matches_uncheckpointed(V, kind):
     if kind == "disk":
         dolfinx_adjoint.checkpointing.disable_disk_checkpointing()
 
-        
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
+
+
 @_needs_pyadjoint_control_checkpoint_fix
 @pytest.mark.parametrize("n_steps, snapshots", [(6, 2)])
 def test_gradient_at_a_new_control_value_matches_uncheckpointed(V, n_steps, snapshots):
