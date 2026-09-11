@@ -2,8 +2,15 @@
 # *Section author: Jørgen S. Dokken ([dokken@simula.no](mailto:dokken@simula.no))*.
 #
 # Converted from the [dolfin-adjoint demo of the same
-# name](https://github.com/dolfin-adjoint/dolfin-adjoint/tree/main/examples/stokes-shape-opt),
+# name](https://dolfin-adjoint.github.io/dolfin-adjoint/documentation/stokes-shape-opt/stokes_problem.html)
+# ([source](https://github.com/dolfin-adjoint/dolfin-adjoint/tree/main/examples/stokes-shape-opt)),
 # with the mesh generation folded in rather than kept in a separate script.
+#
+# The shape-derivative machinery that demo is built on was introduced for legacy dolfin-adjoint
+# in {cite}`dokken2020shape`. That paper derives both first- and second-order shape
+# derivatives; dolfinx-adjoint currently implements the first-order adjoint through a PDE
+# solve and refuses the second-order one rather than returning a wrong number, so the
+# Taylor test below checks the gradient only.
 
 # This is the classical shape optimization problem of minimizing the drag on an obstacle in
 # Stokes flow, first analyzed by Pironneau {cite}`pironneau1974optimum`, who found the
