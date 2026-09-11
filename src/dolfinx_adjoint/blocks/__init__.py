@@ -2,6 +2,7 @@ from .assembly import AssembleBlock
 from .dirichletbc import DirichletBCBlock
 from .function_assigner import FunctionAssignBlock
 from .interpolation import ExprInterpolationBlock, InterpolationBlock
+from .mesh import MoveBlock
 from .nonmatching_interpolation import NonmatchingInterpolationBlock
 from .solvers import LinearProblemBlock, NonlinearProblemBlock
 
@@ -12,6 +13,7 @@ __all__ = [
     "FunctionAssignBlock",
     "InterpolationBlock",
     "LinearProblemBlock",
+    "MoveBlock",
     "NonlinearProblemBlock",
     "NonmatchingInterpolationBlock",
 ]

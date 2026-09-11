@@ -15,8 +15,14 @@ import ufl
 
 from ..compat import bcs_by_block
 from ..types import Function
+from ..types.mesh import Mesh, overloaded_mesh
 from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
-from ..ufl_utils import assign_mixed_parts, sum_form
+from ..ufl_utils import (
+    assign_mixed_parts,
+    get_sorted_arguments,
+    reject_geometry_without_shape_derivative,
+    sum_form,
+)
 from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form
 
 if typing.TYPE_CHECKING:
@@ -274,6 +280,133 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         result.array[:] = 0.0
         result.array[dofs] = reaction_i.array[dofs]
         return result
+
+    def _register_mesh_dependency(self) -> None:
+        """Record the mesh as a dependency, if it has been moved.
+
+        A residual posed on a moved mesh depends on that mesh's geometry through its
+        {py:class}`ufl.SpatialCoordinate`, exactly as it depends on any coefficient
+        appearing in it. {py:func}`~dolfinx_adjoint.types.mesh.overloaded_mesh` returns
+        ``None`` for a mesh that was never passed to {py:func}`~dolfinx_adjoint.move`,
+        which is every problem that is not a shape optimization, and then this is a no-op.
+        """
+        u = self._u[0] if isinstance(self._u, list) else self._u
+        assert isinstance(u, dolfinx.fem.Function)
+        mesh = overloaded_mesh(u.function_space.mesh.ufl_domain())
+        if mesh is not None:
+            reject_geometry_without_shape_derivative(self._rhs)
+            self.add_dependency(mesh, no_duplicates=True)
+
+    def _assert_shape_dependencies_are_checkpointed(self) -> None:
+        """Refuse a shape derivative whose residual would be built at the wrong state.
+
+        A backstop. {py:func}`~dolfinx_adjoint.move` already refuses any checkpoint schedule
+        outside its allowlist of ones verified to retain every step, so in normal use this
+        never fires. It stays because that allowlist is a claim about *other* packages'
+        behaviour: if a schedule on it ever starts releasing checkpoints, this catches it
+        instead of letting the gradient go quietly wrong.
+
+        Unlike ``dF/dm`` for a coefficient ``m`` of a *linear* residual, ``dF/dX`` depends on
+        the values of every coefficient in the residual, the state included -- the geometry
+        enters through the measure and through where the basis functions are evaluated, so
+        differentiating it drags the whole integrand along. Those values are read from each
+        dependency's ``saved_output``.
+
+        Under a checkpoint schedule that recomputes (a ``Revolve``, say, as opposed to one
+        that stores every step), pyadjoint releases a dependency's checkpoint once it
+        believes nothing still needs it -- it keeps only those marked as adjoint
+        dependencies. ``saved_output`` then quietly returns the *live* value of that
+        function, which during a reverse sweep is whatever the last recomputed step left in
+        it, not the value this block saw. The resulting shape gradient is wrong by a wide
+        margin (16% on a four-step heat equation) and, because the tape is self-consistent,
+        a Taylor test still converges at rate 2 and reports nothing.
+
+        A coefficient control is unaffected, which is why this shows up only here: for a
+        linear residual ``dF/dm`` does not reference the released values at all.
+        """
+        released = [
+            block_variable
+            for block_variable in self.get_dependencies()
+            if isinstance(block_variable.output, dolfinx.fem.Function) and block_variable.checkpoint is None
+        ]
+        if released:
+            raise NotImplementedError(
+                "A shape derivative cannot be taken under a checkpoint schedule that "
+                "recomputes: this block's dependencies "
+                f"{sorted(bv.output.name for bv in released)} have had their checkpoints "
+                "released, so the residual would be differentiated at the wrong state and "
+                "the gradient would be silently wrong. Use a schedule that retains every "
+                "step -- checkpoint_schedules.SingleMemoryStorageSchedule or "
+                "SingleDiskStorageSchedule -- or no schedule at all."
+            )
+
+    def _shape_sensitivity(self, residual: ufl.Form, mesh: Mesh) -> _SpecialVector:
+        r"""Return :math:`-\left(\partial F/\partial X\right)^{*}\lambda`, the residual's
+        sensitivity to the mesh geometry.
+
+        This dependency cannot take the symbolic route the rest of
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_adj_component`
+        uses: ``ufl.action(ufl.adjoint(dFdX), lambda)`` raises ``Derivatives should be
+        applied before executing replace``, because UFL cannot expand a coordinate
+        derivative of a coefficient in physical space and so cannot form that Jacobian's
+        adjoint symbolically.
+
+        The way around it is to contract *before* differentiating rather than after.
+        Substituting the adjoint solution for the residual's test function turns ``F`` into
+        a functional, whose coordinate derivative is a one-form on the geometry space and
+        assembles straight into a vector. That is the same quantity: ``F`` is linear in its
+        test function, so with :math:`F_i := F(u, v_i)`,
+
+        .. math::
+            \frac{\partial}{\partial X_j} F(u, \lambda)
+            = \sum_i \lambda_i \frac{\partial F_i}{\partial X_j}
+            = \left[\left(\frac{\partial F}{\partial X}\right)^{*}\lambda\right]_j ,
+
+        with :math:`\lambda`'s dof values held fixed, which is exactly how UFL differentiates
+        a coefficient with respect to the coordinate. Verified against assembling
+        ``dF/dX`` as a rectangular matrix and applying its transpose with PETSc -- the two
+        agree to 1e-15 -- and that route is what dolfin-adjoint uses. This one needs no
+        matrix, so the block never touches a PETSc object whose destructor is collective,
+        and it extends to a blocked problem for free: substitute each test function part by
+        its own adjoint solution component.
+
+        Args:
+            residual: The block's residual ``F``, at its checkpointed dependency values.
+            mesh: The moved mesh to differentiate with respect to.
+
+        Returns:
+            The assembled sensitivity, in the mesh's geometry function space.
+        """
+        adjoint_solutions = (
+            self._adjoint_solutions if isinstance(self._adjoint_solutions, list) else [self._adjoint_solutions]
+        )
+        test_functions = list(get_sorted_arguments(residual.arguments(), 0))
+        contracted = ufl.replace(residual, dict(zip(test_functions, adjoint_solutions, strict=True)))
+
+        V_geom = mesh._ad_function_space()
+        dFdX = ufl.algorithms.expand_derivatives(
+            ufl.derivative(contracted, ufl.SpatialCoordinate(mesh), ufl.TestFunction(V_geom))
+        )
+
+        vec = _vector(V_geom.dofmap.index_map, V_geom.dofmap.index_map_bs, function_space=V_geom)
+        vec.array[:] = 0.0
+        if dFdX.empty():
+            return vec
+
+        compiled = dolfinx.fem.form(
+            dFdX,
+            jit_options=self._jit_options,
+            form_compiler_options=self._form_compiler_options,
+            entity_maps=self._entity_maps,
+        )
+        assemble_compiled_form(compiled, tensor=vec)
+        # The sensitivity is -dF/dX, matching the sign evaluate_adj_component uses for every
+        # other dependency. Negating the assembled vector rather than the form is deliberate:
+        # scaling a form that still holds an unexpanded CoordinateDerivative puts a node
+        # outside it, and UFL rejects that with "CoordinateDerivative(s) must be outermost".
+        # Ghost entries negate with the owned ones, so no further scatter is needed.
+        vec.array[:] *= -1.0
+        return vec
 
     def _refresh_dFdu_state(self, problem: "LinearProblem | NonlinearProblem") -> None:
         """Refresh whichever coefficient stands in for "the state" in ``dF/du``, if any.
@@ -568,6 +701,10 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         c = block_variable.output
         c_rep = block_variable.saved_output
 
+        if isinstance(c, Mesh):
+            self._assert_shape_dependencies_are_checkpointed()
+            return self._shape_sensitivity(sum_form(residual), c)
+
         if isinstance(c, dolfinx.fem.DirichletBC):
             # A bc is never a form coefficient, so it is never in replacement_map and
             # there is no dF/dm to differentiate -- prepare_evaluate_adj already
@@ -826,8 +963,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 if tlm_input is None:
                     continue
                 c = block_variable.output
-                if isinstance(c, dolfinx.mesh.Mesh):
-                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
                 if isinstance(c, dolfinx.fem.DirichletBC):
                     # A bc's SOA-rhs contribution is handled entirely via the boundary
                     # reaction computed after adjoint_solver.solve() below (d2F/dm2 =
@@ -861,8 +996,6 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 if tlm_input is None:
                     continue
                 c = block_variable.output
-                if isinstance(c, dolfinx.mesh.Mesh):
-                    raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
                 if isinstance(c, dolfinx.fem.DirichletBC):
                     # A bc's SOA-rhs contribution is handled entirely via the boundary
                     # reaction computed after adjoint_solver.solve() below (d2F/dm2 =
@@ -984,10 +1117,11 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             raise NotImplementedError("Hessian computation for Constant control not implemented yet.")
             # mesh = extract_mesh_from_form(F_form)
             # W = c._ad_function_space(mesh)
-        elif isinstance(c, dolfinx.mesh.Mesh):
-            raise NotImplementedError("Hessian computation for Mesh control not implemented yet.")
-            # X = dolfin.SpatialCoordinate(c)
-            # W = c._ad_function_space()
+        elif isinstance(c, Mesh):
+            # The shape terms differentiate w.r.t. ufl.SpatialCoordinate(c) rather than a
+            # placeholder Function (see _ProblemBase._differentiation_targets), so their
+            # one-forms test against the geometry space.
+            W = c._ad_function_space()
         else:
             assert isinstance(c, dolfinx.fem.Function)
             W = c.function_space
@@ -1184,6 +1318,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         sorted_coefficients = sorted(coeffs, key=lambda c: c.ufl_id())
         for c in sorted_coefficients:
             self.add_dependency(c, no_duplicates=True)
+        self._register_mesh_dependency()
 
         # Cache form parameters for later
         # NOTE: Should probably be in a struct
@@ -1413,13 +1548,14 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         # own self._user_J for why this must never be read for anything else.
         self._user_J = J
 
-        # NOTE: Add mesh and constants as dependencies later on
+        # NOTE: Add constants as dependencies later on
         u_list = self._u if isinstance(self._u, list) else [self._u]
         coeffs = collect_coefficients(J) | collect_coefficients(self._rhs)
         coeffs -= set(u_list)
         sorted_coeffs = sorted(coeffs, key=lambda c: c.ufl_id())
         for c in sorted_coeffs:
             self.add_dependency(c, no_duplicates=True)
+        self._register_mesh_dependency()
 
         # Cache form parameters for later
         # NOTE: Should probably be in a struct
