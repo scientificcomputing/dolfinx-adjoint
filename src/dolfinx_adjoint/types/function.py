@@ -29,6 +29,7 @@ def _create_function(
 
     Args:
         V: A function space.
+        dtype: The scalar type of the underlying data.
 
     Returns:
         A function that is compatible with the function space.
@@ -124,6 +125,8 @@ class Function(dolfinx.fem.Function, FloatingType):
 
         Args:
             other: Function to compute the inner product with.
+            options: Optional dict; ``"riesz_representation"`` selects the inner product
+                (only ``"l2"`` is currently implemented).
         """
         options = {} if options is None else options
         riesz_representation = options.get("riesz_representation", "l2")
@@ -303,7 +306,7 @@ class Constant(Function):
             try:
                 import scifem
             except ImportError as e:
-                raise ImportError("scifem is required to use Constant 'pip install scifem") from e
+                raise ImportError("scifem is required to use Constant: pip install scifem") from e
 
             V = scifem.create_real_functionspace(domain, value_shape=value_shape)
         super().__init__(V, name=name)

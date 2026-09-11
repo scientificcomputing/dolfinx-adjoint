@@ -14,7 +14,7 @@ readme = "README.md"
 # all -- declaring a lower floor would not widen support, only move the failure.
 requires-python = ">=3.12"
 dependencies = [
-      "fenics-dolfinx>=0.10.0",
+      "fenics-dolfinx>=0.11.0",
       "pyadjoint-ad>=2025.10.0",
       "packaging>=24.2",
       # Storage for checkpoint schedules that keep state on disk. Build it against MPI to get
@@ -31,7 +31,11 @@ dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",
       "jupytext",
-      # "moola@git+https://github.com/funsim/moola.git",
+      # moola (needed by three of the six demos) is deliberately not listed here: PyPI
+      # rejects packages that declare a direct git-URL dependency. Install it manually
+      # first (see README.md's Development Install section, and .github/workflows/build_docs.yml).
+
+      "gmsh",
       "pandas",
       "pyvista[all]>0.45",
       "networkx",
@@ -109,3 +113,8 @@ current_version = "0.3.0"
 filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "CITATION.cff"
+search = 'version: v{current_version}'
+replace = 'version: v{new_version}'

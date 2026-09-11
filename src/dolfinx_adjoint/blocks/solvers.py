@@ -13,16 +13,17 @@ import numpy as np
 import pyadjoint
 import ufl
 
+from ..compat import bcs_by_block
 from ..types import Function
-from ..typing_utils import NestedSequence
+from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
 from ..ufl_utils import assign_mixed_parts, sum_form
-from .assembly import _create_vector, _SpecialVector, assemble_compiled_form
+from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form
 
 if typing.TYPE_CHECKING:
     from ..solvers import LinearProblem, NonlinearProblem
 
 
-def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[Function]:
+def collect_coefficients(form: ufl.BaseForm | typing.Sequence | None) -> set[Function]:
     """Return the set of UFL coefficients appearing anywhere in ``form``.
 
     ``form`` may be a single form or an arbitrarily nested sequence of forms
@@ -34,7 +35,7 @@ def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[Functio
     """
     if form is None:
         return set()
-    if isinstance(form, ufl.Form):
+    if isinstance(form, ufl.BaseForm):
         return set(form.coefficients())
     coefficients: set = set()
     for f in form:
@@ -95,13 +96,15 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
     _problem_ref: weakref.ReferenceType["LinearProblem | NonlinearProblem"]
     _rebuilt_problem: "LinearProblem | NonlinearProblem | None" = None
     _bcs: typing.Sequence[dolfinx.fem.DirichletBC]
-    _u: Function | typing.Sequence[Function]
-    _adjoint_solutions: Function | typing.Sequence[Function]
-    _second_adjoint_solutions: Function | typing.Sequence[Function]
-    _tlm_solutions: Function | typing.Sequence[Function]
+    _u: MaybeBlocked[Function]
+    _adjoint_solutions: MaybeBlocked[Function]
+    _second_adjoint_solutions: MaybeBlocked[Function]
+    _tlm_solutions: MaybeBlocked[Function]
     _jit_options: dict | None
     _form_compiler_options: dict | None
     _entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None
+    _adj_sol_bdy: MaybeBlocked[_SpecialVector] | None = None
+    _adj_sol2_bdy: MaybeBlocked[_SpecialVector] | None = None
 
     def get_reference_problem(self) -> "LinearProblem | NonlinearProblem":
         """Return this block's owning Problem, which owns the shared solvers.
@@ -159,6 +162,119 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             residual, and the dependency-to-checkpoint replacement map used to build it.
         """
 
+    def _should_compute_boundary_adjoint(
+        self, dependencies: typing.Iterable[pyadjoint.block_variable.BlockVariable]
+    ) -> bool:
+        """Whether any of ``dependencies`` is a Dirichlet BC -- i.e. whether the boundary-
+        control reaction term (see
+        {py:meth}`*Problem._get_or_build_adjoint_reaction_template<dolfinx_adjoint.solvers._ProblemBase._get_or_build_adjoint_reaction_template>`)
+        is worth computing this call. A bc dependency is never a form coefficient, so it
+        cannot flow through the ordinary ``dF/dm`` sensitivity path
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_adj_component`
+        otherwise uses.
+        """
+        return any(isinstance(dep.output, dolfinx.fem.DirichletBC) for dep in dependencies)
+
+    def _snapshot_rhs(self, rhs_vec: PETSc.Vec) -> MaybeBlocked[np.ndarray]:  # type: ignore[name-defined]
+        """Take a local, per-output-block numpy snapshot of ``rhs_vec``'s current values.
+
+        Robust to whether the shared solver's PETSc layout is ``nest`` or monolithic:
+        {py:func}`dolfinx.la.petsc.assign` dispatches on argument type, and its
+        ``(PETSc.Vec, array(s))`` overload is exactly the inverse of the
+        ``(array(s), PETSc.Vec)`` overload this same code already uses to *build*
+        ``rhs_vec`` in {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_adj`/
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.prepare_evaluate_hessian` --
+        reused here in reverse rather than assuming a flat/monolithic layout.
+        """
+        # mypy infers ui: MaybeBlocked[Function] here despite the isinstance
+        # narrowing above (the same narrowing pattern used, unannotated, throughout this
+        # module) -- an apparent quirk of this base class's attribute-type inference;
+        # narrow explicitly rather than chase it further.
+        u_list = self._u if isinstance(self._u, list) else [self._u]
+        arrs = [
+            np.zeros(
+                ui.function_space.dofmap.index_map.size_local * ui.function_space.dofmap.index_map_bs,  # type: ignore[union-attr]
+                dtype=dolfinx.default_scalar_type,
+            )
+            for ui in u_list
+        ]
+        dolfinx.la.petsc.assign(rhs_vec, arrs)  # type: ignore[arg-type]
+        return arrs if isinstance(self._u, list) else arrs[0]
+
+    def _compute_boundary_reaction(
+        self,
+        rhs_snapshot: MaybeBlocked[np.ndarray],
+        reaction_template: MaybeBlocked[dolfinx.fem.Form],
+    ) -> MaybeBlocked[_SpecialVector]:
+        r"""Compute ``adj_sol_bdy = rhs_snapshot - action(adjoint(dF/du), adjoint_solution)``,
+        per output block, given a pre-homogenization snapshot of the adjoint/SOA equation's
+        right-hand side (``rhs_snapshot``, from
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._snapshot_rhs`) and the
+        compiled ``reaction_template`` (from
+        {py:meth}`*Problem._get_or_build_adjoint_reaction_template<dolfinx_adjoint.solvers._ProblemBase._get_or_build_adjoint_reaction_template>`).
+
+        This is ~0 on interior dofs (where the homogeneous adjoint/SOA equation holds) and
+        equals the sensitivity of J w.r.t. a Dirichlet bc's value on that bc's own
+        constrained dofs -- see
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase._mask_reaction_to_bc`
+        for how a specific bc's contribution is extracted from this.
+        """
+
+        def _one(ui: Function, snap: np.ndarray, template: dolfinx.fem.Form) -> _SpecialVector:
+            reaction = _create_vector(template, ui.function_space)
+            reaction.array[:] = 0.0
+            assemble_compiled_form(template, reaction)
+            local_size = ui.function_space.dofmap.index_map.size_local * ui.function_space.dofmap.index_map_bs
+            out = _vector(
+                ui.function_space.dofmap.index_map,
+                ui.function_space.dofmap.index_map_bs,
+                ui.function_space,
+                dtype=reaction.array.dtype,
+            )
+            out.array[:local_size] = snap - reaction.array[:local_size]
+            out.scatter_forward()
+            return out
+
+        if isinstance(self._u, list):
+            assert isinstance(rhs_snapshot, typing.Sequence) and isinstance(reaction_template, typing.Sequence)
+            return [
+                _one(ui, snap, template)
+                for ui, snap, template in zip(self._u, rhs_snapshot, reaction_template, strict=True)
+            ]
+        else:
+            assert isinstance(rhs_snapshot, np.ndarray)
+            return _one(self._u, rhs_snapshot, reaction_template)  # type: ignore[arg-type]
+
+    def _mask_reaction_to_bc(
+        self,
+        bc: dolfinx.fem.DirichletBC,
+        reaction: MaybeBlocked[_SpecialVector],
+    ) -> _SpecialVector:
+        """Mask a (possibly per-block) boundary reaction vector onto ``bc``'s own
+        constrained dofs, zero elsewhere, returned on ``bc.function_space``.
+
+        Both owned and ghost dofs are copied (`dolfinx.fem.DirichletBC.dof_indices()`
+        returns both, unrolled): ``reaction``'s ghost entries are already correctly
+        populated (its own construction ends in ``scatter_forward()``), so this stays a
+        purely local operation with no further communication needed.
+        """
+        if isinstance(self._u, list):
+            assert isinstance(reaction, typing.Sequence)
+            reaction_i = reaction[self._bc_block_index[bc]]
+        else:
+            reaction_i = reaction
+        assert isinstance(reaction_i, _SpecialVector)
+        dofs, _ = bc.dof_indices()
+        result = _vector(
+            bc.function_space.dofmap.index_map,
+            bc.function_space.dofmap.index_map_bs,
+            bc.function_space,
+            dtype=reaction_i.array.dtype,
+        )
+        result.array[:] = 0.0
+        result.array[dofs] = reaction_i.array[dofs]
+        return result
+
     def _refresh_dFdu_state(self, problem: "LinearProblem | NonlinearProblem") -> None:
         """Refresh whichever coefficient stands in for "the state" in ``dF/du``, if any.
 
@@ -195,7 +311,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         replace_map.update(_map_block_variables_to_form(form, self.get_outputs()))
         return replace_map
 
-    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> NestedSequence[Function]:
+    def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs) -> MaybeBlocked[Function]:
         """Assemble and solve the tangent-linear (TLM) system for this block.
 
         The TLM solver -- and the compiled LHS it solves with, shared verbatim with
@@ -231,6 +347,16 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         problem = self.get_reference_problem()
         tlm_solver = problem._get_or_build_tlm_solver()
         tlm_solver.bcs = self._bcs
+        # A perturbed bc enters as an inhomogeneous condition on the TLM solve (see
+        # HomogeneousBCLinearProblem.tlm_bcs/solve()), not as an ordinary RHS term -- only
+        # tracked bcs with an actual tangent-linear value this call contribute one; an
+        # untracked bc, or a tracked one with no perturbation this call, correctly keeps
+        # u_dot=0 there via the solver's own unconditional alpha=0.0 pass.
+        tlm_solver.tlm_bcs = [
+            perturbed_bc
+            for bc in self._bcs
+            if hasattr(bc, "block_variable") and (perturbed_bc := bc.block_variable.tlm_value) is not None
+        ]
         templates, seed_placeholders, state_placeholder = problem._get_or_build_tlm_rhs_templates()
 
         for block_variable in self.get_dependencies():
@@ -372,6 +498,15 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             dolfinx.la.petsc.assign(arrs, dJdu)
             dJdu.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)  # type: ignore[arg-type]
 
+        # A Dirichlet bc is never a form coefficient, so its sensitivity can't flow
+        # through evaluate_adj_component's ordinary dF/dm path below -- snapshot the
+        # adjoint right-hand side now, before HomogeneousBCLinearProblem.solve() zeros
+        # every bc dof, so that dJdu - action(adjoint(dF/du), adj_sol) (computed after
+        # the solve, once adj_sol is known) is available as this bc's reaction. See
+        # *Problem._get_or_build_adjoint_reaction_template for the full recipe.
+        compute_bdy = self._should_compute_boundary_adjoint(self.get_dependencies())
+        dJdu_snapshot = self._snapshot_rhs(dJdu) if compute_bdy else None
+
         adjoint_solver.solve()
         if isinstance(self._adjoint_solutions, list):
             for adj_sol, sol in zip(self._adjoint_solutions, adjoint_solver.u):
@@ -379,6 +514,21 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         else:
             assert isinstance(self._adjoint_solutions, dolfinx.fem.Function)
             self._adjoint_solutions.x.array[:] = adjoint_solver.u.x.array[:]
+
+        if compute_bdy:
+            problem._ensure_hessian_placeholders()
+            adj_sol_placeholder = problem.adjoint_solution_placeholder
+            placeholder_list = adj_sol_placeholder if isinstance(adj_sol_placeholder, list) else [adj_sol_placeholder]
+            adj_sol_list = (
+                self._adjoint_solutions if isinstance(self._adjoint_solutions, list) else [self._adjoint_solutions]
+            )
+            for placeholder, sol in zip(placeholder_list, adj_sol_list, strict=True):
+                placeholder.x.array[:] = sol.x.array[:]
+                placeholder.x.scatter_forward()
+            reaction_template = problem._get_or_build_adjoint_reaction_template()
+            self._adj_sol_bdy = self._compute_boundary_reaction(dJdu_snapshot, reaction_template)  # type: ignore[arg-type]
+        else:
+            self._adj_sol_bdy = None
 
         # F_form/replacement_map are still needed by evaluate_adj_component
         # (to build each dependency's own sensitivity form), but the adjoint
@@ -417,6 +567,14 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         residual, replacement_map = prepared
         c = block_variable.output
         c_rep = block_variable.saved_output
+
+        if isinstance(c, dolfinx.fem.DirichletBC):
+            # A bc is never a form coefficient, so it is never in replacement_map and
+            # there is no dF/dm to differentiate -- prepare_evaluate_adj already
+            # computed the boundary reaction this bc's contribution is masked from.
+            assert self._adj_sol_bdy is not None
+            return self._mask_reaction_to_bc(c, self._adj_sol_bdy)
+
         if isinstance(c, Function):
             # Need some clever construction of the TrialFunction to get a part of the mixed space
             part = idx if isinstance(self._u, list) else None
@@ -449,7 +607,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
     def prepare_recompute_component(
         self, inputs: typing.Sequence[typing.Any], relevant_outputs: typing.Sequence[typing.Any]
-    ) -> Function | typing.Sequence[Function]:
+    ) -> MaybeBlocked[Function]:
         """Recompute the block's own forward solution(s) from its checkpointed dependencies and outputs.
 
         Each problem has replaced its own forms' coefficients with placeholders, which are populated
@@ -523,7 +681,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         inputs: typing.Iterable[Function],
         block_variable: pyadjoint.block_variable.BlockVariable,
         idx: int,
-        prepared: Function | typing.Sequence[Function],
+        prepared: MaybeBlocked[Function],
     ) -> Function:
         """Return an isolated copy of this block's own share of the already-recomputed state.
 
@@ -602,12 +760,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             solutions -- passed through unchanged as ``prepared`` to every
             subsequent
             {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.evaluate_hessian_component`
-            call. ``None`` if there is nothing to do (no Hessian input, or no
-            dependency has a tangent-linear value).
+            call. ``None`` if there is nothing to do (no dependency has a
+            tangent-linear value).
         """
         outputs = self.get_outputs()
         tlm_output = [output.tlm_value for output in outputs if output is not None]
-        if (hessian_inputs is None) or (len(tlm_output) == 0):
+        if len(tlm_output) == 0:
             return
 
         # The adjoint solver -- and the compiled LHS it solves with, shared
@@ -668,8 +826,13 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 if tlm_input is None:
                     continue
                 c = block_variable.output
-                if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
+                if isinstance(c, dolfinx.mesh.Mesh):
                     raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+                if isinstance(c, dolfinx.fem.DirichletBC):
+                    # A bc's SOA-rhs contribution is handled entirely via the boundary
+                    # reaction computed after adjoint_solver.solve() below (d2F/dm2 =
+                    # d2F/dudm = 0 for a bc control), not via soa_cross here.
+                    continue
                 template = hessian_templates.soa_cross.get(c)
                 if template is None:
                     continue
@@ -698,8 +861,13 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 if tlm_input is None:
                     continue
                 c = block_variable.output
-                if isinstance(c, (dolfinx.mesh.Mesh, dolfinx.fem.DirichletBC)):
+                if isinstance(c, dolfinx.mesh.Mesh):
                     raise NotImplementedError(f"Hessian computation for {type(c)} control not implemented yet.")
+                if isinstance(c, dolfinx.fem.DirichletBC):
+                    # A bc's SOA-rhs contribution is handled entirely via the boundary
+                    # reaction computed after adjoint_solver.solve() below (d2F/dm2 =
+                    # d2F/dudm = 0 for a bc control), not via soa_cross here.
+                    continue
                 templates = hessian_templates.soa_cross.get(c)
                 if templates is None:
                     continue
@@ -722,6 +890,13 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             local_arrays = [bi.array[: bi.index_map.size_local * bi.block_size] for bi in bs]
             dolfinx.la.petsc.assign(local_arrays, b)
             b.ghostUpdate(PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)
+
+        # Snapshot the SOA right-hand side now, before HomogeneousBCLinearProblem.solve()
+        # zeros every bc dof -- see prepare_evaluate_adj's identical comment; the SOA
+        # equation's b, built above, plays the same role dJdu does for the first-order
+        # adjoint.
+        compute_bdy = self._should_compute_boundary_adjoint(self.get_dependencies())
+        b_snapshot = self._snapshot_rhs(b) if compute_bdy else None
 
         # The SOA (second-order-adjoint) equation shares its LHS verbatim with
         # the first-order adjoint equation (both are adjoint(dF/du)) --
@@ -749,6 +924,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         for placeholder, sol in zip(second_adj_placeholder_list, second_adjoint_solutions_list, strict=True):
             placeholder.x.array[:] = sol.x.array[:]
             placeholder.x.scatter_forward()
+
+        if compute_bdy:
+            reaction_template = problem._get_or_build_second_order_adjoint_reaction_template()
+            self._adj_sol2_bdy = self._compute_boundary_reaction(b_snapshot, reaction_template)  # type: ignore[arg-type]
+        else:
+            self._adj_sol2_bdy = None
 
         return self._compute_residual(), self._adjoint_solutions, self._second_adjoint_solutions
 
@@ -794,9 +975,11 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         c_rep = block_variable.saved_output
 
         # If m = DirichletBC then d^2F(u,m)/dm^2 = 0 and d^2F(u,m)/dudm = 0,
-        # so we only have the term dF(u,m)/dm * adj_sol2
+        # so we only have the term dF(u,m)/dm * adj_sol2 -- i.e. the boundary reaction
+        # computed against the *second-order* adjoint solution in prepare_evaluate_hessian,
+        # masked onto this bc's own dofs exactly like the first-order case.
         if isinstance(c, dolfinx.fem.DirichletBC):
-            raise NotImplementedError("Hessian computation for DirichletBC control not implemented yet.")
+            return self._mask_reaction_to_bc(c, self._adj_sol2_bdy)
         if isinstance(c_rep, dolfinx.fem.Constant):
             raise NotImplementedError("Hessian computation for Constant control not implemented yet.")
             # mesh = extract_mesh_from_form(F_form)
@@ -848,14 +1031,15 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
 
 
 class LinearProblemBlock(_ProblemBlockBase):
-    """A linear problem that can be used with adjoint methods.
+    """The pyadjoint tape block recorded by a {py:class}`~dolfinx_adjoint.LinearProblem` solve.
 
-    This class extends the `dolfinx.fem.petsc.LinearProblem` to support adjoint methods.
+    See `_ProblemBlockBase`'s own docstring for the shared adjoint/TLM/Hessian machinery;
+    this subclass supplies the pieces genuinely specific to a linear ``a``/``L`` residual.
     """
 
-    _adjoint_solutions: Function | typing.Sequence[Function]
-    _tlm_solutions: Function | typing.Sequence[Function]
-    _second_adjoint_solutions: Function | typing.Sequence[Function]
+    _adjoint_solutions: MaybeBlocked[Function]
+    _tlm_solutions: MaybeBlocked[Function]
+    _second_adjoint_solutions: MaybeBlocked[Function]
 
     # 2. Overload for the SCALAR case
     @typing.overload
@@ -902,12 +1086,12 @@ class LinearProblemBlock(_ProblemBlockBase):
 
     def __init__(
         self,
-        a: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
-        L: ufl.Form | typing.Sequence[ufl.Form],
+        a: MaybeBlockedMatrix[ufl.Form],
+        L: MaybeBlocked[ufl.Form],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: Function | typing.Sequence[Function] | None = None,
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        u: MaybeBlocked[Function] | None = None,
+        P: MaybeBlockedMatrix[ufl.Form] | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
@@ -949,7 +1133,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         self._preconditioner = P
 
         # Create overloaded functions
-        self._u: Function | typing.Sequence[Function]
+        self._u: MaybeBlocked[Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
         elif u is None:
@@ -1009,10 +1193,25 @@ class LinearProblemBlock(_ProblemBlockBase):
         self._bcs = bcs if bcs is not None else []
 
         # Add dependencies from the boundary conditions
-        if self._bcs is not None:
-            for bc in self._bcs:
-                if hasattr(bc, "block_variable"):
-                    self.add_dependency(bc, no_duplicates=True)
+        for bc in self._bcs:
+            if hasattr(bc, "block_variable"):
+                self.add_dependency(bc, no_duplicates=True)
+
+        # Which output block each bc constrains, for evaluate_adj_component/
+        # evaluate_hessian_component's DirichletBC branch to index into the
+        # (possibly per-block) boundary reaction with -- computed once here, since a
+        # bc's block assignment is static for this Block's lifetime. Reuses dolfinx's
+        # own bcs_by_block rather than a hand-rolled containment check, matching the
+        # grouping HomogeneousBCLinearProblem.solve() already relies on.
+        self._bc_block_index: dict[dolfinx.fem.DirichletBC, int] = {}
+        if isinstance(self._u, list) and self._bcs:
+            spaces = [ui.function_space for ui in self._u]
+            grouped = bcs_by_block(spaces, self._bcs)
+            for block_idx, bcs_in_block in enumerate(grouped):
+                for bc in bcs_in_block:
+                    self._bc_block_index[bc] = block_idx
+        self._adj_sol_bdy = None
+        self._adj_sol2_bdy = None
 
         # No forward/adjoint/TLM solver is built here: this block shares the
         # ones owned by self.get_reference_problem() (see LinearProblem in ../solvers.py),
@@ -1074,8 +1273,23 @@ class LinearProblemBlock(_ProblemBlockBase):
         )
         prefix = f"RebuiltLinearProblem_{next(_PROBLEM_PREFIX_COUNTER)}_"
 
-        gc.collect()  # reclaim whatever's floating in the last rebuild's cyclic garbage
-        # before allocating fresh PETSc/communicator resources for this one
+        # Collect before building the replacement, which allocates fresh Functions.
+        # Every ufl.replace() leaves a cyclic Replacer behind -- UFL builds its handler
+        # table out of bound methods that point back at it -- and that cycle pins the
+        # Functions in the Replacer's own mapping, so a discarded Problem's placeholders
+        # stay alive until the cyclic collector runs. That matters because a live dolfinx
+        # Function currently costs two neighbourhood communicators: la::Vector builds its
+        # own Scatterer, which calls MPI_Dist_graph_create_adjacent twice. Measured, ~1024
+        # retained Functions exhaust MPICH's 2048-context table, so repeated rebuilds
+        # abort with "Too many communicators" without this.
+        #
+        # Deliberately not PETSc.garbage_cleanup(): the PETSc objects here are released by
+        # refcounting at the same point on every rank, so PETSc's garbage stash stays empty
+        # (measured, both ranks) and there is nothing for it to drain. The communicators at
+        # stake belong to dolfinx, not PETSc. Revisit once FEniCS/dolfinx#4484 -- one
+        # cached scatter pattern per IndexMap, rather than one Scatterer per Function --
+        # reaches a release we depend on.
+        gc.collect()
 
         return LinearProblem(
             self._lhs,  # type: ignore[arg-type]
@@ -1095,15 +1309,16 @@ class LinearProblemBlock(_ProblemBlockBase):
 
 
 class NonlinearProblemBlock(_ProblemBlockBase):
-    """A nonlinear problem that can be used with adjoint methods.
+    """The pyadjoint tape block recorded by a {py:class}`~dolfinx_adjoint.NonlinearProblem` solve.
 
-    This class extends the `dolfinx.fem.petsc.NonlinearProblem` to support adjoint methods.
+    See `_ProblemBlockBase`'s own docstring for the shared adjoint/TLM/Hessian machinery;
+    this subclass supplies the pieces genuinely specific to a nonlinear ``F`` residual.
     """
 
-    _adjoint_solutions: Function | typing.Sequence[Function]
-    _second_adjoint_solutions: Function | typing.Sequence[Function]
-    _tlm_solutions: Function | typing.Sequence[Function]
-    _rhs: ufl.Form | typing.Sequence[ufl.Form]
+    _adjoint_solutions: MaybeBlocked[Function]
+    _second_adjoint_solutions: MaybeBlocked[Function]
+    _tlm_solutions: MaybeBlocked[Function]
+    _rhs: MaybeBlocked[ufl.Form]
 
     @typing.overload
     def __init__(
@@ -1147,11 +1362,11 @@ class NonlinearProblemBlock(_ProblemBlockBase):
 
     def __init__(
         self,
-        F: ufl.Form | typing.Sequence[ufl.Form],
+        F: MaybeBlocked[ufl.Form],
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: Function | typing.Sequence[Function] | None = None,
-        J: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
+        u: MaybeBlocked[Function] | None = None,
+        J: MaybeBlockedMatrix[ufl.Form] | None = None,
+        P: MaybeBlockedMatrix[ufl.Form] | None = None,
         form_compiler_options: dict | None = None,
         jit_options: dict | None = None,
         entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
@@ -1182,7 +1397,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
 
         # Create overloaded functions
         assert u is not None, "Control variable(s) must be provided."
-        self._u: Function | typing.Sequence[Function]
+        self._u: MaybeBlocked[Function]
         if isinstance(u, dolfinx.fem.Function):
             self._u = pyadjoint.create_overloaded_object(u)
             replace_dict = {u: self._u}
@@ -1212,6 +1427,25 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         self._form_compiler_options = form_compiler_options
         self._entity_maps = entity_maps
         self._bcs = bcs if bcs is not None else []
+
+        # Add dependencies from the boundary conditions
+        for bc in self._bcs:
+            if hasattr(bc, "block_variable"):
+                self.add_dependency(bc, no_duplicates=True)
+
+        # Which output block each bc constrains, for evaluate_adj_component/
+        # evaluate_hessian_component's DirichletBC branch to index into the
+        # (possibly per-block) boundary reaction with -- computed once here, since a
+        # bc's block assignment is static for this Block's lifetime. Reuses dolfinx's
+        # own bcs_by_block rather than a hand-rolled containment check, matching the
+        # grouping HomogeneousBCLinearProblem.solve() already relies on.
+        self._bc_block_index: dict[dolfinx.fem.DirichletBC, int] = {}
+        if isinstance(self._u, list) and self._bcs:
+            spaces = [ui.function_space for ui in self._u]
+            grouped = bcs_by_block(spaces, self._bcs)
+            for block_idx, bcs_in_block in enumerate(grouped):
+                for bc in bcs_in_block:
+                    self._bc_block_index[bc] = block_idx
 
         # No forward/adjoint solver is built here: this block shares the ones
         # owned by self.get_reference_problem() (see NonlinearProblem in ../solvers.py),
@@ -1275,8 +1509,9 @@ class NonlinearProblemBlock(_ProblemBlockBase):
             "replay to avoid this cost.",
             stacklevel=4,
         )
-        gc.collect()  # reclaim whatever's floating in the last rebuild's cyclic garbage
-        # before allocating fresh PETSc/communicator resources for this one
+        # See LinearProblemBlock._rebuild_problem for why this is here, and why it is
+        # not PETSc.garbage_cleanup().
+        gc.collect()
 
         prefix = f"RebuiltNonlinearProblem_{next(_PROBLEM_PREFIX_COUNTER)}_"
         return NonlinearProblem(

@@ -9,7 +9,7 @@ from .typing_utils import NestedSequence
 
 
 def recursive_space_discovery(
-    obj: NestedSequence[ufl.Form | None], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
+    obj: NestedSequence[ufl.BaseForm | None], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
 ) -> None:
     """Recursively discover, for each row/column index, the function space of the
     (as yet unassigned) argument occupying that position.
@@ -22,7 +22,7 @@ def recursive_space_discovery(
         spaces: A dictionary mapping row/column indices to discovered function spaces.
             This dictionary is updated in-place as the function traverses the structure.
     """
-    if isinstance(obj, ufl.Form):
+    if isinstance(obj, ufl.BaseForm):
         for arg in obj.arguments():
             if arg.part() is None:
                 # The argument number corresponds to the index of the row/column
@@ -41,7 +41,7 @@ def recursive_space_discovery(
 
 
 def build_argument_replacement_map(
-    obj: NestedSequence[ufl.Form | None],
+    obj: NestedSequence[ufl.BaseForm | None],
     indices: tuple[int, ...],
     test_functions: typing.Sequence[ufl.Argument],
     trial_functions: typing.Sequence[ufl.Argument],
@@ -75,14 +75,14 @@ def build_argument_replacement_map(
 
 
 @typing.overload
-def assign_mixed_parts[T: NestedSequence[ufl.Form | None]](form1: T, /) -> T: ...
+def assign_mixed_parts[T: NestedSequence[ufl.BaseForm | None]](form1: T, /) -> T: ...
 @typing.overload
-def assign_mixed_parts[T: NestedSequence[ufl.Form | None], S: NestedSequence[ufl.Form | None]](
+def assign_mixed_parts[T: NestedSequence[ufl.BaseForm | None], S: NestedSequence[ufl.BaseForm | None]](
     form1: T, form2: S, /
 ) -> tuple[T, S]: ...
 def assign_mixed_parts(
-    *form_structs: NestedSequence[ufl.Form | None],
-) -> NestedSequence[ufl.Form | None] | tuple[NestedSequence[ufl.Form | None], ...]:
+    *form_structs: NestedSequence[ufl.BaseForm | None],
+) -> NestedSequence[ufl.BaseForm | None] | tuple[NestedSequence[ufl.BaseForm | None], ...]:
     """
     Recursively assigns mixed-space `part` indices to {py:class}`ufl.Argument`
     (test and trial functions), within nested iterables of forms.
@@ -145,7 +145,7 @@ def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
     if form is None:
         return None
 
-    if isinstance(form, ufl.Form):
+    if isinstance(form, ufl.BaseForm):
         return form
 
     elif isinstance(form, typing.Iterable):
@@ -181,7 +181,9 @@ def compute_adjoint(form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]
     return ufl.extract_blocks(compute_form_adjoint(form))
 
 
-def recursive_replace(form: NestedSequence[ufl.Form | None], placeholders: dict) -> NestedSequence[ufl.Form | None]:
+def recursive_replace(
+    form: NestedSequence[ufl.BaseForm | None], placeholders: dict
+) -> NestedSequence[ufl.BaseForm | None]:
     """Recursively apply {py:func}`ufl.replace` to a (possibly nested) form structure.
 
     Args:
@@ -196,6 +198,6 @@ def recursive_replace(form: NestedSequence[ufl.Form | None], placeholders: dict)
     """
     if form is None:
         return None
-    if isinstance(form, ufl.Form):
+    if isinstance(form, ufl.BaseForm):
         return ufl.replace(form, placeholders)
     return [recursive_replace(f, placeholders) for f in form]
