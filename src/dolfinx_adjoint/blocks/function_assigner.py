@@ -230,16 +230,24 @@ class FunctionAssignBlock(Block):
         if self.expr is None:
             prepared = inputs[0]
 
-        # We should return the exact object instance to maintain C++ memory bindings
-        # (especially for DirichletBCs), updating it in-place.
-        output = block_variable.saved_output
+        # Mutate the live output object in place -- required so that a native, identity-bound
+        # consumer built once from it (e.g. a dolfinx.fem.DirichletBC's "g") sees the update --
+        # but return a *separate*, freshly isolated checkpoint for the tape's own bookkeeping.
+        # Returning the same mutated object as the checkpoint, as this used to do, is only safe
+        # without a schedule. Under one, pyadjoint's TimeStep.checkpoint stores the very same
+        # object for a global dependency rather than a copy of it, and restore_from_checkpoint
+        # hands that object straight back, so mutating it in place silently corrupts a snapshot
+        # a later step still needs instead of replacing it. See the note on
+        # _ProblemBlockBase.recompute_component for why the copy is not made conditional on a
+        # schedule being active: it is measurably too cheap to be worth the second code path.
+        live = block_variable.output
         if isinstance(prepared, dolfinx.fem.Function):
-            output.x.array[:] = prepared.x.array[:]
+            live.x.array[:] = prepared.x.array[:]
         elif isinstance(prepared, (float, int)):
-            output.x.array[:] = prepared
+            live.x.array[:] = prepared
         else:
-            assign_linear_combination(prepared, output)
-        return output
+            assign_linear_combination(prepared, live)
+        return live._ad_create_checkpoint()
 
     def __str__(self):
         rhs = self.expr or self.other or self.get_dependencies()[0].output

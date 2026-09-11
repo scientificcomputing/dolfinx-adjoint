@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 import dolfinx
 from ufl.algebra import Conj
 from ufl.algorithms.formsplitter import extract_blocks
@@ -299,3 +301,32 @@ def compute_form_adjoint(
                     form_adj += map_integrands(Conj, replace(block, local_map))
 
         return form_adj
+
+
+def bcs_by_block(
+    spaces: Sequence[dolfinx.fem.FunctionSpace | dolfinx.cpp.fem.FunctionSpace_float32 | None],
+    bcs: Sequence[dolfinx.fem.DirichletBC],
+) -> list[list[dolfinx.fem.DirichletBC]]:
+    """Arrange boundary conditions by the space they constrain, on every supported dolfinx.
+
+    :py:func:`dolfinx.fem.bcs.bcs_by_block` cannot be called directly because 0.11 and 0.12
+    disagree about which side of the containment check is a Python wrapper and which is a
+    cpp object, in opposite directions:
+
+    * 0.11 does ``V.contains(bc.function_space)``. ``DirichletBC.function_space`` there
+      unwraps to a cpp space, so ``V`` must be a cpp space too -- as it is when it comes
+      from ``extract_function_spaces``, whose spaces are cpp on both versions. Passing a
+      *Python* ``V`` (e.g. ``u.function_space``) picks up the Python ``contains``, which
+      dereferences ``bc.function_space._cpp_object`` and raises ``AttributeError``.
+    * 0.12 (FEniCS/dolfinx#4342) made ``DirichletBC`` hold the Python ``V``/``g`` it was
+      built with, and ``bcs_by_block`` now normalises ``V`` itself while requiring
+      ``bc.function_space`` to be the Python wrapper.
+
+    Normalising both sides here and calling the cpp ``contains`` directly is stable across
+    both, and accepts either flavour of space from the caller.
+    """
+
+    def _cpp(space):
+        return getattr(space, "_cpp_object", space)
+
+    return [[bc for bc in bcs if _cpp(V).contains(_cpp(bc.function_space))] if V is not None else [] for V in spaces]

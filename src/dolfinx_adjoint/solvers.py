@@ -9,10 +9,15 @@ import pyadjoint
 import ufl
 from dolfinx.fem.function import Function as _Function
 
-from .blocks.solvers import LinearProblemBlock, NonlinearProblemBlock, _ProblemBlockBase, collect_coefficients
+from .blocks.solvers import (
+    LinearProblemBlock,
+    NonlinearProblemBlock,
+    _ProblemBlockBase,
+    collect_coefficients,
+)
 from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
-from .typing_utils import NestedSequence
+from .typing_utils import MaybeBlocked, MaybeBlockedMatrix
 from .ufl_utils import (
     assign_mixed_parts,
     compute_adjoint,
@@ -28,16 +33,17 @@ _PROBLEM_PREFIX_COUNTER = itertools.count()
 
 
 @typing.overload
-def find_or_create_then_overload(u: _Function | None, L: ufl.Form) -> _Function: ...
+def find_or_create_then_overload(u: _Function | None, L: ufl.BaseForm) -> _Function: ...
 @typing.overload
 def find_or_create_then_overload(
-    u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.Form]
+    u: typing.Sequence[_Function] | None, L: typing.Sequence[ufl.BaseForm]
 ) -> typing.Sequence[_Function]: ...
 
 
 def find_or_create_then_overload(
-    u: _Function | typing.Sequence[_Function] | None, L: ufl.Form | typing.Sequence[ufl.Form]
-) -> _Function | typing.Sequence[_Function]:
+    u: MaybeBlocked[_Function] | None,
+    L: MaybeBlocked[ufl.BaseForm],
+) -> MaybeBlocked[_Function]:
     """Find or create, then overload the unknown
     {py:class}`~dolfinx_adjoint.Function` ``u`` for a `*Problem`.
 
@@ -63,7 +69,7 @@ def find_or_create_then_overload(
         try:
             # Extract function space for unknown from the right hand
             # side of the equation.
-            assert isinstance(L, ufl.Form)
+            assert isinstance(L, ufl.BaseForm)
             return Function(L.arguments()[0].ufl_function_space())
         except AttributeError:
             assert isinstance(L, typing.Iterable)
@@ -107,7 +113,7 @@ class HessianTemplates(typing.NamedTuple):
             per-dependency (not per-row) shape as ``fixed``.
     """
 
-    soa_self: NestedSequence[dolfinx.fem.Form]
+    soa_self: MaybeBlocked[dolfinx.fem.Form]
     soa_cross: dict
     fixed: dict
     cross: dict
@@ -133,6 +139,8 @@ def _pad_blocks_by_part(form: ufl.Form, test_funcs: typing.Sequence[ufl.Argument
         return padded
     assert isinstance(form, ufl.Form)
     for block in ufl.extract_blocks(form):
+        if block is None:
+            continue
         args = block.arguments()
         assert len(args) == 1, "Expected a single test function in the block."
         padded[args[0].part()] = block
@@ -148,7 +156,7 @@ def _build_soa_self_template(
     jit_options: dict | None,
     form_compiler_options: dict | None,
     entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None,
-) -> NestedSequence[dolfinx.fem.Form]:
+) -> MaybeBlocked[dolfinx.fem.Form]:
     """Build the SOA self-term ``adjoint(d2F/du2) . adjoint_solution``.
 
     The same computation for both {py:class}`~dolfinx_adjoint.LinearProblem` and
@@ -190,7 +198,7 @@ class _ProblemBase(abc.ABC):
     # derives from) before any method on this class runs.
     ad_block_tag: str | None
     bcs: typing.Sequence[dolfinx.fem.DirichletBC]
-    _u: _Function | typing.Sequence[_Function]
+    _u: MaybeBlocked[_Function]
     _rhs: typing.Any
     _preconditioner: typing.Any
     _value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function]
@@ -211,7 +219,9 @@ class _ProblemBase(abc.ABC):
         return self._value_placeholders
 
     @property
-    def residual_state_placeholder(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+    def residual_state_placeholder(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Function]:
         """The dedicated "state" placeholder(s) standing in for ``u`` in every
         compiled template built from the residual (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_residual_template`).
@@ -222,7 +232,9 @@ class _ProblemBase(abc.ABC):
         return self._residual_state_placeholder
 
     @property
-    def adjoint_solution_placeholder(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+    def adjoint_solution_placeholder(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Function]:
         """The placeholder(s) for the first-order adjoint solution in the cached
         Hessian templates (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
@@ -231,7 +243,9 @@ class _ProblemBase(abc.ABC):
         return self._adjoint_solution_placeholder
 
     @property
-    def second_adjoint_solution_placeholder(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+    def second_adjoint_solution_placeholder(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Function]:
         """The placeholder(s) for the second-order adjoint (SOA) solution in the
         cached Hessian templates (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
@@ -240,7 +254,9 @@ class _ProblemBase(abc.ABC):
         return self._second_adjoint_solution_placeholder
 
     @property
-    def hessian_u_seed(self) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+    def hessian_u_seed(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Function]:
         """The placeholder(s) for the state's own tangent-linear direction in the
         cached Hessian self-term (see
         {py:meth}`~dolfinx_adjoint.solvers._ProblemBase._get_or_build_hessian_templates`).
@@ -264,22 +280,22 @@ class _ProblemBase(abc.ABC):
         self._adjoint_solver: HomogeneousBCLinearProblem | None = None
         self._tlm_solver: HomogeneousBCLinearProblem | None = None
         self._residual_template: ufl.Form | None = None
-        self._residual_state_placeholder: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None
+        self._residual_state_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
         self._dFdu_template: ufl.Form | None = None
         self._dFdu_adj_template: ufl.Form | typing.Sequence | None = None
         self._tlm_rhs_templates: dict | None = None
         self._tlm_seed_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {}
         self._hessian_templates: HessianTemplates | None = None
-        self._adjoint_solution_placeholder: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None
-        self._second_adjoint_solution_placeholder: (
-            dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None
-        ) = None
-        self._hessian_u_seed: dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function] | None = None
+        self._adjoint_solution_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
+        self._second_adjoint_solution_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
+        self._hessian_u_seed: MaybeBlocked[dolfinx.fem.Function] | None = None
+        self._adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
+        self._second_order_adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
 
     @abc.abstractmethod
     def _get_or_build_residual_template(
         self,
-    ) -> tuple[ufl.Form, dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]]:
+    ) -> tuple[ufl.Form, MaybeBlocked[dolfinx.fem.Function]]:
         """Build (once) and return F with every coefficient replaced by its placeholder,
         and u replaced by a dedicated "state" placeholder for "u at this evaluation point".
 
@@ -352,7 +368,7 @@ class _ProblemBase(abc.ABC):
     ) -> tuple[
         dict[dolfinx.fem.Function, typing.Any],
         dict[dolfinx.fem.Function, dolfinx.fem.Function],
-        dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function],
+        MaybeBlocked[dolfinx.fem.Function],
     ]:
         """Build (once) and return the per-dependency TLM right-hand-side templates."""
         # Shared by both classes: built purely from the residual template
@@ -383,7 +399,7 @@ class _ProblemBase(abc.ABC):
             # *ProblemBlock.prepare_evaluate_tlm in blocks/solvers.py), avoids
             # that entirely.
             for c, c_placeholder in self._value_placeholders.items():
-                seed = dolfinx.fem.Function(c.function_space)
+                seed = dolfinx.fem.Function(c.function_space, name=f"{c.name}_tlm_seed")
                 dFdm_c = ufl.algorithms.expand_derivatives(-ufl.derivative(F_template, c_placeholder, seed))
                 if isinstance(self._u, list):
                     dFdm_c = _pad_blocks_by_part(dFdm_c, test_funcs)
@@ -399,6 +415,125 @@ class _ProblemBase(abc.ABC):
                 self._tlm_seed_placeholders[c] = seed
             self._tlm_rhs_templates = templates
         return self._tlm_rhs_templates, self._tlm_seed_placeholders, state_placeholder
+
+    def _ensure_hessian_placeholders(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Function]:
+        """Build (once) the adjoint_solution_placeholder/second_adjoint_solution_placeholder/
+        hessian_u_seed placeholders, independently of the rest of the (more expensive) Hessian
+        templates.
+
+        Factored out of `_get_or_build_hessian_templates` so that
+        `_get_or_build_adjoint_reaction_template` (a boundary-control gradient, needed even
+        when no Hessian is ever requested) can share the same placeholder without pulling in
+        the full Hessian machinery -- see `dolfinx-adjoint-knowledge`'s
+        `scratch/boundary-control/spec.md` for the design rationale.
+
+        Returns:
+            The (possibly newly built) adjoint_solution_placeholder.
+        """
+        if self._adjoint_solution_placeholder is None:
+            _, state_placeholder = self._get_or_build_residual_template()
+            if isinstance(self._u, list):
+                assert isinstance(state_placeholder, typing.Sequence)
+                state_list = list(state_placeholder)
+                self._adjoint_solution_placeholder = [
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_adjoint") for s in state_list
+                ]
+                self._second_adjoint_solution_placeholder = [
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_second_adjoint") for s in state_list
+                ]
+                self._hessian_u_seed = [
+                    dolfinx.fem.Function(s.function_space, name=f"{s.name}_hessian_u_seed") for s in state_list
+                ]
+            else:
+                assert isinstance(state_placeholder, dolfinx.fem.Function)
+                self._adjoint_solution_placeholder = dolfinx.fem.Function(
+                    state_placeholder.function_space,
+                    name=f"{state_placeholder.name}_adjoint",
+                )
+                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(
+                    state_placeholder.function_space,
+                    name=f"{state_placeholder.name}_second_adjoint",
+                )
+                self._hessian_u_seed = dolfinx.fem.Function(
+                    state_placeholder.function_space,
+                    name=f"{state_placeholder.name}_hessian_u_seed",
+                )
+        assert self._adjoint_solution_placeholder is not None
+        return self._adjoint_solution_placeholder
+
+    def _get_or_build_adjoint_reaction_template(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Form]:
+        """Build (once) and return ``action(adjoint(dF/du), adjoint_solution_placeholder)``,
+        compiled with **no bcs applied at all** -- the boundary-control gradient recipe. See
+        `dolfinx-adjoint-knowledge`'s `scratch/boundary-control/spec.md` for the full
+        derivation and why no bcs are applied here.
+
+        Deliberately a separate, lighter-weight method from `_get_or_build_hessian_templates`
+        (which needs the *symbolic* form to keep differentiating further for soa_cross) --
+        this one only ever needs the *compiled*, directly assemblable form, and must not
+        force building the rest of the (more expensive) Hessian machinery for problems that
+        never request a Hessian.
+        """
+        if self._adjoint_reaction_template is None:
+            placeholder = self._ensure_hessian_placeholders()
+            self._adjoint_reaction_template = self._build_adjoint_reaction_template(placeholder)
+        return self._adjoint_reaction_template
+
+    def _get_or_build_second_order_adjoint_reaction_template(
+        self,
+    ) -> MaybeBlocked[dolfinx.fem.Form]:
+        """Build (once) and return ``action(adjoint(dF/du), second_adjoint_solution_placeholder)``
+        -- the Hessian-side counterpart of `_get_or_build_adjoint_reaction_template`, sharing
+        the same ``adjoint(dF/du)`` operator (the SOA equation's LHS is verbatim the
+        first-order adjoint equation's, see
+        `blocks/solvers.py::_ProblemBlockBase.prepare_evaluate_hessian`) but evaluated at the
+        second-order adjoint solution instead of the first-order one. This is the *entire*
+        Hessian-action contribution for a Dirichlet bc control -- see
+        `dolfinx-adjoint-knowledge`'s `scratch/boundary-control/spec.md` for why.
+        """
+        if self._second_order_adjoint_reaction_template is None:
+            self._ensure_hessian_placeholders()
+            assert self._second_adjoint_solution_placeholder is not None
+            self._second_order_adjoint_reaction_template = self._build_adjoint_reaction_template(
+                self._second_adjoint_solution_placeholder
+            )
+        return self._second_order_adjoint_reaction_template
+
+    def _build_adjoint_reaction_template(
+        self,
+        adjoint_placeholder: MaybeBlocked[dolfinx.fem.Function],
+    ) -> MaybeBlocked[dolfinx.fem.Form]:
+        """Compile ``action(adjoint(dF/du), adjoint_placeholder)``, with no bcs applied.
+
+        Shared builder for `_get_or_build_adjoint_reaction_template` (first-order) and
+        `_get_or_build_second_order_adjoint_reaction_template` (SOA) -- identical except for
+        which adjoint-solution placeholder is applied.
+        """
+        dFdu_adj_template = sum_form(self._get_or_build_dFdu_adj_template())  # type: ignore[arg-type]
+        assert isinstance(dFdu_adj_template, ufl.Form)
+        reaction_form = ufl.action(dFdu_adj_template, adjoint_placeholder)
+        if isinstance(self._u, list):
+            F_template, _ = self._get_or_build_residual_template()
+            test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
+            return [
+                dolfinx.fem.form(  # type: ignore[return-value]
+                    form_i,  # type: ignore[arg-type]
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+                for form_i in _pad_blocks_by_part(reaction_form, test_funcs)
+            ]
+        else:
+            return dolfinx.fem.form(
+                reaction_form,
+                jit_options=self._jit_options,
+                form_compiler_options=self._form_compiler_options,
+                entity_maps=self._entity_maps,
+            )
 
     def _get_or_build_hessian_templates(self) -> HessianTemplates:
         """Build (once) and return the per-dependency Hessian templates.
@@ -418,19 +553,19 @@ class _ProblemBase(abc.ABC):
             assert isinstance(dFdu_template, ufl.Form)
             assert isinstance(dFdu_adj_template, ufl.Form)
 
+            self._ensure_hessian_placeholders()
+            assert self._hessian_u_seed is not None
+            assert self._adjoint_solution_placeholder is not None
             blocked = isinstance(self._u, list)
-            soa_self: NestedSequence[dolfinx.fem.Form]
+            soa_self: MaybeBlocked[dolfinx.fem.Form]
             if blocked:
-                # One placeholder Function per output block, mirroring how
-                # _get_or_build_hessian_templates's scalar branch below uses a
-                # single one -- these back the adjoint_solution_placeholder/
-                # second_adjoint_solution_placeholder/hessian_u_seed properties.
                 assert isinstance(state_placeholder, typing.Sequence)
                 state_list = list(state_placeholder)
                 test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
-                self._adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
-                self._second_adjoint_solution_placeholder = [dolfinx.fem.Function(s.function_space) for s in state_list]
-                self._hessian_u_seed = [dolfinx.fem.Function(s.function_space) for s in state_list]
+                # Reuse the placeholders _ensure_hessian_placeholders already built:
+                # rebuilding them here would orphan the ones the (already compiled and
+                # cached) boundary-reaction templates hold, freezing a bc control's
+                # gradient at whatever value those held when the first Hessian was taken.
                 state_arg: typing.Any = state_list
 
                 # soa_self = adjoint(d2F/du2) . adjoint_solution -- the SOA
@@ -462,9 +597,12 @@ class _ProblemBase(abc.ABC):
                 ]
             else:
                 assert isinstance(state_placeholder, dolfinx.fem.Function)
-                self._adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
-                self._second_adjoint_solution_placeholder = dolfinx.fem.Function(state_placeholder.function_space)
-                self._hessian_u_seed = dolfinx.fem.Function(state_placeholder.function_space)
+                # See the blocked branch above: the placeholders are built once, in
+                # _ensure_hessian_placeholders, and must not be replaced here. They are
+                # scalar here for the same reason state_placeholder is -- asserted so
+                # that is visible to the type checker across the method boundary.
+                assert isinstance(self._hessian_u_seed, dolfinx.fem.Function)
+                assert isinstance(self._adjoint_solution_placeholder, dolfinx.fem.Function)
                 state_arg = state_placeholder
 
                 soa_self = _build_soa_self_template(
@@ -623,7 +761,7 @@ class _ProblemBase(abc.ABC):
         """
 
     @abc.abstractmethod
-    def _dolfinx_solve(self) -> _Function | typing.Sequence[_Function]:
+    def _dolfinx_solve(self) -> MaybeBlocked[_Function]:
         """Perform the actual forward solve, via the base ``dolfinx.fem.petsc`` class.
 
         Each subclass overrides this to call its own base class's ``solve()``
@@ -636,7 +774,7 @@ class _ProblemBase(abc.ABC):
             The solution Function, or one per output block for a blocked problem.
         """
 
-    def _record_and_solve(self, annotate: bool) -> _Function | typing.Sequence[_Function]:
+    def _record_and_solve(self, annotate: bool) -> MaybeBlocked[_Function]:
         """Shared ``solve()`` skeleton for both classes.
 
         Args:
@@ -685,6 +823,8 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
         P: Preconditioner for the linear problem.
         kind: Kind of PETSc Matrix to assemble the system into.
         petsc_options: Options dictionary for the PETSc krylov supspace solver.
+        petsc_options_prefix: Options prefix for the PETSc solver -- auto-generated,
+            unique per `LinearProblem`, if not supplied.
         form_compiler_options: Form compiler options for generating assembly kernels.
         jit_options: Options for just-in-time compilation of the forms.
         entity_maps: Mapping from meshes that coefficients and arguments are defined on to the
@@ -698,7 +838,7 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
     def __init__(
         self,
         a: ufl.Form,
-        L: ufl.Form,
+        L: ufl.BaseForm,
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
         u: _Function | None = None,
@@ -717,12 +857,12 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
     def __init__(
         self,
         a: typing.Sequence[typing.Sequence[ufl.Form]],
-        L: typing.Sequence[ufl.Form],
+        L: typing.Sequence[ufl.BaseForm],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
         u: typing.Sequence[_Function] | None = None,
         P: typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
-        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        kind: MaybeBlockedMatrix[str] | None = None,
         petsc_options: dict | None = None,
         petsc_options_prefix: str | None = None,
         form_compiler_options: dict | None = None,
@@ -734,13 +874,13 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
     ) -> None: ...
     def __init__(
         self,
-        a: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]],
-        L: ufl.Form | typing.Sequence[ufl.Form],
+        a: MaybeBlockedMatrix[ufl.Form],
+        L: MaybeBlocked[ufl.BaseForm],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        u: _Function | typing.Sequence[_Function] | None = None,
-        P: ufl.Form | typing.Sequence[typing.Sequence[ufl.Form]] | None = None,
-        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        u: MaybeBlocked[_Function] | None = None,
+        P: MaybeBlockedMatrix[ufl.Form] | None = None,
+        kind: MaybeBlockedMatrix[str] | None = None,
         petsc_options: dict | None = None,
         petsc_options_prefix: str | None = None,
         form_compiler_options: dict | None = None,
@@ -824,7 +964,7 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
 
     def _get_or_build_residual_template(
         self,
-    ) -> tuple[ufl.Form, dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]]:
+    ) -> tuple[ufl.Form, MaybeBlocked[dolfinx.fem.Function]]:
         """Build (once) and return F = action(a, state) - L, placeholder-substituted, with a
         dedicated "state" placeholder standing in for "u at this evaluation point", distinct
         from the live ``self._u`` the forward solve owns.
@@ -876,10 +1016,10 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
             problem=self,
         )  # type: ignore[misc]
 
-    def _dolfinx_solve(self) -> _Function | typing.Sequence[_Function]:
+    def _dolfinx_solve(self) -> MaybeBlocked[_Function]:
         return dolfinx.fem.petsc.LinearProblem.solve(self)
 
-    def solve(self, annotate: bool = True) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+    def solve(self, annotate: bool = True) -> MaybeBlocked[dolfinx.fem.Function]:
         """
         Solve the linear problem and return the solution.
         """
@@ -899,6 +1039,8 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         P: Preconditioner for the nonlinear problem.
         kind: Kind of PETSc Matrix to assemble the system into.
         petsc_options: Options dictionary for the PETSc SNES solver.
+        petsc_options_prefix: Options prefix for the PETSc solver -- auto-generated,
+            unique per `NonlinearProblem`, if not supplied.
         form_compiler_options: Form compiler options for generating assembly kernels.
         jit_options: Options for just-in-time compilation of the forms.
         entity_maps: Mapping from meshes that coefficients and arguments are defined on to the
@@ -936,7 +1078,7 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
         J: typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
         P: typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
-        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        kind: MaybeBlockedMatrix[str] | None = None,
         petsc_options: dict | None = None,
         petsc_options_prefix: str | None = None,
         form_compiler_options: dict | None = None,
@@ -948,13 +1090,13 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
     ) -> None: ...
     def __init__(
         self,
-        F: ufl.form.Form | typing.Sequence[ufl.form.Form],
-        u: _Function | typing.Sequence[_Function],
+        F: MaybeBlocked[ufl.form.Form],
+        u: MaybeBlocked[_Function],
         *,
         bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
-        J: ufl.form.Form | typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
-        P: ufl.form.Form | typing.Sequence[typing.Sequence[ufl.form.Form]] | None = None,
-        kind: str | typing.Sequence[typing.Sequence[str]] | None = None,
+        J: MaybeBlockedMatrix[ufl.form.Form] | None = None,
+        P: MaybeBlockedMatrix[ufl.form.Form] | None = None,
+        kind: MaybeBlockedMatrix[str] | None = None,
         petsc_options: dict | None = None,
         petsc_options_prefix: str | None = None,
         form_compiler_options: dict | None = None,
@@ -1007,8 +1149,10 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         coefficients = collect_coefficients(F) - set(u_list)
         if J is not None:
             coefficients |= collect_coefficients(J) - set(u_list)
+        # Has to be sorted when creating placeholders, as function creation is a collective operation
+        sorted_coefficients = sorted(coefficients, key=lambda c: c.ufl_id())
         self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
-            c: dolfinx.fem.Function(c.function_space) for c in coefficients
+            c: dolfinx.fem.Function(c.function_space) for c in sorted_coefficients
         }
 
         # Initialize nonlinear solver
@@ -1037,9 +1181,8 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         """Dirichlet boundary conditions applied to the residual and Jacobian.
 
         {py:class}`dolfinx.fem.petsc.NonlinearProblem` has no ``bcs`` attribute of its
-        own (its SNES callbacks close over a fixed ``bcs`` list at
-        construction, see the note in {py:meth}`~dolfinx_adjoint.NonlinearProblem.__init__`); this property exposes
-        ``self._bcs`` under the same name {py:class}`~dolfinx_adjoint.LinearProblem` uses (there, it is
+        own (its SNES callbacks close over a fixed ``bcs`` list at construction); this
+        property exposes ``self._bcs`` under the same name {py:class}`~dolfinx_adjoint.LinearProblem` uses (there, it is
         the base class's own attribute), so {py:class}`~dolfinx_adjoint.solvers._ProblemBase`'s shared methods
         can read/write ``self.bcs`` uniformly across both classes.
         """
@@ -1051,7 +1194,7 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
 
     def _get_or_build_residual_template(
         self,
-    ) -> tuple[ufl.Form, dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]]:
+    ) -> tuple[ufl.Form, MaybeBlocked[dolfinx.fem.Function]]:
         """Build (once) and return F with every non-u coefficient replaced by its placeholder,
         and u itself replaced by a dedicated "state" placeholder standing in for "u at this
         evaluation point", distinct from the live ``self._u`` the forward SNES path owns.
@@ -1106,10 +1249,10 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
             problem=self,
         )  # type: ignore[misc]
 
-    def _dolfinx_solve(self) -> _Function | typing.Sequence[_Function]:
+    def _dolfinx_solve(self) -> MaybeBlocked[_Function]:
         return dolfinx.fem.petsc.NonlinearProblem.solve(self)
 
-    def solve(self, annotate: bool = True) -> dolfinx.fem.Function | typing.Sequence[dolfinx.fem.Function]:
+    def solve(self, annotate: bool = True) -> MaybeBlocked[dolfinx.fem.Function]:
         """
         Solve the nonlinear problem and return the solution.
         """

@@ -36,6 +36,7 @@ def _vector(
         map: Index map the describes the size and distribution of the
             vector.
         bs: Block size.
+        function_space: The function space the vector is associated with.
         dtype: The scalar type.
 
     Returns:
@@ -75,6 +76,8 @@ def _create_vector(L: dolfinx.fem.Form, space: dolfinx.fem.FunctionSpace) -> _Sp
 
     Args:
         L: A linear form.
+        space: The function space ``L``'s (single) argument lives on -- must match
+            ``L.function_spaces[0]``.
 
     Returns:
         A vector that the form can be assembled into.
