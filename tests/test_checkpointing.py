@@ -16,6 +16,7 @@ import pyadjoint
 import pytest
 import ufl
 from checkpoint_schedules import Revolve, SingleDiskStorageSchedule
+from packaging.version import Version
 from pyadjoint.checkpointing import CheckpointError
 
 import dolfinx_adjoint
@@ -171,6 +172,64 @@ def test_taylor_test_under_checkpointing(V, n_steps, snapshots):
     rf, controls, directions = _tape_heat_equation(V, n_steps, Revolve(n_steps, snapshots))
     rate = pyadjoint.taylor_test(rf, controls, directions)
     assert rate > 1.95
+
+
+#: pyadjoint's checkpoint manager cleared block-variable checkpoints by assigning to the
+#: private ``BlockVariable._checkpoint``, which bypasses the ``is_control`` guard in the
+#: public ``checkpoint`` setter. A control value installed by ``Control.update`` (i.e. by
+#: ``ReducedFunctional.__call__``) was therefore wiped during forward replay, and the
+#: reverse pass read the stale value off the user's own Function. Fixed upstream by
+#: pyadjoint 143a35c ("Route checkpoint-clearing through the public setter", PR #257),
+#: which is not in any tagged release yet -- 2026.4.1 is the newest, and a source build
+#: carrying the fix still reports that version. Hence the version gate is a lower bound
+#: only, and the marker is deliberately non-strict: it must tolerate an XPASS on a patched
+#: 2026.4.1. Once a release containing the fix exists, raise the ``pyadjoint-ad`` floor in
+#: pyproject.toml and delete this marker rather than bumping the version below.
+_needs_pyadjoint_control_checkpoint_fix = pytest.mark.xfail(
+    Version(pyadjoint.__version__) <= Version("2026.4.1"),
+    strict=False,
+    reason="Needs pyadjoint 143a35c (PR #257); unreleased as of 2026.4.1",
+)
+
+
+def _moved_off_taped_values(V, controls):
+    """``controls`` shifted away from the values they were taped at.
+
+    Re-evaluating at the taped values is not enough to catch a lost control checkpoint:
+    the control's own Function still holds those values, so falling back to it reads the
+    right numbers by accident.
+    """
+    moved = []
+    with pyadjoint.stop_annotating():
+        for i, c in enumerate(controls):
+            m = dolfinx_adjoint.Function(V, name=f"moved_{i}")
+            m.interpolate(lambda x, i=i: 0.7 + 0.05 * (i + 2) * x[1])
+            m.x.array[:] = c.x.array + 0.3 * m.x.array
+            moved.append(m)
+    return moved
+
+
+@_needs_pyadjoint_control_checkpoint_fix
+@pytest.mark.parametrize("n_steps, snapshots", [(6, 2)])
+def test_gradient_at_a_new_control_value_matches_uncheckpointed(V, n_steps, snapshots):
+    """A schedule does not change the gradient at a *re-evaluated* control value.
+
+    Every other schedule test here differentiates at the values the tape was built at,
+    which is the one place this cannot fail -- so none of them cover what an optimiser
+    actually does, which is to evaluate at a new point on every iteration after the first.
+
+    The unscheduled run is a sound reference for this particular defect: it is the
+    schedule that drops the control's checkpoint, and the unscheduled gradient was
+    independently confirmed against a pure-functional central difference.
+    """
+    rf_plain, controls_plain, _ = _tape_heat_equation(V, n_steps)
+    expected = _gradient(rf_plain, _moved_off_taped_values(V, controls_plain))
+
+    rf_ckpt, controls_ckpt, _ = _tape_heat_equation(V, n_steps, Revolve(n_steps, snapshots))
+    actual = _gradient(rf_ckpt, _moved_off_taped_values(V, controls_ckpt))
+
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        np.testing.assert_allclose(a, e, rtol=1e-12, atol=1e-14, err_msg=f"control {i}")
 
 
 def _tape_snes_heat_equation(V, n_steps, schedule=None, solution_dependent_diffusivity=False):
