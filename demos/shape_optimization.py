@@ -106,7 +106,7 @@ dolfinx_adjoint.move(mesh, s)
 # basis functions are evaluated at.
 
 # +
-V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+V = dolfinx.fem.functionspace(mesh, ("Lagrange", 2))
 u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
 
 tdim = mesh.topology.dim
@@ -121,6 +121,8 @@ problem = dolfinx_adjoint.LinearProblem(
     bcs=[bc],
     petsc_options=lu_options,
     petsc_options_prefix="torsion_",
+    adjoint_petsc_options=lu_options,
+    tlm_petsc_options=lu_options,
 )
 uh = problem.solve()
 # -
@@ -153,9 +155,17 @@ Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s, riesz_map=riesz_map))
 # +
 direction = dolfinx_adjoint.Function(S)
 direction.interpolate(lambda x: np.vstack((np.sin(np.pi * x[0]), np.sin(np.pi * x[1]))))
-rate = pyadjoint.taylor_test(Jhat, s, direction)
-print(f"Taylor convergence rate: {rate:.3f}")
-assert rate > 1.9
+direction.x.array[:] *= 10
+rates = pyadjoint.taylor_to_dict(Jhat, s, direction)
+print(rates)
+
+print(
+    f"Taylor rates: R0 {min(rates['R0']['Rate']):.3f}, "
+    f"R1 {min(rates['R1']['Rate']):.3f}, R2 {min(rates['R2']['Rate']):.3f}"
+)
+assert min(rates["R0"]["Rate"]) > 0.9
+assert min(rates["R1"]["Rate"]) > 1.9
+assert min(rates["R2"]["Rate"]) > 2.9
 # -
 
 # ## Steepest descent

@@ -7,10 +7,8 @@
 # with the mesh generation folded in rather than kept in a separate script.
 #
 # The shape-derivative machinery that demo is built on was introduced for legacy dolfin-adjoint
-# in {cite}`dokken2020shape`. That paper derives both first- and second-order shape
-# derivatives; dolfinx-adjoint currently implements the first-order adjoint through a PDE
-# solve and refuses the second-order one rather than returning a wrong number, so the
-# Taylor test below checks the gradient only.
+# in {cite}`dokken2020shape`, which derives both the first- and second-order shape derivatives
+# verified below.
 
 # This is the classical shape optimization problem of minimizing the drag on an obstacle in
 # Stokes flow, first analyzed by Pironneau {cite}`pironneau1974optimum`, who found the
@@ -396,21 +394,29 @@ J = J + beta * ((barycenter_x - c_x) ** 2 + (barycenter_y - c_y) ** 2)
 print(f"Initial dissipation: {float(dissipation):.6f}   obstacle volume: {float(obstacle_volume):.6f}")
 # -
 
-# ### Verifying the shape gradient
+# ### Verifying the shape derivatives
 #
-# A first-order Taylor test, in the same direction the original demo uses. Note that only the
-# gradient is checked: dolfinx-adjoint refuses a shape *Hessian* across a PDE solve rather
-# than return a wrong one, so the original's second-order `taylor_to_dict` check has no
-# counterpart yet.
+# Taylor tests of orders 0, 1 and 2, in the same direction the original demo uses and with the
+# same expected rates: the residual without a derivative converges at 1, corrected by the
+# shape gradient at 2, and corrected by the shape Hessian as well at 3. The second-order rate
+# is the one that exercises `dF/dX` in the tangent-linear right-hand side and the mixed and
+# pure second shape derivatives in the second-order adjoint.
 
 # +
 Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(h))
 
 perturbation = dolfinx_adjoint.Function(S)
 perturbation.interpolate(lambda x: np.vstack((-x[0], x[1])))
-rate = pyadjoint.taylor_test(Jhat, h, perturbation)
-print(f"Taylor convergence rate: {rate:.3f}")
-assert rate > 1.9
+rates = pyadjoint.taylor_to_dict(Jhat, h, perturbation)
+print(rates)
+
+print(
+    f"Taylor rates: R0 {min(rates['R0']['Rate']):.3f}, "
+    f"R1 {min(rates['R1']['Rate']):.3f}, R2 {min(rates['R2']['Rate']):.3f}"
+)
+assert min(rates["R0"]["Rate"]) > 0.9
+assert min(rates["R1"]["Rate"]) > 1.9
+
 # -
 
 # ### Optimizing
