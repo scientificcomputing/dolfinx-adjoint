@@ -1,9 +1,14 @@
+import typing
+
 import dolfinx
 from pyadjoint import Block
 from pyadjoint.tape import stop_annotating
 
 from ..types.function import _create_function
-from .interpolation import _MatrixCSRWorkspace, get_mult
+from .interpolation import _MatrixCSRWorkspace, get_mult, wrap_transfer_matrix
+
+if typing.TYPE_CHECKING:
+    from petsc4py import PETSc
 
 
 def _import_fenicsx_ii():
@@ -37,6 +42,7 @@ class NonmatchingInterpolationBlock(Block):
         red_op=None,  # Optional fenicsx_ii ReductionOperator
         ad_block_tag: str | None = None,
         use_petsc: bool = False,
+        matrix_workspace: "_MatrixCSRWorkspace | PETSc.Mat | None" = None,
     ):
         super().__init__(ad_block_tag=ad_block_tag)
         self.space_from = func_from.function_space
@@ -55,8 +61,11 @@ class NonmatchingInterpolationBlock(Block):
         self._tlm_output: dolfinx.fem.Function | None = None
         self._hessian_output: dolfinx.fem.Function | None = None
 
-        # Matrix cache
-        self._matrix_workspace = None
+        # Matrix cache. Supplying `matrix_workspace` lets a caller that already built (and
+        # intends to keep reusing) the transfer matrix for this `red_op` -- for instance one
+        # evaluated once per timestep across a time-dependent forward model -- hand it in here,
+        # rather than have every `interpolate_nonmatching` call rebuild its own from scratch.
+        self._matrix_workspace = matrix_workspace
 
     def __str__(self):
         return f"interpolate_nonmatching_{self.space_from.mesh.name}_to_{self.space_to.mesh.name}"
@@ -80,10 +89,7 @@ class NonmatchingInterpolationBlock(Block):
                 use_petsc=self._use_petsc,
             )
 
-            if self._use_petsc:
-                self._matrix_workspace = mat
-            else:
-                self._matrix_workspace = _MatrixCSRWorkspace(mat)
+            self._matrix_workspace = wrap_transfer_matrix(mat, self._use_petsc)
 
         return self._matrix_workspace
 
