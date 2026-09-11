@@ -3,9 +3,70 @@ from __future__ import annotations
 import typing
 
 import ufl
+from ufl.algorithms.analysis import extract_type
 
 from .compat import compute_form_adjoint
 from .typing_utils import NestedSequence
+
+# Geometric quantities whose shape derivative UFL gets right. Everything else in
+# `ufl.classes.GeometricQuantity` is differentiated to *zero*: `CoordinateDerivativeRuleset`
+# registers a rule for the whole base class that returns an independent terminal
+# ("Explicitly defining dg/dw == 0"). These four survive because `compute_form_data` runs
+# `apply_geometry_lowering` first, rewriting them in terms of the Jacobian and so of the
+# coordinates, before the coordinate derivative is applied; the ones that stay terminals do
+# not. Measured: CellDiameter and MinCellEdgeLength come out at 2/3 of the true derivative
+# (only the measure's contribution survives) and Circumradius at exactly 0.
+_SHAPE_DIFFERENTIABLE_GEOMETRY = frozenset({"SpatialCoordinate", "FacetNormal", "CellVolume", "FacetArea"})
+
+
+def geometry_without_shape_derivative(form: NestedSequence[ufl.BaseForm | None]) -> set[str]:
+    """Names of geometric quantities in ``form`` that UFL differentiates to zero.
+
+    Args:
+        form: A single form, ``None``, or an arbitrarily nested sequence of forms/``None``
+            (a blocked system's right-hand side is a list, and ``ufl.extract_blocks`` returns
+            tuples).
+
+    Returns:
+        The distinct type names of the offending quantities, empty if there are none.
+    """
+    if form is None:
+        return set()
+    if isinstance(form, ufl.BaseForm):
+        return {
+            type(quantity).__name__
+            for quantity in extract_type(form, ufl.classes.GeometricQuantity)
+            if type(quantity).__name__ not in _SHAPE_DIFFERENTIABLE_GEOMETRY
+        }
+    offenders: set[str] = set()
+    for part in form:
+        offenders |= geometry_without_shape_derivative(part)
+    return offenders
+
+
+def reject_geometry_without_shape_derivative(form: NestedSequence[ufl.BaseForm | None]) -> None:
+    """Refuse a form whose shape derivative UFL would silently get wrong.
+
+    Called only once a mesh is known to have been moved, so a form using these quantities on a
+    mesh nobody differentiates through is left alone.
+
+    Args:
+        form: The form, or nested structure of forms, about to gain a mesh dependency.
+
+    Raises:
+        NotImplementedError: If ``form`` contains a geometric quantity that UFL differentiates
+            to zero with respect to the coordinates.
+    """
+    offenders = geometry_without_shape_derivative(form)
+    if offenders:
+        raise NotImplementedError(
+            f"Cannot take a shape derivative of a form containing {', '.join(sorted(offenders))}: "
+            "UFL differentiates every geometric quantity except "
+            f"{', '.join(sorted(_SHAPE_DIFFERENTIABLE_GEOMETRY))} to zero with respect to the "
+            "coordinates, so the contribution would be dropped and the gradient would be "
+            "silently wrong rather than merely incomplete. Express the quantity through "
+            "SpatialCoordinate instead, or do not move this mesh."
+        )
 
 
 def recursive_space_discovery(
@@ -167,18 +228,30 @@ def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
         raise TypeError(f"Cannot sum form of type {type(form)}")
 
 
-def compute_adjoint(form: ufl.Form) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
+def compute_adjoint(form: ufl.Form, blocked: bool = True) -> typing.Sequence[typing.Sequence[ufl.Form]] | ufl.Form:
     """Compute the adjoint of a (possibly blocked) bilinear form.
 
     Args:
         form: A bilinear form :math:`a(u, v)`. Blocked forms should be summed with
-        {py:func}`sum_form` before passing to this function.
+            {py:func}`sum_form` before passing to this function.
+        blocked: Whether ``form``'s arguments come from a genuine blocked/mixed
+            problem (multiple ``Argument``s with distinct ``part()`` tags). When
+            ``False``, ``ufl.extract_blocks`` is skipped entirely: a plain scalar
+            or vector-*shaped* (non-mixed) argument still reports multiple
+            "parts" to UFL, so ``extract_blocks`` would otherwise decompose the
+            single bilinear form into spurious blocks that each still reference
+            the original, full-space ``Argument`` -- producing a system sized
+            for several redundant copies of the space once assembled.
 
     Returns:
-        The transposed form :math:`a(v, u)`, decomposed back into blocks (via
-        ``ufl.extract_blocks``) -- a no-op decomposition for a scalar form.
+        The transposed form :math:`a(v, u)`: a single ``ufl.Form`` when
+        ``blocked=False``, else decomposed back into blocks via
+        ``ufl.extract_blocks`` (a no-op decomposition for a scalar form).
     """
-    return ufl.extract_blocks(compute_form_adjoint(form))
+    adjoint_form = compute_form_adjoint(form)
+    if not blocked:
+        return adjoint_form
+    return ufl.extract_blocks(adjoint_form)
 
 
 def recursive_replace(

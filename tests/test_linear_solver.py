@@ -162,3 +162,39 @@ def test_linear_mixed_derivative_hessian(mesh_2D):
     H = Jh.hessian(dm)._ad_dot(dm)
     min_rate_hess = pyadjoint.taylor_test(Jh, m, dm, dJdm=dJ, Hm=H)
     assert np.isclose(min_rate_hess, 3.0, rtol=1e-1, atol=1e-1), f"Hessian rate failed: {min_rate_hess}"
+
+
+def test_unblocked_vector_valued_problem(mesh_2D):
+    """An ordinary vector-valued problem, solved as one system rather than as blocks.
+
+    Every other vector-valued problem in this suite is *blocked* (a list of forms, one per
+    field), where the arguments carry ``part()`` indices. This one is a single form on a
+    single space whose element happens to be blocked, i.e. ``("Lagrange", 1, (gdim,))``.
+
+    That distinction used to matter: ``compute_adjoint`` called ``ufl.extract_blocks``
+    unconditionally, which splits a vector element into one form per scalar component,
+    leaving the arguments on ``ufl.FunctionSpace`` components that DOLFINx cannot compile.
+    Building the adjoint solver then failed with ``'FunctionSpace' object has no attribute
+    '_cpp_object'``. Nothing here exercised it, so it went unnoticed.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = mesh_2D
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (mesh.geometry.dim,)))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+
+    f = Function(V, name="control")
+    f.x.array[:] = 1.0
+
+    problem = LinearProblem(
+        ufl.inner(ufl.sym(ufl.grad(u)), ufl.sym(ufl.grad(v))) * ufl.dx + ufl.inner(u, v) * ufl.dx,
+        ufl.inner(f, v) * ufl.dx,
+        petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        petsc_options_prefix="test_unblocked_vector_",
+    )
+    uh = problem.solve()
+    J = assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
+
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(f))
+    h = Function(V)
+    h.interpolate(lambda x: np.vstack((np.sin(x[0]), np.cos(x[1]))))
+    assert pyadjoint.taylor_test(Jhat, f, h) > 1.9

@@ -10,6 +10,8 @@ parts:
     - file: "demos/demo_nonmatching_grids.py"
     - file: "demos/emi_membrane_current_control.py"
     - file: "demos/boundary_control.py"
+    - file: "demos/shape_optimization.py"
+    - file: "demos/stokes_shape_optimization.py"
   - caption: Python API
     chapters:
     - file: "docs/api"
