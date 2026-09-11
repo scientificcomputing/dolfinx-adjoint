@@ -1273,8 +1273,23 @@ class LinearProblemBlock(_ProblemBlockBase):
         )
         prefix = f"RebuiltLinearProblem_{next(_PROBLEM_PREFIX_COUNTER)}_"
 
-        gc.collect()  # reclaim whatever's floating in the last rebuild's cyclic garbage
-        # before allocating fresh PETSc/communicator resources for this one
+        # Collect before building the replacement, which allocates fresh Functions.
+        # Every ufl.replace() leaves a cyclic Replacer behind -- UFL builds its handler
+        # table out of bound methods that point back at it -- and that cycle pins the
+        # Functions in the Replacer's own mapping, so a discarded Problem's placeholders
+        # stay alive until the cyclic collector runs. That matters because a live dolfinx
+        # Function currently costs two neighbourhood communicators: la::Vector builds its
+        # own Scatterer, which calls MPI_Dist_graph_create_adjacent twice. Measured, ~1024
+        # retained Functions exhaust MPICH's 2048-context table, so repeated rebuilds
+        # abort with "Too many communicators" without this.
+        #
+        # Deliberately not PETSc.garbage_cleanup(): the PETSc objects here are released by
+        # refcounting at the same point on every rank, so PETSc's garbage stash stays empty
+        # (measured, both ranks) and there is nothing for it to drain. The communicators at
+        # stake belong to dolfinx, not PETSc. Revisit once FEniCS/dolfinx#4484 -- one
+        # cached scatter pattern per IndexMap, rather than one Scatterer per Function --
+        # reaches a release we depend on.
+        gc.collect()
 
         return LinearProblem(
             self._lhs,  # type: ignore[arg-type]
@@ -1494,8 +1509,9 @@ class NonlinearProblemBlock(_ProblemBlockBase):
             "replay to avoid this cost.",
             stacklevel=4,
         )
-        gc.collect()  # reclaim whatever's floating in the last rebuild's cyclic garbage
-        # before allocating fresh PETSc/communicator resources for this one
+        # See LinearProblemBlock._rebuild_problem for why this is here, and why it is
+        # not PETSc.garbage_cleanup().
+        gc.collect()
 
         prefix = f"RebuiltNonlinearProblem_{next(_PROBLEM_PREFIX_COUNTER)}_"
         return NonlinearProblem(
