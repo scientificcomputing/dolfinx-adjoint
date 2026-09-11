@@ -348,6 +348,8 @@ def optimize(
     plotter.close()
 
     # Final compliance/volume fraction as plain floats.
+    uh = problem.u
+    L = problem.L
     final_compliance = dolfinx_adjoint.assemble_scalar(ufl.action(L, uh), annotate=False)
     final_vol_frac = dolfinx_adjoint.assemble_scalar(rho * ufl.dx, annotate=False) / (Lx * Ly * Lz)
 
