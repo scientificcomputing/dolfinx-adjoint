@@ -1,4 +1,4 @@
-# # Optimal control of the EMI equations
+# # Optimal control with submeshes and interface coupling
 # *Author: Jørgen S. Dokken ([dokken@simula.no](mailto:dokken@simula.no))*.
 
 # This demo is a second a stepping stone up from the
