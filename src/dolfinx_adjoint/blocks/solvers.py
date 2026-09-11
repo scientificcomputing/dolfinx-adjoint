@@ -23,7 +23,7 @@ if typing.TYPE_CHECKING:
     from ..solvers import LinearProblem, NonlinearProblem
 
 
-def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[Function]:
+def collect_coefficients(form: ufl.BaseForm | typing.Sequence | None) -> set[Function]:
     """Return the set of UFL coefficients appearing anywhere in ``form``.
 
     ``form`` may be a single form or an arbitrarily nested sequence of forms
@@ -35,7 +35,7 @@ def collect_coefficients(form: ufl.Form | typing.Sequence | None) -> set[Functio
     """
     if form is None:
         return set()
-    if isinstance(form, ufl.Form):
+    if isinstance(form, ufl.BaseForm):
         return set(form.coefficients())
     coefficients: set = set()
     for f in form:

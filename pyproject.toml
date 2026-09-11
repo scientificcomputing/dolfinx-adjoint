@@ -31,10 +31,11 @@ dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
       "jupyter-book<2.0",
       "jupytext",
-      # moola (needed by two of the three demos) is deliberately not listed here: PyPI
-      # #     mesh = form.ufl_domain()
-        #     space = c1._ad_function_space(mesh)rejects packages that declare a direct git-URL dependency. Install it manually
+      # moola (needed by three of the six demos) is deliberately not listed here: PyPI
+      # rejects packages that declare a direct git-URL dependency. Install it manually
       # first (see README.md's Development Install section, and .github/workflows/build_docs.yml).
+
+      "gmsh",
       "pandas",
       "pyvista[all]>0.45",
       "networkx",

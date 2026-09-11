@@ -9,7 +9,7 @@ from .typing_utils import NestedSequence
 
 
 def recursive_space_discovery(
-    obj: NestedSequence[ufl.Form | None], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
+    obj: NestedSequence[ufl.BaseForm | None], indices: tuple[int, ...], spaces: dict[int, ufl.FunctionSpace]
 ) -> None:
     """Recursively discover, for each row/column index, the function space of the
     (as yet unassigned) argument occupying that position.
@@ -22,7 +22,7 @@ def recursive_space_discovery(
         spaces: A dictionary mapping row/column indices to discovered function spaces.
             This dictionary is updated in-place as the function traverses the structure.
     """
-    if isinstance(obj, ufl.Form):
+    if isinstance(obj, ufl.BaseForm):
         for arg in obj.arguments():
             if arg.part() is None:
                 # The argument number corresponds to the index of the row/column
@@ -145,7 +145,7 @@ def sum_form(form: NestedSequence[ufl.Form | None]) -> ufl.Form | None:
     if form is None:
         return None
 
-    if isinstance(form, ufl.Form):
+    if isinstance(form, ufl.BaseForm):
         return form
 
     elif isinstance(form, typing.Iterable):
@@ -196,6 +196,6 @@ def recursive_replace(form: NestedSequence[ufl.Form | None], placeholders: dict)
     """
     if form is None:
         return None
-    if isinstance(form, ufl.Form):
+    if isinstance(form, ufl.BaseForm):
         return ufl.replace(form, placeholders)
     return [recursive_replace(f, placeholders) for f in form]
