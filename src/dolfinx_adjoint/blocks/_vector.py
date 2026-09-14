@@ -4,15 +4,22 @@ import numpy.typing as npt
 
 
 class _SpecialVector(dolfinx.la.Vector):
-    """Workaround adding __iadd__ to `dolfinx.la.Vector`."""
+    """Workaround adding __iadd__ to `dolfinx.la.Vector`.
+
+    NOTE: Should be made a block variable, i.e. we should probably return a `CoFunction` instead of a Vector.
+    """
 
     def __init__(self, x, function_space: dolfinx.fem.FunctionSpace):
         super().__init__(x._cpp_object)
         self._function_space = function_space
 
-    def __iadd__(self, other):
+    def _ad_iadd(self, other):
         self.array[:] += other.array[:]
         return self
+
+    def __iadd__(self, other):
+        # Backward compat with pyadjoint 2026.9.0
+        return self._ad_iadd(other)
 
     @property
     def function_space(self) -> dolfinx.fem.FunctionSpace:
