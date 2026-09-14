@@ -184,7 +184,7 @@ marker_names = {
     float(obstacle_marker): "Obstacle (control)",
 }
 
-plotter = pyvista.Plotter(shape=(2, 1), window_size=[1100, 800])
+plotter = pyvista.Plotter(shape=(2, 1), window_size=[700, 510])
 plotter.subplot(0, 0)
 plotter.add_text("Mesh", font_size=10)
 plotter.add_mesh(mesh_grid, show_edges=True, color="white", edge_color="dimgrey", line_width=1)
@@ -458,7 +458,7 @@ else:
     plotter.show()
 
 # The state it induces spans the whole channel, so velocity and pressure share a wide figure.
-plotter = pyvista.Plotter(shape=(2, 1), window_size=[1100, 800])
+plotter = pyvista.Plotter(shape=(2, 1), window_size=[700, 510])
 plotter.subplot(0, 0)
 plotter.add_text("Velocity at the optimum", font_size=10)
 plotter.add_mesh(mesh_grid, style="wireframe", color="lightgrey", opacity=0.3)

@@ -1,0 +1,9 @@
+/* Jupyter Book adds every CSS file under `_static/` to `html_css_files`. */
+
+/* pyvista's "html" jupyter backend emits an iframe sized in pixels from the plotter's
+   `window_size`, which overflows the article column when the plotter asks for more pixels
+   than the theme gives it. `max-width` clamps the used width without overriding the
+   inline `width`, so scenes that already fit keep their requested size. */
+iframe.pyvista {
+  max-width: 100%;
+}
