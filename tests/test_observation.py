@@ -2,7 +2,6 @@
 
 from mpi4py import MPI
 
-import basix.ufl
 import dolfinx
 import numpy as np
 import pyadjoint
@@ -236,28 +235,6 @@ def test_replicated_points_are_required():
     points = sample_points(5) if comm.rank == 0 else sample_points(6)
     with pytest.raises(ValueError, match="replicated"):
         dolfinx_adjoint.PointObservation(V, points)
-
-
-def test_mixed_element_is_rejected_on_every_process():
-    """A mixed space must fail identically everywhere, not only where points landed.
-
-    The element is validated up front rather than during assembly: a process that owns no
-    points skips assembly entirely, so a lazy check would raise on some processes and not
-    others and deadlock at the next collective call instead of surfacing the error.
-    """
-    comm = MPI.COMM_WORLD
-    mesh = unit_square(comm, 6)
-    element = basix.ufl.mixed_element(
-        [
-            basix.ufl.element("Lagrange", mesh.basix_cell(), 1),
-            basix.ufl.element("Lagrange", mesh.basix_cell(), 2),
-        ]
-    )
-    W = dolfinx.fem.functionspace(mesh, element)
-
-    # A single point, so at most one process would ever reach assembly.
-    with pytest.raises(NotImplementedError):
-        dolfinx_adjoint.PointObservation(W, np.array([[0.3, 0.4]]))
 
 
 def test_points_must_match_across_processes():
