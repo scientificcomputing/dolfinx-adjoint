@@ -77,6 +77,24 @@ class _MatrixCSRWorkspace:
         self.col_vec = dolfinx.la.vector(mat.index_map(1), mat.block_size[1], dtype=mat.data.dtype)
 
 
+def wrap_transfer_matrix(mat, use_petsc: bool) -> "_MatrixCSRWorkspace | PETSc.Mat":
+    """Wrap an already-assembled transfer matrix for use with :func:`get_mult`.
+
+    A PETSc matrix is handed back as-is; a native CSR one is wrapped in a
+    :class:`_MatrixCSRWorkspace` so ``get_mult`` has pre-allocated scratch vectors to
+    multiply with. Shared by every block that builds a transfer matrix from a source other
+    than :func:`_build_interpolation_matrix` (which already returns a wrapped result).
+
+    ``mat`` is deliberately left untyped: its concrete type (a ``PETSc.Mat``, a
+    ``dolfinx.la.MatrixCSR``, or whatever a third-party matrix builder such as
+    ``fenicsx_ii`` returns) is determined by the caller via ``use_petsc``, not statically
+    knowable from that flag alone.
+    """
+    if use_petsc:
+        return mat
+    return _MatrixCSRWorkspace(mat)
+
+
 def get_mult(
     mat: "PETSc.Mat" | _MatrixCSRWorkspace,
     transpose: bool = False,
