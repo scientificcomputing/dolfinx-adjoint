@@ -16,6 +16,7 @@ from ufl.algorithms.apply_derivatives import apply_coordinate_derivatives
 from ..compat import get_interpolation_points
 from ..types.function import Function, _create_function
 from ..types.mesh import Mesh, overloaded_mesh
+from ..ufl_utils import reject_geometry_in_expression
 from ..utils import unroll_dofmap
 
 if typing.TYPE_CHECKING:
@@ -329,8 +330,17 @@ class ExprInterpolationBlock(Block):
         # `self._deps[idx]` lookup below stays valid because the mesh is handled before them.
         self._mesh: Mesh | None = None
         if _reads_geometry(self.expr):
-            self._mesh = overloaded_mesh(ufl.domain.extract_unique_domain(self.expr))
+            domain = ufl.domain.extract_unique_domain(self.expr)
+            self._mesh = overloaded_mesh(domain)
+            if self._mesh is None:
+                # See _ProblemBlockBase._register_mesh_dependency.
+                self._unannotated_domain = None if domain is None else domain.ufl_id()
             if self._mesh is not None:
+                # Same refusal the assembly and solver blocks apply: `_reads_geometry` fires on
+                # any GeometricQuantity, including the ones UFL differentiates to zero, so
+                # without this an expression mixing a dropped quantity with a live one would
+                # lose half its derivative silently.
+                reject_geometry_in_expression(self.expr)
                 self.add_dependency(self._mesh, no_duplicates=True)
         self._mesh_output: dolfinx.fem.Function | None = None
 

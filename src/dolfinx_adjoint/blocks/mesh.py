@@ -55,8 +55,22 @@ class MoveBlock(pyadjoint.Block):
         idx: int,
         prepared: typing.Any = None,
     ) -> typing.Any:
-        """Pass the adjoint value through unchanged to both the mesh and the displacement."""
-        return adj_inputs[0]
+        """Pass the adjoint value through to both the mesh and the displacement.
+
+        The *value* is the same for both -- the map is a translation, so its derivative is the
+        identity -- but the object must not be. ``BlockVariable.add_adj_output`` stores the
+        first contribution by reference and accumulates later ones in place, and dxa's
+        ``_SpecialVector`` provides that in-place add, so returning one object twice would
+        leave the mesh's and the displacement's block variables aliasing a single buffer:
+        any further accumulation into either would write through into the other. Reachable
+        from the second ``move()`` onwards, where the mesh's input block variable is itself
+        control-dependent and so does receive a value.
+        """
+        if idx == 0:
+            return adj_inputs[0]
+        copy = _displacement_vector(block_variable.output.function_space)
+        copy.array[:] = adj_inputs[0].array[:]
+        return copy
 
     def evaluate_tlm_component(
         self,

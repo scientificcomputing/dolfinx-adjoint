@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import typing
+
 import dolfinx
 import pyadjoint
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
@@ -59,6 +61,12 @@ def apply_displacement(mesh: dolfinx.mesh.Mesh, displacement: dolfinx.fem.Functi
         mesh: The mesh to move.
         displacement: The displacement, in the mesh's geometry function space.
     """
+    # The ghost rows of `mesh.geometry.x` are updated from `displacement`'s own ghost
+    # entries, so those have to be current: a displacement written on owned dofs only --
+    # which is what any externally supplied field looks like -- would otherwise move a ghost
+    # node differently from its owner and tear the mesh at the partition boundary. Silent, and
+    # invisible in serial.
+    displacement.x.scatter_forward()
     gdim = mesh.geometry.dim
     mesh.geometry.x[:, :gdim] += displacement.x.array.reshape(-1, gdim)
 
@@ -119,16 +127,40 @@ def move(
             "dolfinx_adjoint.interpolate() first, so the move stays differentiable."
         )
 
+    # Identity, not shape. `FiniteElement::operator==` compares the underlying basix
+    # element by value -- it carries no dofmap, no index map and no mesh -- so an element
+    # comparison alone accepts a displacement belonging to a *different* mesh with the same
+    # coordinate element, and `apply_displacement` would then move this mesh by that one's
+    # field. The index map is what actually ties the dofs to these coordinate nodes.
     V_geom = geometry_function_space(mesh)
-    if displacement.function_space.dofmap.index_map_bs != V_geom.dofmap.index_map_bs or (
-        displacement.function_space.element != V_geom.element
+    displacement_map = displacement.function_space.dofmap.index_map
+    geometry_map = mesh.geometry.index_map()
+    same_map = getattr(displacement_map, "_cpp_object", displacement_map) is getattr(
+        geometry_map, "_cpp_object", geometry_map
+    )
+    if (
+        displacement.function_space.mesh is not mesh
+        or not same_map
+        or displacement.function_space.dofmap.index_map_bs != V_geom.dofmap.index_map_bs
+        or displacement.function_space.element != V_geom.element
     ):
         raise ValueError(
-            "The displacement must live in the mesh's geometry function space "
-            f"({V_geom.ufl_element()}), got {displacement.function_space.ufl_element()}. "
+            "The displacement must live in *this* mesh's geometry function space "
+            f"({V_geom.ufl_element()}), got {displacement.function_space.ufl_element()} on "
+            f"{'this mesh' if displacement.function_space.mesh is mesh else 'a different mesh'}. "
             "Use dolfinx_adjoint.interpolate(displacement, "
             "dolfinx_adjoint.geometry_function_space(mesh)) to map it there first."
         )
+
+    if not annotate:
+        # Promote only when the move is being recorded. Promoting regardless would leave the
+        # mesh an overloaded Mesh, and registered globally, for the rest of the process --
+        # after which every form posed on it takes a mesh dependency it does not need, pays
+        # for a discarded shape-sensitivity assembly on each reverse sweep, and is subject to
+        # the geometric-quantity refusal. Nothing undoes that, clear_tape() included.
+        with stop_annotating():
+            apply_displacement(mesh, displacement)
+        return typing.cast(Mesh, mesh)
 
     overloaded = annotate_mesh(mesh)
 

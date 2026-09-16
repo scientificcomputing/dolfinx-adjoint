@@ -289,13 +289,29 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         appearing in it. {py:func}`~dolfinx_adjoint.types.mesh.overloaded_mesh` returns
         ``None`` for a mesh that was never passed to {py:func}`~dolfinx_adjoint.move`,
         which is every problem that is not a shape optimization, and then this is a no-op.
+
+        Every form the block will differentiate is checked, not only ``self._rhs``. For a
+        :py:class:`LinearProblemBlock` the residual is ``action(a, u) - L``, so a geometric
+        quantity in the *bilinear* form reaches the coordinate derivative just as one in ``L``
+        does -- and that is where the mesh size sits in every stabilized, interior-penalty and
+        Nitsche formulation. The preconditioner is checked as well: it is not part of the
+        residual, but a quantity UFL cannot differentiate there is a sign the same quantity is
+        meant geometrically, and refusing is the safe direction.
         """
         u = self._u[0] if isinstance(self._u, list) else self._u
         assert isinstance(u, dolfinx.fem.Function)
         mesh = overloaded_mesh(u.function_space.mesh.ufl_domain())
         if mesh is not None:
-            reject_geometry_without_shape_derivative(self._rhs)
+            for form in (self._rhs, getattr(self, "_lhs", None), getattr(self, "_preconditioner", None)):
+                reject_geometry_without_shape_derivative(form)
             self.add_dependency(mesh, no_duplicates=True)
+        else:
+            # The mesh has not been annotated yet, so this block cannot take it as a
+            # dependency and replaying the tape will not rewind the geometry before
+            # re-running the block. Remember which domain that was, so annotate_mesh() can
+            # refuse rather than let the gradient drift -- see types.mesh.annotate_mesh.
+            domain = u.function_space.mesh.ufl_domain()
+            self._unannotated_domain = None if domain is None else domain.ufl_id()
 
     def _assert_shape_dependencies_are_checkpointed(self) -> None:
         """Refuse a shape derivative whose residual would be built at the wrong state.
@@ -517,6 +533,18 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 continue
             template = templates.get(block_variable.output)
             if template is None:
+                if isinstance(block_variable.output, Mesh):
+                    # A coefficient with no tangent-linear term legitimately has no template;
+                    # the mesh always has one built for it, so its absence means the Problem's
+                    # templates were built before the mesh was moved and the shape term would
+                    # be dropped from the right-hand side without a word.
+                    raise RuntimeError(
+                        "This block depends on a moved mesh, but the problem's tangent-linear "
+                        "templates were built before the mesh was moved, so there is no dF/dX "
+                        "term to assemble and the tangent-linear model would be silently "
+                        "incomplete. Call dolfinx_adjoint.move() (or annotate_mesh()) before "
+                        "the first solve of this problem."
+                    )
                 continue
             seed = seed_placeholders[block_variable.output]
             seed.x.array[:] = tlm_value.x.array[:]

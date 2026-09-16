@@ -86,6 +86,11 @@ class AssembleBlock(Block):
         if mesh is not None:
             reject_geometry_without_shape_derivative(self.form)
             self.add_dependency(mesh, no_duplicates=True)
+        else:
+            # See _ProblemBlockBase._register_mesh_dependency: a block built before the mesh
+            # was annotated cannot be rewound, so record the domain for annotate_mesh().
+            domain = self.form.ufl_domain()
+            self._unannotated_domain = None if domain is None else domain.ufl_id()
         for coefficient in self.form.coefficients():
             if isinstance(coefficient, OverloadedType):
                 self.add_dependency(coefficient, no_duplicates=True)

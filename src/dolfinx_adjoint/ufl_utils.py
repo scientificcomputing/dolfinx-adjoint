@@ -16,6 +16,14 @@ from .typing_utils import NestedSequence
 # coordinates, before the coordinate derivative is applied; the ones that stay terminals do
 # not. Measured: CellDiameter and MinCellEdgeLength come out at 2/3 of the true derivative
 # (only the measure's contribution survives) and Circumradius at exactly 0.
+#
+# The lowering argument holds unconditionally for SpatialCoordinate and FacetNormal. For
+# CellVolume and FacetArea it holds only on an affine simplex domain -- both UFL handlers
+# return the terminal unchanged unless `domain.is_piecewise_linear_simplex_domain()`. That
+# does not make the allowlist unsafe off affine simplices: FFCx cannot generate code for the
+# un-lowered terminal in the *forward* form either ("Not handled: <class
+# 'ufl.geometry.CellVolume'>"), so such a form never compiles and no dropped term is
+# reachable through it.
 _SHAPE_DIFFERENTIABLE_GEOMETRY = frozenset({"SpatialCoordinate", "FacetNormal", "CellVolume", "FacetArea"})
 
 
@@ -61,6 +69,40 @@ def reject_geometry_without_shape_derivative(form: NestedSequence[ufl.BaseForm |
     if offenders:
         raise NotImplementedError(
             f"Cannot take a shape derivative of a form containing {', '.join(sorted(offenders))}: "
+            "UFL differentiates every geometric quantity except "
+            f"{', '.join(sorted(_SHAPE_DIFFERENTIABLE_GEOMETRY))} to zero with respect to the "
+            "coordinates, so the contribution would be dropped and the gradient would be "
+            "silently wrong rather than merely incomplete. Express the quantity through "
+            "SpatialCoordinate instead, or do not move this mesh."
+        )
+
+
+def reject_geometry_in_expression(expr: ufl.core.expr.Expr) -> None:
+    """Refuse a bare expression whose shape derivative UFL would silently get wrong.
+
+    The expression counterpart of {py:func}`reject_geometry_without_shape_derivative`, for
+    interpolation, where there is no form to scan and no measure to attach one to.
+
+    Args:
+        expr: The expression about to gain a mesh dependency.
+
+    Raises:
+        NotImplementedError: If ``expr`` contains a geometric quantity that UFL differentiates
+            to zero with respect to the coordinates.
+    """
+    from ufl.algorithms.analysis import traverse_unique_terminals
+
+    offenders = sorted(
+        {
+            type(terminal).__name__
+            for terminal in traverse_unique_terminals(expr)
+            if isinstance(terminal, ufl.classes.GeometricQuantity)
+            and type(terminal).__name__ not in _SHAPE_DIFFERENTIABLE_GEOMETRY
+        }
+    )
+    if offenders:
+        raise NotImplementedError(
+            f"Cannot take a shape derivative of an expression containing {', '.join(offenders)}: "
             "UFL differentiates every geometric quantity except "
             f"{', '.join(sorted(_SHAPE_DIFFERENTIABLE_GEOMETRY))} to zero with respect to the "
             "coordinates, so the contribution would be dropped and the gradient would be "

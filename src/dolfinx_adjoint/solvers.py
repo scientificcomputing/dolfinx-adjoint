@@ -26,10 +26,6 @@ from .ufl_utils import (
     sum_form,
 )
 
-# Sentinel for "not looked up yet", so that a cached `None` (the mesh was never moved) is
-# distinguishable from an unpopulated cache.
-_UNSET = object()
-
 # A counter incremented once per Problem construction is deterministic
 # and identical on every rank, since construction happens in lock-step
 # in a well-formed SPMD program.
@@ -293,7 +289,6 @@ class _ProblemBase(abc.ABC):
         self._adjoint_solution_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
         self._second_adjoint_solution_placeholder: MaybeBlocked[dolfinx.fem.Function] | None = None
         self._hessian_u_seed: MaybeBlocked[dolfinx.fem.Function] | None = None
-        self._shape_mesh_cached: typing.Any = _UNSET
         self._adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
         self._second_order_adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
 
@@ -303,15 +298,18 @@ class _ProblemBase(abc.ABC):
         A moved mesh is a differentiation target exactly like a coefficient of the residual:
         the residual depends on it through {py:class}`ufl.SpatialCoordinate`, and every
         template below differentiates with respect to that instead of a placeholder Function.
-        Looked up once and cached -- including the ``None``, so an ordinary problem pays one
-        dictionary lookup rather than one per template build.
-        """
-        if self._shape_mesh_cached is _UNSET:
-            from .types.mesh import overloaded_mesh
 
-            u = self._u[0] if isinstance(self._u, list) else self._u
-            self._shape_mesh_cached = overloaded_mesh(u.function_space.mesh.ufl_domain())
-        return self._shape_mesh_cached
+        Deliberately *not* cached. A cached ``None`` outlives the reason for it: the blocks
+        this Problem records look the mesh up fresh on every construction, so a Problem whose
+        templates were built before :py:func:`~dolfinx_adjoint.move` would go on reporting no
+        mesh while its blocks carried one as a dependency -- and the shape term would then be
+        dropped from the tangent-linear right-hand side. The lookup is one dictionary access
+        into a ``WeakValueDictionary``; the templates it guards are compiled code.
+        """
+        from .types.mesh import overloaded_mesh
+
+        u = self._u[0] if isinstance(self._u, list) else self._u
+        return overloaded_mesh(u.function_space.mesh.ufl_domain())
 
     def _differentiation_targets(self, seed_placeholders: dict) -> list:
         """Every quantity the Hessian templates differentiate with respect to.
