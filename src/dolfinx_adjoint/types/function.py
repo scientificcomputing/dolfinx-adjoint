@@ -182,6 +182,21 @@ class Function(dolfinx.fem.Function, FloatingType):
         return r
 
     @no_annotations
+    def _ad_iadd(self, other: typing.Self) -> typing.Self:
+        """In-place addition, used to accumulate tangent-linear contributions.
+
+        `OverloadedType._ad_iadd` adds with `+=`, which on a `ufl.Coefficient`
+        builds a symbolic `ufl.algebra.Sum` rather than accumulating dof values.
+        `BlockVariable.add_tlm_output` would then hold an expression where the
+        rest of dxa expects a Function, so override it with a real in-place add.
+
+        `__iadd__` is deliberately not defined alongside this: `f += g` on the
+        public type must keep its UFL meaning.
+        """
+        self.x.array[:] += other.x.array[:]
+        return self
+
+    @no_annotations
     def _ad_convert_riesz(self, value: dolfinx.la.Vector, riesz_map: dict | None = None) -> dolfinx.fem.Function:
         """Convert a vector to a Riesz representation of the function."""
         options = {} if riesz_map is None else riesz_map

@@ -11,7 +11,8 @@ only_build_toc_files: true
 # See https://jupyterbook.org/content/execute.html
 execute:
   execute_notebooks: cache
-  timeout: 100
+  # Per cell. Topology optimization demo takes a long time for now. Switch to SIMPLE at some point.
+  timeout: 1800
 
 # Information about where the book exists on the web
 repository:

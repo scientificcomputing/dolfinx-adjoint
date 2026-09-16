@@ -15,7 +15,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
       "fenics-dolfinx>=0.11.0",
-      "pyadjoint-ad>=2025.10.0",
+      "pyadjoint-ad>=2026.9.0",
       "packaging>=24.2",
       # Storage for checkpoint schedules that keep state on disk. Build it against MPI to get
       # one shared checkpoint file; without that each process writes its own.
@@ -25,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 scifem = ["scifem"]
-fenicsx_ii = ["fenicsx_ii"]
+fenicsx_ii = ["fenicsx_ii>=0.6.0"]
 test = ["pytest", "dolfinx-adjoint[scifem,fenicsx_ii]"]
 dev = ["pdbpp", "ipython", "mypy", "ruff"]
 docs = [
