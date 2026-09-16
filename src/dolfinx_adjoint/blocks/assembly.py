@@ -11,7 +11,9 @@ from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
 
 
 def assemble_compiled_form(
-    form: dolfinx.fem.Form, tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None
+    form: dolfinx.fem.Form,
+    tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None,
+    finalize: bool = True,
 ) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
     """Assemble a compiled form into ``tensor`` (or return a new scalar).
 
@@ -19,6 +21,14 @@ def assemble_compiled_form(
         form: Compiled form to assemble.
         tensor: For a rank-1 form, the vector to accumulate the assembled contribution
             into, while it is unused for a rank-0 form.
+        finalize: Whether to reduce ``tensor`` across ranks once the contribution is in.
+            Leave it ``True`` for a vector this is the only contribution to. Pass ``False``
+            for every call but the last when several forms accumulate into one vector, and
+            reduce once at the end: the reduction is ``scatter_reverse(add)`` followed by
+            ``scatter_forward()``, so reducing after each call would leave every ghost entry
+            holding a copy of its owner's running total, which the *next* call's
+            ``scatter_reverse`` would then add to the owner again -- once per ghosting rank.
+            That is invisible in serial and grows with the rank count.
     Returns:
         For a rank-1 form, ``tensor`` itself (mutated in place). For a rank-0 form, the
         assembled scalar as a Python ``float``.
@@ -31,8 +41,9 @@ def assemble_compiled_form(
             raise ValueError("tensor must be provided for rank-1 forms.")
         assert isinstance(tensor, dolfinx.la.Vector)
         dolfinx.fem.assemble._assemble_vector_array(tensor.array, form)
-        tensor.scatter_reverse(dolfinx.la.InsertMode.add)
-        tensor.scatter_forward()
+        if finalize:
+            tensor.scatter_reverse(dolfinx.la.InsertMode.add)
+            tensor.scatter_forward()
     elif form.rank == 0:
         local_val = dolfinx.fem.assemble_scalar(form)
         comm = form.mesh.comm

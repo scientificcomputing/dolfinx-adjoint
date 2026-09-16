@@ -1168,10 +1168,13 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         hessian_templates = problem._get_or_build_hessian_templates()
         _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
 
+        # Every contribution below accumulates into one vector, so none of them reduces on
+        # its own -- see assemble_compiled_form's `finalize` for why reducing per call
+        # double-counts shared dofs, once per ghosting rank.
         fixed_template = hessian_templates.fixed[c]
         hessian_output = _create_vector(fixed_template, W)
         hessian_output.array[:] = 0.0
-        assemble_compiled_form(fixed_template, hessian_output)
+        assemble_compiled_form(fixed_template, hessian_output, finalize=False)
 
         for _, bv in relevant_dependencies:
             c2 = bv.output
@@ -1186,8 +1189,10 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             seed2 = seed_placeholders[c2]
             seed2.x.array[:] = tlm_input.x.array[:]
             seed2.x.scatter_forward()
-            assemble_compiled_form(template, hessian_output)
+            assemble_compiled_form(template, hessian_output, finalize=False)
 
+        hessian_output.scatter_reverse(dolfinx.la.InsertMode.add)
+        hessian_output.scatter_forward()
         hessian_output.array[:] *= -1.0
         return hessian_output
 
