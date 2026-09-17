@@ -36,6 +36,7 @@ docs = [
       # first (see README.md's Development Install section, and .github/workflows/build_docs.yml).
 
       "gmsh",
+      "matplotlib",
       "pandas",
       "pyvista[all]>0.45",
       "networkx",

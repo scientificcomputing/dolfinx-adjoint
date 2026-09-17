@@ -292,6 +292,44 @@ class _ProblemBase(abc.ABC):
         self._adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
         self._second_order_adjoint_reaction_template: MaybeBlocked[dolfinx.fem.Form] | None = None
 
+    def _get_shape_mesh(self):
+        """The moved mesh this problem is posed on, or ``None`` if it was never moved.
+
+        A moved mesh is a differentiation target exactly like a coefficient of the residual:
+        the residual depends on it through {py:class}`ufl.SpatialCoordinate`, and every
+        template below differentiates with respect to that instead of a placeholder Function.
+
+        Deliberately *not* cached. A cached ``None`` outlives the reason for it: the blocks
+        this Problem records look the mesh up fresh on every construction, so a Problem whose
+        templates were built before :py:func:`~dolfinx_adjoint.move` would go on reporting no
+        mesh while its blocks carried one as a dependency -- and the shape term would then be
+        dropped from the tangent-linear right-hand side. The lookup is one dictionary access
+        into a ``WeakValueDictionary``; the templates it guards are compiled code.
+        """
+        from .types.mesh import overloaded_mesh
+
+        u = self._u[0] if isinstance(self._u, list) else self._u
+        return overloaded_mesh(u.function_space.mesh.ufl_domain())
+
+    def _differentiation_targets(self, seed_placeholders: dict) -> list:
+        """Every quantity the Hessian templates differentiate with respect to.
+
+        Returns one ``(key, argument, seed, space)`` per target: the dictionary key the
+        block looks templates up by, the UFL object to differentiate against, the direction
+        placeholder, and the space the resulting one-form's test function lives on. A
+        coefficient differentiates against its placeholder Function; the mesh differentiates
+        against its {py:class}`ufl.SpatialCoordinate`. Everything downstream is identical,
+        which is what lets the shape terms reuse the coefficient machinery wholesale.
+        """
+        targets = [
+            (c, c_placeholder, seed_placeholders[c], c.function_space)
+            for c, c_placeholder in self._value_placeholders.items()
+        ]
+        mesh = self._get_shape_mesh()
+        if mesh is not None:
+            targets.append((mesh, ufl.SpatialCoordinate(mesh), seed_placeholders[mesh], mesh._ad_function_space()))
+        return targets
+
     @abc.abstractmethod
     def _get_or_build_residual_template(
         self,
@@ -413,6 +451,29 @@ class _ProblemBase(abc.ABC):
                     entity_maps=self._entity_maps,
                 )
                 self._tlm_seed_placeholders[c] = seed
+
+            mesh = self._get_shape_mesh()
+            if mesh is not None:
+                # dF/dX in a known direction is a one-form on the state's test space, so it
+                # slots into the same right-hand side as every coefficient's term. The
+                # residual is negated *before* differentiating rather than the derivative
+                # after: scaling a form that still holds an unexpanded CoordinateDerivative
+                # puts a node outside it, and UFL rejects that ("CoordinateDerivative(s) must
+                # be outermost").
+                V_geom = mesh._ad_function_space()
+                seed = dolfinx.fem.Function(V_geom, name="shape_tlm_seed")
+                dFdX = ufl.algorithms.expand_derivatives(ufl.derivative(-F_template, ufl.SpatialCoordinate(mesh), seed))
+                if isinstance(self._u, list):
+                    dFdX = _pad_blocks_by_part(dFdX, test_funcs)
+                elif dFdX == 0 or dFdX.empty():
+                    dFdX = ufl.ZeroBaseForm((test_funcs[0],))
+                templates[mesh] = dolfinx.fem.form(
+                    dFdX,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+                self._tlm_seed_placeholders[mesh] = seed
             self._tlm_rhs_templates = templates
         return self._tlm_rhs_templates, self._tlm_seed_placeholders, state_placeholder
 
@@ -637,9 +698,7 @@ class _ProblemBase(abc.ABC):
             # Each cross-term below uses its own dedicated seed_placeholders
             # direction placeholder rather than one combined form, for the same
             # 0 * inf = NaN reason as _get_or_build_tlm_rhs_templates.
-            for c, c_placeholder in self._value_placeholders.items():
-                seed = seed_placeholders[c]
-
+            for c, c_placeholder, seed, c_space in self._differentiation_targets(seed_placeholders):
                 # soa_cross[c]: the SOA right-hand side's contribution from c's
                 # own tangent-linear direction, via dFdu_adj_applied.
                 soa_form = ufl.algorithms.expand_derivatives(ufl.derivative(dFdu_adj_applied, c_placeholder, seed))
@@ -666,7 +725,7 @@ class _ProblemBase(abc.ABC):
                 # depend on any *other* dependency's tangent-linear value --
                 # the second-order-adjoint term (dL2dm, from L2) plus the
                 # mixed state/control second derivative (d2Fdudm, from L1).
-                dc = ufl.TestFunction(c.function_space)
+                dc = ufl.TestFunction(c_space)
                 dL1dm = ufl.derivative(L1, c_placeholder, dc)
                 dL2dm = ufl.derivative(L2, c_placeholder, dc)
                 d2Fdudm = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, state_arg, self._hessian_u_seed))
@@ -682,8 +741,7 @@ class _ProblemBase(abc.ABC):
 
                 # cross[(c, c2)]: c's Hessian-action contribution from another
                 # dependency c2's tangent-linear direction, reusing dL1dm.
-                for c2, c2_placeholder in self._value_placeholders.items():
-                    seed2 = seed_placeholders[c2]
+                for c2, c2_placeholder, seed2, _ in self._differentiation_targets(seed_placeholders):
                     cross_form = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, c2_placeholder, seed2))
                     if cross_form == 0 or cross_form.empty():
                         continue
