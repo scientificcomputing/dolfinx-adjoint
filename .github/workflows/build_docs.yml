@@ -15,7 +15,12 @@ env:
   PYVISTA_OFF_SCREEN: false
   PYVISTA_JUPYTER_BACKEND: "html"
   LIBGL_ALWAYS_SOFTWARE: 1
-  DISPLAY: ":99.0"
+  # pyvista renders the demo scenes through VTK, which needs a GL context. With no X
+  # server on the runner VTK fell back to EGL, where `LIBGL_ALWAYS_SOFTWARE` is refused
+  # ("Not allowed to force software rendering when API explicitly selects a hardware
+  # device"), and every recorded frame came out as unlit black fragments while the build
+  # still went green. OSMesa renders in software without an X server or an EGL device.
+  VTK_DEFAULT_OPENGL_WINDOW: vtkOSOpenGLRenderWindow
   PIP_NO_BUILD_ISOLATION: 0
 
 jobs:
@@ -32,6 +37,7 @@ jobs:
 
       - name: Install mesa-utils
         run: apt-get update && apt-get install -y mesa-utils
+
 
       - name: Install dependencies
         run: |
