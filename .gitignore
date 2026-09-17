@@ -135,3 +135,5 @@ _build/
 
 # git worktrees used for isolated feature branches
 /.worktrees/
+*.gif
+*.png
