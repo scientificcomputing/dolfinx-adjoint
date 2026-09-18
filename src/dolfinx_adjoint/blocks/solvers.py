@@ -17,6 +17,7 @@ from ..compat import bcs_by_block
 from ..types import Function
 from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
 from ..ufl_utils import assign_mixed_parts, sum_form
+from ..utils import _compile_form
 from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form
 
 if typing.TYPE_CHECKING:
@@ -589,12 +590,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         dFdm = -ufl.derivative(sum_res, c_rep, dc)
         if dFdm.empty():
             # Generate a dummy form to safely extract the correct Vector wrapper type
-            dFdm = dolfinx.fem.form(ufl.ZeroBaseForm((dc,)))  # type: ignore[call-overload]
+            dFdm = _compile_form(ufl.ZeroBaseForm((dc,)))  # type: ignore[call-overload]
 
         dFdm_adj = ufl.adjoint(dFdm)
         sensitivity = ufl.action(dFdm_adj, self._adjoint_solutions)
 
-        compiled_sensitivity = dolfinx.fem.form(
+        compiled_sensitivity = _compile_form(
             sensitivity,
             jit_options=self._jit_options,
             form_compiler_options=self._form_compiler_options,
@@ -603,6 +604,11 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         vec = _create_vector(compiled_sensitivity, sensitivity.arguments()[0].ufl_function_space())
         vec.array[:] = 0.0
         assemble_compiled_form(compiled_sensitivity, tensor=vec)
+        # Deliberately returns the raw complex Hermitian pairing under a complex build. This
+        # is an adjoint seed that may still have to flow further upstream, so it must not have
+        # its real part taken here; the `2*Re[.]` extraction that turns an accumulated seed
+        # into a real parameter's gradient belongs at the Control, and lives in
+        # `Function._ad_convert_riesz`.
         return vec
 
     def prepare_recompute_component(
@@ -851,7 +857,11 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             bs = []
             for i, soa_self_i in enumerate(hessian_templates.soa_self):
                 out_i = outputs[i].saved_output
-                bi = dolfinx.la.vector(out_i.function_space.dofmap.index_map, out_i.function_space.dofmap.index_map_bs)
+                # From the form, not from the index map alone: dolfinx.la.vector defaults to
+                # float64 whatever the build's scalar type, which silently truncates a complex
+                # SOA right-hand side (and under numpy's casting rules does not even truncate
+                # -- the accumulation below raises).
+                bi = _create_vector(soa_self_i, out_i.function_space)
                 bi.array[:] = 0.0
                 dolfinx.fem.assemble_vector(bi.array, soa_self_i)
                 bs.append(bi)

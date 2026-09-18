@@ -3,11 +3,162 @@ import typing
 from mpi4py import MPI
 
 import dolfinx
+import numpy
 import ufl
 from pyadjoint import Block, OverloadedType, create_overloaded_object
 from ufl.formatting.ufl2unicode import ufl2unicode
 
+from ..ufl_utils import _wirtinger_derivative_forms
+from ..utils import _compile_form
 from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
+
+
+def _assemble_scalar_value(
+    form: typing.Union[ufl.Form, dolfinx.fem.Form],
+    jit_options: dict | None = None,
+    form_compiler_options: dict | None = None,
+    entity_maps: typing.Any = None,
+) -> float:
+    """Assemble a rank-0 form into a real scalar, reducing across the communicator.
+
+    This is the only rank-0 assembly in the package, and so the only place that fixes what an
+    assembled scalar *means*: under a complex-scalar build the real part is taken
+    unconditionally, defining the assembled quantity as
+
+    .. math::
+
+        J := \\mathrm{Re}\\left(\\mathrm{assemble}(form)\\right)
+
+    That is a definition rather than error-correction. A Functional must be real-valued even
+    when the state is complex-valued, and :math:`\\mathrm{Re}(f(u))` is a perfectly
+    well-defined real functional of a complex state -- the adjoint path differentiates *it*,
+    consistently, which is exactly why
+    {py:meth}`~dolfinx_adjoint.blocks.assembly.AssembleBlock.compute_action_adjoint` carries a
+    factor of one half (:math:`\\mathrm{Re}(f(u))`'s Wirtinger derivative is
+    :math:`\\tfrac{1}{2}f'(u)`, not :math:`f'(u)`). Taking the real part is also not optional
+    plumbing: {py:func}`dolfinx.fem.assemble_scalar` returns a complex value under a
+    complex-PETSc build whatever the form's structure.
+
+    The definition lives here, beside the only other assembly in the package, rather than in
+    {py:func}`dolfinx_adjoint.assemble_scalar`: what an assembled rank-0 form means is a fact
+    about assembly, not about tape annotation, and the annotating entry point is a caller of
+    this like any other.
+
+    Args:
+        form: The rank-0 form, symbolic (UFL) or already compiled. A compiled form ignores
+            the compilation options below.
+        jit_options: JIT compilation options.
+        form_compiler_options: Form compiler options.
+        entity_maps: Relations between the meshes of the form's arguments and coefficients.
+
+    Returns:
+        The reduced, real-valued scalar.
+    """
+    if isinstance(form, ufl.Form):
+        form = _compile_form(
+            form,
+            jit_options=jit_options,
+            form_compiler_options=form_compiler_options,
+            entity_maps=entity_maps,
+        )
+    local_output = dolfinx.fem.assemble_scalar(form)
+    output = form.mesh.comm.allreduce(local_output, op=MPI.SUM)
+    # See this function's docstring: J := Re(assemble(form)), unconditionally.
+    return float(numpy.real(output))
+
+
+def _assemble_rank1_form(
+    form: ufl.Form,
+    space: dolfinx.fem.FunctionSpace | None = None,
+    jit_options: dict | None = None,
+    form_compiler_options: dict | None = None,
+    entity_maps: typing.Any = None,
+) -> tuple[_SpecialVector, dolfinx.fem.FunctionSpace]:
+    """Compile a rank-1 form and assemble it into a vector of its own.
+
+    Args:
+        form: The rank-1 form.
+        space: The space its argument lives on. Inferred from the form when not given.
+        jit_options: JIT compilation options.
+        form_compiler_options: Form compiler options.
+        entity_maps: Relations between the meshes of the form's arguments and coefficients.
+
+    Returns:
+        The assembled vector, and the space it lives on -- which a caller assembling a second
+        form into the same space needs, having possibly left it to be inferred here.
+    """
+    compiled_form = _compile_form(
+        form,
+        jit_options=jit_options,
+        form_compiler_options=form_compiler_options,
+        entity_maps=entity_maps,
+    )
+    if space is None:
+        (argument,) = form.arguments()
+        space = argument.ufl_function_space()
+    vector = _create_vector(compiled_form, space)
+    vector.array[:] = 0.0
+    assemble_compiled_form(compiled_form, vector)
+    return vector, space
+
+
+def _assemble_wirtinger_seed(
+    form: ufl.Form,
+    coefficient: typing.Union[ufl.Coefficient, ufl.Constant],
+    argument: ufl.Argument,
+    space: dolfinx.fem.FunctionSpace | None = None,
+    jit_options: dict | None = None,
+    form_compiler_options: dict | None = None,
+    entity_maps: typing.Any = None,
+) -> _SpecialVector:
+    r"""Assemble the adjoint seed of a rank-0 ``form`` with respect to ``coefficient``.
+
+    The one place a seed is derived and assembled, so that the difference between the two
+    scalar types stays here rather than at each call site. Under a real-scalar build the seed
+    is one assembled derivative. Under a complex-scalar build it takes two, combined vector by
+    vector as :math:`\mathrm{Re}(v_1) + i\,\mathrm{Re}(v_2)`; see
+    {py:func}`dolfinx_adjoint.ufl_utils._wirtinger_derivative_forms` for why one derivative is
+    not enough and what the two are.
+
+    Args:
+        form: The rank-0 form to differentiate.
+        coefficient: The coefficient to differentiate with respect to.
+        argument: The direction to differentiate in, an argument over a real-valued basis.
+        space: The space ``argument`` lives on. Inferred from the derivative when not given.
+        jit_options: JIT compilation options.
+        form_compiler_options: Form compiler options.
+        entity_maps: Relations between the meshes of the form's arguments and coefficients.
+
+    Returns:
+        The assembled seed.
+    """
+    dform, dform_imaginary_direction = _wirtinger_derivative_forms(form, coefficient, argument)
+    assert isinstance(dform, ufl.Form), "dform must be a UFL form."
+    if dform.empty():
+        # The form does not depend on this coefficient at all -- a second-order seed of a
+        # Functional that is linear in the state, say, where the first derivative has already
+        # differentiated the state away. The seed is zero, but it still has to be a vector on
+        # the right space, so it is assembled from an explicit zero rather than short-circuited
+        # here: an empty Form is not compilable, while a ZeroBaseForm over the same argument is.
+        dform = ufl.ZeroBaseForm((argument,))
+        dform_imaginary_direction = None
+    vector, space = _assemble_rank1_form(
+        dform,
+        space,
+        jit_options=jit_options,
+        form_compiler_options=form_compiler_options,
+        entity_maps=entity_maps,
+    )
+    if dform_imaginary_direction is not None:
+        imaginary_direction_vector, _ = _assemble_rank1_form(
+            dform_imaginary_direction,
+            space,
+            jit_options=jit_options,
+            form_compiler_options=form_compiler_options,
+            entity_maps=entity_maps,
+        )
+        vector.array[:] = vector.array.real + 1j * imaginary_direction_vector.array.real
+    return vector
 
 
 def assemble_compiled_form(
@@ -21,7 +172,9 @@ def assemble_compiled_form(
             into, while it is unused for a rank-0 form.
     Returns:
         For a rank-1 form, ``tensor`` itself (mutated in place). For a rank-0 form, the
-        assembled scalar as a Python ``float``.
+        assembled scalar as a Python ``float`` -- delegated to
+        {py:func}`_assemble_scalar_value` so that the definition
+        :math:`J := \\mathrm{Re}(\\mathrm{assemble}(form))` is stated in exactly one place.
     Raises:
         NotImplementedError: If the form's rank is not 0 or 1.
     """
@@ -34,9 +187,7 @@ def assemble_compiled_form(
         tensor.scatter_reverse(dolfinx.la.InsertMode.add)
         tensor.scatter_forward()
     elif form.rank == 0:
-        local_val = dolfinx.fem.assemble_scalar(form)
-        comm = form.mesh.comm
-        tensor = comm.allreduce(local_val, op=MPI.SUM)
+        tensor = _assemble_scalar_value(form)
     else:
         raise NotImplementedError("Only 1-form assembly is currently supported.")
     assert tensor is not None
@@ -71,7 +222,7 @@ class AssembleBlock(Block):
 
         # Store compiled and original form
         self.form = form
-        self.compiled_form = dolfinx.fem.form(
+        self.compiled_form = _compile_form(
             form, jit_options=jit_options, form_compiler_options=form_compiler_options, entity_maps=entity_maps
         )
 
@@ -94,7 +245,7 @@ class AssembleBlock(Block):
         form: ufl.Form | None = None,
         c_rep: typing.Union[ufl.Coefficient, ufl.Constant] | None = None,
         space: dolfinx.fem.FunctionSpace | None = None,
-        dform: dolfinx.fem.Form | None = None,
+        dform: ufl.Form | None = None,
     ):
         """This computes the action of the adjoint of the derivative of `form` wrt `c_rep` on `adj_input`.
 
@@ -121,32 +272,50 @@ class AssembleBlock(Block):
         """
         if arity_form == 0:
             assert arity_form == self.compiled_form.rank, "Inconsistent arity of input form and block form."
+            computing_own_output_derivative = dform is None
             if dform is None:
                 assert space is not None
-                dc = ufl.TestFunction(space)
-                dform = ufl.derivative(form, c_rep, dc)
+                assert form is not None and c_rep is not None
+                # Not ufl.derivative directly: under a complex build a single derivative does
+                # not carry enough information to seed the adjoint, and the one UFL produces
+                # breaks its own complex-mode arity rules. See
+                # {py:func}`_assemble_wirtinger_seed`.
+                vector = _assemble_wirtinger_seed(
+                    form,
+                    c_rep,
+                    ufl.TestFunction(space),
+                    space,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
+            else:
+                # An already-derived form (the second-order path's second directional
+                # derivative): the seed it stands for was decided by whoever derived it, so
+                # there is nothing to split here and it is assembled as it comes.
+                assert isinstance(dform, ufl.Form), "dform must be a UFL form."
+                vector, space = _assemble_rank1_form(
+                    dform,
+                    space,
+                    jit_options=self._jit_options,
+                    form_compiler_options=self._form_compiler_options,
+                    entity_maps=self._entity_maps,
+                )
 
-            assert isinstance(dform, ufl.Form), "dform must be a UFL form."
-            compiled_adjoint = dolfinx.fem.form(
-                dform,
-                jit_options=self._jit_options,
-                form_compiler_options=self._form_compiler_options,
-                entity_maps=self._entity_maps,
-            )
+            if computing_own_output_derivative and numpy.iscomplexobj(vector.array):
+                # This block's own forward output is Re(assemble(form)) (`assemble_scalar`
+                # takes the real part unconditionally under a complex-PETSc build, since a
+                # Functional must be real-valued even when the state is complex-valued), while
+                # the seed above differentiates the underlying *complex* form. A real
+                # parameter's gradient is recovered from an accumulated seed as `2*Re[.]`, in
+                # `Function._ad_convert_riesz`; the derivative of Re(f) wanted here is one
+                # half of that, so the one-half is applied at this end. Only applies when the
+                # seed is freshly derived from `form` here (this block's own output); a
+                # caller-supplied `dform` (e.g. the Hessian path's second directional
+                # derivative) is a different quantity and is left untouched -- complex-mode
+                # Hessians are not yet supported.
+                vector.array[:] *= 0.5
 
-            if space is None:
-                # If space is not supplied infer it from the form
-                assert len(dform.arguments()) == 1
-                space = dform.arguments()[0].ufl_function_space()
-                # self._cached_vectors[id(space)] = _create_vector(compiled_adjoint)
-            vector = _create_vector(compiled_adjoint, space)
-            vector.array[:] = 0.0
-            # elif self._cached_vectors.get(id(space)) is None:
-            # Create a new vector for this space
-            # self._cached_vectors[id(space)] = _create_vector(compiled_adjoint)
-            # self._cached_vectors[id(space)].array[:] = 0.0
-            # assemble_compiled_form(compiled_adjoint, self._cached_vectors[id(space)])
-            assemble_compiled_form(compiled_adjoint, vector)
             # return a vector scaled by the scalar `adj_input`
             # Safegaurd against None seeds from PyAdjoint
             if adj_input is None:
@@ -154,7 +323,11 @@ class AssembleBlock(Block):
             vector.array[:] *= vector.x.array.dtype.type(adj_input)
             vector.scatter_forward()
 
-            return vector, dform
+            # Returns the raw complex result under a complex build: this may be an adjoint
+            # seed bound for a Block further upstream, so its real part must not be taken
+            # here. The `2*Re[.]` that turns an accumulated seed into a real parameter's
+            # gradient happens once, at the Control, in `Function._ad_convert_riesz`.
+            return vector
             # Return a Vector scaled by the scalar `adj_input`
             # self._cached_vectors[id(space)].array[:] *= adj_input
             # self._cached_vectors[id(space)].scatter_forward()
@@ -214,7 +387,7 @@ class AssembleBlock(Block):
         #     c_rep = dolfin.SpatialCoordinate(c_rep)
         #     space = c._ad_function_space()
 
-        return self.compute_action_adjoint(adj_input, arity_form, form, c_rep, space)[0]
+        return self.compute_action_adjoint(adj_input, arity_form, form, c_rep, space)
 
     def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs):
         return self.prepare_evaluate_adj(inputs, tlm_inputs, self.get_dependencies())
@@ -238,7 +411,7 @@ class AssembleBlock(Block):
                 dform += ufl.derivative(form, c_rep, tlm_value)
         if not isinstance(dform, float):
             dform = ufl.algorithms.expand_derivatives(dform)
-            compiled_form = dolfinx.fem.form(
+            compiled_form = _compile_form(
                 dform,
                 jit_options=self._jit_options,
                 form_compiler_options=self._form_compiler_options,
@@ -286,8 +459,26 @@ class AssembleBlock(Block):
         #     space = c1._ad_function_space()
         else:
             return None
-        hessian_outputs, dform = self.compute_action_adjoint(hessian_input, arity_form, form, c1_rep, space)
-        ddform = 0.0
+        hessian_outputs = self.compute_action_adjoint(hessian_input, arity_form, form, c1_rep, space)
+
+        # The remaining term seeds `c1` from this block's output *derivative* in the
+        # tangent-linear direction, rather than from the output itself. That derivative is
+        # `tlm_form` below -- the very form `evaluate_tlm_component` assembles -- and the
+        # second-order seed of it is the first-order seed machinery applied to it unchanged.
+        #
+        # Deriving it that way rather than by differentiating the already-derived `dform` a
+        # second time is what makes the complex-scalar case come out: this block's output is
+        # Re(assemble(form)), so its directional derivative is Re(assemble(tlm_form)), and
+        # seeding a real part correctly needs the two Wirtinger derivatives and the one-half
+        # that `compute_action_adjoint` already applies to a form it is handed as `form`. A
+        # form handed in as `dform` gets neither, since by then the seed it stands for has
+        # already been decided. The two constructions agree term by term under a real build,
+        # where differentiation simply commutes.
+        # ZeroBaseForm rather than 0.0 as the identity to sum onto: a dependency with no
+        # tangent-linear value contributes nothing, and starting from a float would leave the
+        # sum a float in the case where *every* dependency does, which then needs testing for
+        # separately from an empty form.
+        tlm_form = ufl.ZeroBaseForm(())
         for other_idx, bv in relevant_dependencies:
             c2_rep = bv.saved_output
             tlm_input = bv.tlm_value
@@ -297,14 +488,13 @@ class AssembleBlock(Block):
 
             if isinstance(c2_rep, dolfinx.mesh.Mesh):
                 X = ufl.SpatialCoordinate(c2_rep)
-                ddform += ufl.derivative(dform, X, tlm_input)
+                tlm_form += ufl.derivative(form, X, tlm_input)
             else:
-                ddform += ufl.derivative(dform, c2_rep, tlm_input)
-        if not isinstance(ddform, float):
-            ddform = ufl.algorithms.expand_derivatives(ddform)
+                tlm_form += ufl.derivative(form, c2_rep, tlm_input)
+        tlm_form = ufl.algorithms.expand_derivatives(tlm_form)
 
-        if not ddform.empty():
-            adj_action = self.compute_action_adjoint(adj_input, arity_form, dform=ddform)[0]
+        if not tlm_form.empty():
+            adj_action = self.compute_action_adjoint(adj_input, arity_form, tlm_form, c1_rep, space)
             try:
                 hessian_outputs += adj_action
             except TypeError:
@@ -315,16 +505,11 @@ class AssembleBlock(Block):
         return self.prepare_evaluate_adj(inputs, None, None)
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
-        form = prepared
-
-        compiled_form = dolfinx.fem.form(
-            form,
-            jit_options=self._jit_options,
-            form_compiler_options=self._form_compiler_options,
-            entity_maps=self._entity_maps,
+        return create_overloaded_object(
+            _assemble_scalar_value(
+                prepared,
+                jit_options=self._jit_options,
+                form_compiler_options=self._form_compiler_options,
+                entity_maps=self._entity_maps,
+            )
         )
-        local_output = dolfinx.fem.assemble_scalar(compiled_form)
-        comm = compiled_form.mesh.comm
-        output = comm.allreduce(local_output, op=MPI.SUM)
-        output = create_overloaded_object(output)
-        return output

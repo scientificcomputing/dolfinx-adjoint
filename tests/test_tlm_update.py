@@ -40,6 +40,26 @@ def mesh_2D():
     return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 7)
 
 
+def _keep_problem_alive(rf, problem):
+    """Pin ``problem`` to ``rf`` so it outlives the helper frame that built it.
+
+    A block holds only a weakref to its owning Problem
+    (``LinearProblemBlock._problem_ref``), so a Problem that dies when the helper which
+    created it returns leaves the recorded blocks holding a dead reference; each rebuilds
+    an equivalent Problem -- fresh uncompiled forms, fresh PETSc solvers -- on the first
+    replay. The Hessian checks below evaluate and re-evaluate the tape at several points,
+    so the rebuild would be paid on every one of them.
+
+    Attaching it to the ReducedFunctional ties the Problem's lifetime to the object that
+    drives the replay, which is exactly as long as the blocks can need it.
+
+    Returns:
+        ``rf``, so this can wrap a return value in place.
+    """
+    rf._dxa_problem = problem
+    return rf
+
+
 def _viscous_stokes(mesh):
     """Blocked Stokes-like problem whose control ``mu`` sits inside ``a[0][0]``.
 
@@ -66,9 +86,12 @@ def _viscous_stokes(mesh):
 
     a = [
         [ufl.inner(mu * ufl.grad(u), ufl.grad(v)) * dx, ufl.inner(p, ufl.div(v)) * dx],
-        [ufl.inner(q, ufl.div(u)) * dx, None],
+        [ufl.inner(ufl.div(u), q) * dx, None],
     ]
-    L = [ufl.inner(f, v) * dx, dolfinx.fem.Constant(mesh, 0.0) * q * dx]
+    L = [
+        ufl.inner(f, v) * dx,
+        ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)), q) * dx,
+    ]
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -92,7 +115,7 @@ def _viscous_stokes(mesh):
     # stay well above round-off: a functional dominated by a control-independent term
     # bottoms out at machine precision before the third-order rate is visible.
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
-    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), Z
+    return _keep_problem_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), problem), Z
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])
@@ -161,7 +184,7 @@ def _navier_stokes(mesh):
         + ufl.inner(ph, ufl.div(v)) * dx
         - ufl.inner(f, v) * dx
     )
-    F1 = ufl.inner(q, ufl.div(uh)) * dx
+    F1 = ufl.inner(ufl.div(uh), q) * dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -203,7 +226,7 @@ def _navier_stokes(mesh):
     # Quartic in the state and with no constant offset, for the same round-off-avoidance
     # reason as _viscous_stokes's objective.
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
-    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), Z
+    return _keep_problem_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), problem), Z
 
 
 def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(
@@ -272,7 +295,7 @@ def _diffusive_poisson(mesh):
     # Quartic in the state, for the same round-off-avoidance reason as
     # ``_viscous_stokes``'s objective.
     J = assemble_scalar(uh**4 * dx)
-    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(m)), Z
+    return _keep_problem_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(m)), problem), Z
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])
