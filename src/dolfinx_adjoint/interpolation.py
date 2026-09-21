@@ -58,10 +58,19 @@ def interpolate_nonmatching(
     maxit: int = 15,
     **kwargs,
 ):
-    """Interpolate a Function into a different function space on a non-matching mesh."""
+    """Interpolate a Function into a different function space on a non-matching mesh.
+
+    ``kwargs`` accepts ``red_op`` (a custom ``fenicsx_ii`` reduction operator, used by the
+    adjoint/TLM/Hessian and any recompute), ``petsc_mat`` (build the transfer matrix as a
+    PETSc matrix rather than a native CSR one), and ``matrix_workspace`` -- an
+    already-built transfer matrix/workspace to reuse instead of assembling a new one. Pass
+    the latter when this call recurs with the same ``red_op`` and spaces (for instance once
+    per timestep of a time-dependent forward model), to avoid rebuilding it every time.
+    """
     ad_block_tag = kwargs.pop("ad_block_tag", None)
     petsc_mat = kwargs.pop("petsc_mat", False)
     red_op = kwargs.pop("red_op", None)
+    matrix_workspace = kwargs.pop("matrix_workspace", None)
 
     if red_op is not None and (cells is not None or interpolation_data is not None):
         warnings.warn(
@@ -108,6 +117,7 @@ def interpolate_nonmatching(
             red_op=red_op,
             ad_block_tag=ad_block_tag,
             use_petsc=petsc_mat,
+            matrix_workspace=matrix_workspace,
         )
 
         tape.add_block(block)
