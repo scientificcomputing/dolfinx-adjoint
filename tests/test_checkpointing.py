@@ -75,29 +75,6 @@ def isolated_tape():
             options.delValue(key)
 
 
-def _keep_problem_alive(rf, problem):
-    """Pin ``problem`` to ``rf`` so it outlives the helper frame that built it.
-
-    A block holds only a weakref to its owning Problem
-    (``LinearProblemBlock._problem_ref``), so a Problem that dies when the helper which
-    created it returns leaves every block this tape recorded holding a dead reference.
-    Each of them then rebuilds its own equivalent Problem -- with fresh, uncompiled forms
-    and fresh PETSc solvers -- on the first replay, turning the single shared Problem a
-    time loop was given into one per time step. A checkpointed tape replays the forward
-    repeatedly by design, so this is the worst place in the suite to pay that cost, and
-    with a long enough loop the retained Functions can exhaust MPICH's communicator table
-    outright (see ``LinearProblemBlock._rebuild_problem``).
-
-    Attaching it to the ReducedFunctional ties the Problem's lifetime to the object that
-    drives the replay, which is exactly as long as the blocks can need it.
-
-    Returns:
-        ``rf``, so this can wrap a return value in place.
-    """
-    rf._dxa_problem = problem
-    return rf
-
-
 def _perturbation_directions(V, n):
     """Perturbation directions for a Taylor test.
 
@@ -184,7 +161,7 @@ def _tape_heat_equation(V, n_steps, schedule=None, disk=False, use_mpio=None):
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
-    return _keep_problem_alive(rf, problem), controls, _perturbation_directions(V, n_steps)
+    return problem.keep_alive(rf), controls, _perturbation_directions(V, n_steps)
 
 
 def _gradient(rf, controls):
@@ -286,7 +263,7 @@ def _tape_bc_control_heat_equation(V, n_steps, schedule=None, disk=False):
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
-    return _keep_problem_alive(rf, problem), controls, _perturbation_directions(V, n_steps)
+    return problem.keep_alive(rf), controls, _perturbation_directions(V, n_steps)
 
 
 def _bc_control_schedule(kind, n_steps):
@@ -449,7 +426,7 @@ def _tape_snes_heat_equation(V, n_steps, schedule=None, solution_dependent_diffu
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
-    return _keep_problem_alive(rf, problem), controls, _perturbation_directions(V, n_steps)
+    return problem.keep_alive(rf), controls, _perturbation_directions(V, n_steps)
 
 
 @pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])

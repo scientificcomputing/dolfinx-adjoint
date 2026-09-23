@@ -40,26 +40,6 @@ def mesh_2D():
     return dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 7)
 
 
-def _keep_problem_alive(rf, problem):
-    """Pin ``problem`` to ``rf`` so it outlives the helper frame that built it.
-
-    A block holds only a weakref to its owning Problem
-    (``LinearProblemBlock._problem_ref``), so a Problem that dies when the helper which
-    created it returns leaves the recorded blocks holding a dead reference; each rebuilds
-    an equivalent Problem -- fresh uncompiled forms, fresh PETSc solvers -- on the first
-    replay. The Hessian checks below evaluate and re-evaluate the tape at several points,
-    so the rebuild would be paid on every one of them.
-
-    Attaching it to the ReducedFunctional ties the Problem's lifetime to the object that
-    drives the replay, which is exactly as long as the blocks can need it.
-
-    Returns:
-        ``rf``, so this can wrap a return value in place.
-    """
-    rf._dxa_problem = problem
-    return rf
-
-
 def _viscous_stokes(mesh):
     """Blocked Stokes-like problem whose control ``mu`` sits inside ``a[0][0]``.
 
@@ -115,7 +95,7 @@ def _viscous_stokes(mesh):
     # stay well above round-off: a functional dominated by a control-independent term
     # bottoms out at machine precision before the third-order rate is visible.
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
-    return _keep_problem_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), problem), Z
+    return problem.keep_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu))), Z
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])
@@ -226,7 +206,7 @@ def _navier_stokes(mesh):
     # Quartic in the state and with no constant offset, for the same round-off-avoidance
     # reason as _viscous_stokes's objective.
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
-    return _keep_problem_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), problem), Z
+    return problem.keep_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu))), Z
 
 
 def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(
@@ -295,7 +275,7 @@ def _diffusive_poisson(mesh):
     # Quartic in the state, for the same round-off-avoidance reason as
     # ``_viscous_stokes``'s objective.
     J = assemble_scalar(uh**4 * dx)
-    return _keep_problem_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(m)), problem), Z
+    return problem.keep_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(m))), Z
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])

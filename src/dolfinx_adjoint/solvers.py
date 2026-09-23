@@ -33,6 +33,8 @@ from .utils import _compile_form, _explaining_scalar_type_mismatch
 # in a well-formed SPMD program.
 _PROBLEM_PREFIX_COUNTER = itertools.count()
 
+_T = typing.TypeVar("_T")
+
 
 @typing.overload
 def find_or_create_then_overload(u: _Function | None, L: ufl.BaseForm) -> _Function: ...
@@ -211,6 +213,36 @@ class _ProblemBase(abc.ABC):
     _tlm_options: dict | None
     _petsc_options_prefix: str
     _kind: typing.Any
+
+    def keep_alive(self, owner: _T) -> _T:
+        """Tie this Problem's lifetime to ``owner``, and return ``owner``.
+
+        The blocks this Problem records hold it only through a weakref (see
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.get_reference_problem`),
+        so a Problem built inside a helper function and not kept by the caller dies when
+        that helper returns. Every block recorded from it is then left with a dead
+        reference and rebuilds an equivalent Problem -- fresh, uncompiled forms and fresh
+        PETSc solvers -- on the first replay, once per block rather than once for the
+        whole tape.
+
+        Attaching the Problem to the {py:class}`~pyadjoint.ReducedFunctional` that drives
+        the replay keeps it alive for exactly as long as those blocks can need it::
+
+            return problem.keep_alive(pyadjoint.ReducedFunctional(J, control))
+
+        Args:
+            owner: Object to attach this Problem to; typically the
+                {py:class}`~pyadjoint.ReducedFunctional` built from the same solve.
+
+        Returns:
+            ``owner``, so this can wrap a return value in place.
+        """
+        self_refs = getattr(owner, "_dxa_problems", None)
+        if self_refs is None:
+            self_refs = []
+            owner._dxa_problems = self_refs
+        self_refs.append(self)
+        return owner
 
     @property
     def value_placeholders(self) -> dict[dolfinx.fem.Function, dolfinx.fem.Function]:
