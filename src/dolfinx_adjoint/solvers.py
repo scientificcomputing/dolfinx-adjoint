@@ -19,17 +19,21 @@ from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
 from .typing_utils import MaybeBlocked, MaybeBlockedMatrix
 from .ufl_utils import (
+    _conjugate_hermitian_pairing,
     assign_mixed_parts,
     compute_adjoint,
     get_sorted_arguments,
     recursive_replace,
     sum_form,
 )
+from .utils import _compile_form, _explaining_scalar_type_mismatch
 
 # A counter incremented once per Problem construction is deterministic
 # and identical on every rank, since construction happens in lock-step
 # in a well-formed SPMD program.
 _PROBLEM_PREFIX_COUNTER = itertools.count()
+
+_T = typing.TypeVar("_T")
 
 
 @typing.overload
@@ -173,7 +177,7 @@ def _build_soa_self_template(
         soa_self_form = ufl.ZeroBaseForm((dFdu_template.arguments()[0],))
     else:
         soa_self_form = ufl.action(ufl.adjoint(d2Fdu2), adjoint_solution_placeholder)
-    return dolfinx.fem.form(  # type: ignore[call-overload]
+    return _compile_form(  # type: ignore[call-overload]
         soa_self_form,
         jit_options=jit_options,
         form_compiler_options=form_compiler_options,
@@ -209,6 +213,36 @@ class _ProblemBase(abc.ABC):
     _tlm_options: dict | None
     _petsc_options_prefix: str
     _kind: typing.Any
+
+    def keep_alive(self, owner: _T) -> _T:
+        """Tie this Problem's lifetime to ``owner``, and return ``owner``.
+
+        The blocks this Problem records hold it only through a weakref (see
+        {py:meth}`~dolfinx_adjoint.blocks.solvers._ProblemBlockBase.get_reference_problem`),
+        so a Problem built inside a helper function and not kept by the caller dies when
+        that helper returns. Every block recorded from it is then left with a dead
+        reference and rebuilds an equivalent Problem -- fresh, uncompiled forms and fresh
+        PETSc solvers -- on the first replay, once per block rather than once for the
+        whole tape.
+
+        Attaching the Problem to the {py:class}`~pyadjoint.ReducedFunctional` that drives
+        the replay keeps it alive for exactly as long as those blocks can need it::
+
+            return problem.keep_alive(pyadjoint.ReducedFunctional(J, control))
+
+        Args:
+            owner: Object to attach this Problem to; typically the
+                {py:class}`~pyadjoint.ReducedFunctional` built from the same solve.
+
+        Returns:
+            ``owner``, so this can wrap a return value in place.
+        """
+        self_refs = getattr(owner, "_dxa_problems", None)
+        if self_refs is None:
+            self_refs = []
+            owner._dxa_problems = self_refs
+        self_refs.append(self)
+        return owner
 
     @property
     def value_placeholders(self) -> dict[dolfinx.fem.Function, dolfinx.fem.Function]:
@@ -406,7 +440,7 @@ class _ProblemBase(abc.ABC):
                 else:
                     if dFdm_c == 0 or dFdm_c.empty():
                         dFdm_c = ufl.ZeroBaseForm((test_funcs[0],))
-                templates[c] = dolfinx.fem.form(
+                templates[c] = _compile_form(
                     dFdm_c,
                     jit_options=self._jit_options,
                     form_compiler_options=self._form_compiler_options,
@@ -519,7 +553,7 @@ class _ProblemBase(abc.ABC):
             F_template, _ = self._get_or_build_residual_template()
             test_funcs = list(get_sorted_arguments(F_template.arguments(), 0))
             return [
-                dolfinx.fem.form(  # type: ignore[return-value]
+                _compile_form(  # type: ignore[return-value]
                     form_i,  # type: ignore[arg-type]
                     jit_options=self._jit_options,
                     form_compiler_options=self._form_compiler_options,
@@ -528,7 +562,7 @@ class _ProblemBase(abc.ABC):
                 for form_i in _pad_blocks_by_part(reaction_form, test_funcs)
             ]
         else:
-            return dolfinx.fem.form(
+            return _compile_form(
                 reaction_form,
                 jit_options=self._jit_options,
                 form_compiler_options=self._form_compiler_options,
@@ -587,7 +621,7 @@ class _ProblemBase(abc.ABC):
                 # padded via _pad_blocks_by_part for any row a differentiation
                 # happened to eliminate entirely.
                 soa_self = [
-                    dolfinx.fem.form(
+                    _compile_form(
                         form_i,  # type: ignore[arg-type]
                         jit_options=self._jit_options,
                         form_compiler_options=self._form_compiler_options,
@@ -646,7 +680,7 @@ class _ProblemBase(abc.ABC):
                 if not (soa_form == 0 or soa_form.empty()):
                     if blocked:
                         soa_cross_templates[c] = [
-                            dolfinx.fem.form(
+                            _compile_form(
                                 form_i,  # type: ignore[arg-type]
                                 jit_options=self._jit_options,
                                 form_compiler_options=self._form_compiler_options,
@@ -655,7 +689,7 @@ class _ProblemBase(abc.ABC):
                             for form_i in _pad_blocks_by_part(soa_form, test_funcs)
                         ]
                     else:
-                        soa_cross_templates[c] = dolfinx.fem.form(
+                        soa_cross_templates[c] = _compile_form(
                             soa_form,
                             jit_options=self._jit_options,
                             form_compiler_options=self._form_compiler_options,
@@ -670,10 +704,16 @@ class _ProblemBase(abc.ABC):
                 dL1dm = ufl.derivative(L1, c_placeholder, dc)
                 dL2dm = ufl.derivative(L2, c_placeholder, dc)
                 d2Fdudm = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, state_arg, self._hessian_u_seed))
-                fixed_form = ufl.algorithms.expand_derivatives(dL2dm + d2Fdudm)
+                # L1/L2 contract the residual against an adjoint solution, which a complex
+                # build pairs the other way round from the seed convention -- see
+                # ufl_utils._conjugate_hermitian_pairing. A real build returns these
+                # untouched.
+                fixed_form = ufl.algorithms.expand_derivatives(
+                    _conjugate_hermitian_pairing(dL2dm) + _conjugate_hermitian_pairing(d2Fdudm)
+                )
                 if fixed_form == 0 or fixed_form.empty():
                     fixed_form = ufl.ZeroBaseForm((dc,))
-                fixed_templates[c] = dolfinx.fem.form(
+                fixed_templates[c] = _compile_form(
                     fixed_form,
                     jit_options=self._jit_options,
                     form_compiler_options=self._form_compiler_options,
@@ -684,10 +724,12 @@ class _ProblemBase(abc.ABC):
                 # dependency c2's tangent-linear direction, reusing dL1dm.
                 for c2, c2_placeholder in self._value_placeholders.items():
                     seed2 = seed_placeholders[c2]
-                    cross_form = ufl.algorithms.expand_derivatives(ufl.derivative(dL1dm, c2_placeholder, seed2))
+                    cross_form = ufl.algorithms.expand_derivatives(
+                        _conjugate_hermitian_pairing(ufl.derivative(dL1dm, c2_placeholder, seed2))
+                    )
                     if cross_form == 0 or cross_form.empty():
                         continue
-                    cross_templates[(c, c2)] = dolfinx.fem.form(
+                    cross_templates[(c, c2)] = _compile_form(
                         cross_form,
                         jit_options=self._jit_options,
                         form_compiler_options=self._form_compiler_options,
@@ -938,19 +980,23 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
             c: dolfinx.fem.Function(c.function_space) for c in sorted_coefficients
         }
         a_R, L_R, P_R = recursive_replace((a, L, P), self._value_placeholders)  # type: ignore[misc]
-        super().__init__(
-            a=a_R,  # type: ignore[arg-type]
-            L=L_R,  # type: ignore[arg-type]
-            bcs=bcs,
-            u=self._u,  # type: ignore[arg-type]
-            P=P_R,  # type: ignore[arg-type]
-            kind=kind,  # type: ignore[arg-type]
-            petsc_options_prefix=petsc_options_prefix,
-            petsc_options=petsc_options,
-            form_compiler_options=form_compiler_options,
-            jit_options=jit_options,
-            entity_maps=entity_maps,
-        )  # type: ignore[misc]
+        # The forms are compiled here, so this is where a coefficient carrying the wrong
+        # scalar dtype first fails -- several layers down, naming neither dtype nor
+        # coefficient. See {py:func}`dolfinx_adjoint.utils.scalar_type_mismatch_message`.
+        with _explaining_scalar_type_mismatch((a_R, L_R, P_R)):
+            super().__init__(
+                a=a_R,  # type: ignore[arg-type]
+                L=L_R,  # type: ignore[arg-type]
+                bcs=bcs,
+                u=self._u,  # type: ignore[arg-type]
+                P=P_R,  # type: ignore[arg-type]
+                kind=kind,  # type: ignore[arg-type]
+                petsc_options_prefix=petsc_options_prefix,
+                petsc_options=petsc_options,
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )  # type: ignore[misc]
 
         # Match the adjoint/TLM solvers' matrix layout to whatever `kind` the
         # forward solver actually resolved to (kind=None can auto-resolve to
@@ -1157,19 +1203,22 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
 
         # Initialize nonlinear solver
         F_R, J_R, P_R = recursive_replace((F, J, P), self._value_placeholders)  # type: ignore[misc]
-        super().__init__(
-            F=F_R,  # type: ignore[arg-type]
-            J=J_R,  # type: ignore[arg-type]
-            P=P_R,  # type: ignore[arg-type]
-            bcs=self._bcs,
-            u=self._u,  # type: ignore[arg-type]
-            kind=kind,  # type: ignore[arg-type]
-            petsc_options_prefix=petsc_options_prefix,
-            petsc_options=petsc_options,
-            form_compiler_options=form_compiler_options,
-            jit_options=jit_options,
-            entity_maps=entity_maps,
-        )  # type: ignore[misc]
+        # As in LinearProblem above: compiling here is where a wrong-dtype coefficient
+        # first fails, in a message that names neither dtype nor coefficient.
+        with _explaining_scalar_type_mismatch((F_R, J_R, P_R)):
+            super().__init__(
+                F=F_R,  # type: ignore[arg-type]
+                J=J_R,  # type: ignore[arg-type]
+                P=P_R,  # type: ignore[arg-type]
+                bcs=self._bcs,
+                u=self._u,  # type: ignore[arg-type]
+                kind=kind,  # type: ignore[arg-type]
+                petsc_options_prefix=petsc_options_prefix,
+                petsc_options=petsc_options,
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )  # type: ignore[misc]
 
         # Adjoint and tangent-linear solver state: shared lazy-init machinery
         # lives in _ProblemBase._init_adjoint_state -- see LinearProblem's use

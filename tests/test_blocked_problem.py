@@ -51,13 +51,13 @@ def test_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches_finite_di
         return ufl.inner(p, ufl.div(v)) * dx
 
     def a10(q, u):
-        return ufl.inner(q, ufl.div(u)) * dx
+        return ufl.inner(ufl.div(u), q) * dx
 
     def L0(f, v):
         return ufl.inner(f, v) * dx
 
     def L1(mesh, q):
-        return dolfinx.fem.Constant(mesh, 0.0) * q * dx
+        return ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)), q) * dx
 
     Z = dolfinx.fem.functionspace(mesh, ("DG", 0, (mesh.geometry.dim,)))
     f = Function(Z, name="control")
@@ -247,7 +247,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches
             + ufl.inner(ufl.dot(ufl.grad(uh), uh), v) * dx
             + ufl.inner(ph, ufl.div(v)) * dx
             - ufl.inner(f, v) * dx
-            + ufl.inner(q, ufl.div(uh)) * dx
+            + ufl.inner(ufl.div(uh), q) * dx
         )
     else:
         v, q = ufl.TestFunction(V), ufl.TestFunction(Q)
@@ -256,7 +256,7 @@ def test_nonlinear_solver(use_mixed_space: bool, mesh_2D, assert_hessian_matches
             + ufl.inner(ufl.dot(ufl.grad(uh), uh), v) * dx
             + ufl.inner(ph, ufl.div(v)) * dx
             - ufl.inner(f, v) * dx,
-            ufl.inner(q, ufl.div(uh)) * dx,
+            ufl.inner(ufl.div(uh), q) * dx,
         ]
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -353,7 +353,7 @@ def test_nonlinear_blocked_dirichletbc_control(mesh_2D, assert_hessian_matches_f
     # Fixed (untracked, not the control here) viscosity -- a plain dolfinx.fem.Constant
     # never appears in ufl.Form.coefficients(), so it is never registered as a tape
     # dependency, matching how test_solver's own fixed bc value is untracked.
-    mu = dolfinx.fem.Constant(mesh, 0.08)
+    mu = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.08))
     uh, ph = Function(V, name="velocity"), Function(Q, name="pressure")
 
     x = ufl.SpatialCoordinate(mesh)
@@ -365,7 +365,7 @@ def test_nonlinear_blocked_dirichletbc_control(mesh_2D, assert_hessian_matches_f
         + ufl.inner(ufl.dot(ufl.grad(uh), uh), v) * dx
         + ufl.inner(ph, ufl.div(v)) * dx
         - ufl.inner(f, v) * dx,
-        ufl.inner(q, ufl.div(uh)) * dx,
+        ufl.inner(ufl.div(uh), q) * dx,
     ]
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -456,7 +456,10 @@ def test_blocked_dirichletbc_control_on_second_block(mesh_2D):
         [ufl.inner(ufl.grad(u0), ufl.grad(v0)) * dx, None],
         [None, ufl.inner(ufl.grad(u1), ufl.grad(v1)) * dx],
     ]
-    L = [ufl.inner(f, v0) * dx, ufl.inner(dolfinx.fem.Constant(mesh, 0.0), v1) * dx]
+    L = [
+        ufl.inner(f, v0) * dx,
+        ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)), v1) * dx,
+    ]
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -467,7 +470,7 @@ def test_blocked_dirichletbc_control_on_second_block(mesh_2D):
     # investigation (see AGENTS.md-adjacent dxa notes) already found produces a spuriously
     # huge, non-smooth "solution" from a direct LU factorization).
     boundary_dofs_0 = dolfinx.fem.locate_dofs_topological(V0, mesh.topology.dim - 1, boundary_facets)
-    bc0 = dolfinx.fem.dirichletbc(dolfinx.fem.Constant(mesh, 0.0), boundary_dofs_0, V0)
+    bc0 = dolfinx.fem.dirichletbc(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)), boundary_dofs_0, V0)
 
     boundary_dofs = dolfinx.fem.locate_dofs_topological(V1, mesh.topology.dim - 1, boundary_facets)
 
@@ -572,12 +575,12 @@ def test_blocked_dirichletbc_control_with_entity_maps(mesh_2D):
         [ufl.inner(ufl.grad(u0), ufl.grad(v0)) * dx0, None],
         [None, ufl.inner(ufl.grad(u1), ufl.grad(v1)) * dx1],
     ]
-    L = [ufl.inner(f, v0) * dx0, ufl.inner(dolfinx.fem.Constant(mesh1, 0.0), v1) * dx1]
+    L = [ufl.inner(f, v0) * dx0, ufl.inner(dolfinx.fem.Constant(mesh1, dolfinx.default_scalar_type(0.0)), v1) * dx1]
 
     mesh0.topology.create_connectivity(mesh0.topology.dim - 1, mesh0.topology.dim)
     boundary_facets0 = dolfinx.mesh.exterior_facet_indices(mesh0.topology)
     boundary_dofs0 = dolfinx.fem.locate_dofs_topological(V0, mesh0.topology.dim - 1, boundary_facets0)
-    bc0 = dolfinx.fem.dirichletbc(dolfinx.fem.Constant(mesh0, 0.0), boundary_dofs0, V0)
+    bc0 = dolfinx.fem.dirichletbc(dolfinx.fem.Constant(mesh0, dolfinx.default_scalar_type(0.0)), boundary_dofs0, V0)
 
     mesh1.topology.create_connectivity(mesh1.topology.dim - 1, mesh1.topology.dim)
     boundary_facets1 = dolfinx.mesh.exterior_facet_indices(mesh1.topology)

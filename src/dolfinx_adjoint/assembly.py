@@ -1,7 +1,5 @@
 import typing
 
-from mpi4py import MPI
-
 import dolfinx
 import numpy
 import numpy.typing as npt
@@ -9,36 +7,50 @@ import ufl
 from pyadjoint.overloaded_type import create_overloaded_object
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 
-from .blocks.assembly import AssembleBlock
+from .blocks.assembly import AssembleBlock, _assemble_scalar_value
 
 
-def assemble_scalar(form: ufl.Form, **kwargs):
-    """Assemble as scalar value from a form.
+def assemble_scalar(form: typing.Union[ufl.Form, dolfinx.fem.Form], **kwargs):
+    """Assemble a rank-0 form into a real scalar, annotating it onto the tape.
+
+    The annotating entry point for
+    {py:func}`dolfinx_adjoint.blocks.assembly._assemble_scalar_value`, which does the
+    assembly and states what the assembled quantity *is* -- in particular that under a
+    complex-scalar build the real part is taken unconditionally,
+    :math:`J := \\mathrm{Re}(\\mathrm{assemble}(form))`. See it for why that is a definition
+    rather than error-correction. This function adds only the tape block.
 
     Args:
-        form: Symbolic form (UFL) to assemble.
+        form: Symbolic form (UFL) to assemble, or an already-compiled rank-0
+            {py:class}`dolfinx.fem.Form`. A compiled form cannot be annotated onto the tape
+            (recording a block needs the symbolic form), so it requires ``annotate=False``.
         kwargs: Keyword arguments to pass to the assembly routine.
             Includes ``"ad_block_tag"`` to tag the block in the adjoint tape,
             ``"annotate"`` to control whether the assembly is annotated in the adjoint tape,
             ``"jit_options"`` for JIT compilation options,
             ``"form_compiler_options"`` for form compiler options, and ``"entity_maps"`` for
             assembling with Arguments and coefficients form meshes that has some relation.
+
+    Raises:
+        ValueError: If an already-compiled form is passed with annotation enabled.
     """
     ad_block_tag = kwargs.pop("ad_block_tag", None)
 
     annotate = annotate_tape(kwargs)
+    already_compiled = not isinstance(form, ufl.Form)
+    if already_compiled and annotate:
+        raise ValueError(
+            "assemble_scalar cannot annotate an already-compiled form -- recording a block "
+            "requires the symbolic UFL form. Pass the UFL form, or annotate=False."
+        )
+
     with stop_annotating():
-        compiled_form = dolfinx.fem.form(
+        output = _assemble_scalar_value(
             form,
             jit_options=kwargs.pop("jit_options", None),
             form_compiler_options=kwargs.pop("form_compiler_options", None),
             entity_maps=kwargs.pop("entity_maps", None),
         )
-
-        local_output = dolfinx.fem.assemble_scalar(compiled_form)
-        comm = compiled_form.mesh.comm
-        output = comm.allreduce(local_output, op=MPI.SUM)
-        assert isinstance(output, float)
 
     output = create_overloaded_object(output)
 

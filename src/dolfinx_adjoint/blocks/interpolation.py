@@ -33,6 +33,66 @@ def _import_scifem():
     return scifem
 
 
+def _elementwise_dual_evaluation_is_a_reshape(space_to: dolfinx.fem.FunctionSpace) -> bool:
+    """Whether interpolating into ``space_to`` is nothing but a reshape of point values.
+
+    True for the element families a tape's interpolations are written in (Lagrange, DG):
+    an identity pullback, a dual basis that is point evaluation, and no dof transformations
+    between the reference and physical cell. Where any of those does not hold, assembling the
+    cell-local operator involves Jacobians, the element's interpolation matrix and a
+    permutation, which :py:mod:`scifem` already implements.
+    """
+    return (
+        isinstance(space_to.ufl_element().pullback, ufl.pullback.IdentityPullback)
+        and bool(space_to.element.interpolation_ident)
+        and not space_to.element.needs_dof_transformations
+    )
+
+
+def _prepare_interpolation_data(expr: ufl.core.expr.Expr, space_to: dolfinx.fem.FunctionSpace) -> np.ndarray:
+    """Cell-local interpolation data for ``expr``, as ``(cells, dofs_to, dofs_from)``.
+
+    Mirrors {py:func}`scifem.prepare_interpolation_data`, which refuses a complex-scalar build
+    outright -- it allocates its intermediates as ``float64``, so a complex expression would
+    silently lose its imaginary part. The entries of this operator are genuinely complex as
+    soon as the interpolated expression carries a complex coefficient, so the refusal cannot
+    simply be lifted; the data has to be built in the expression's own dtype.
+
+    Rather than reimplement the general case, this covers the element families where the
+    computation is a reshape of the evaluated expression (see
+    {py:func}`_elementwise_dual_evaluation_is_a_reshape`) and defers everything else to
+    scifem, which handles the general real-valued case and refuses the complex one. The same
+    path is taken under a real build, so it is exercised by the real test suite too.
+    """
+    if not _elementwise_dual_evaluation_is_a_reshape(space_to):
+        return _import_scifem().prepare_interpolation_data(expr, space_to)
+
+    # Both spaces are known to share a mesh: MatrixFreeInterpolationOperator, this function's
+    # only caller, refuses anything else before getting here.
+    (argument,) = ufl.algorithms.extract_arguments(expr)
+    space_from = argument.ufl_function_space()
+    mesh = space_from.mesh
+
+    points = get_interpolation_points(space_to)
+    cells = np.arange(mesh.topology.index_map(mesh.topology.dim).size_local, dtype=np.int32)
+    values = dolfinx.fem.Expression(expr, points).eval(mesh, cells)
+
+    dofs_from = space_from.dofmap.bs * space_from.dofmap.dof_layout.num_dofs
+    block_size = space_to.dofmap.bs
+    # (cells, points, value components, dofs_from): one column per basis function of the space
+    # being differentiated with respect to, one entry per component of the value at each point.
+    per_point = values.reshape(len(cells), len(points), -1, dofs_from)
+    components = per_point.shape[2]
+    by_component = per_point.transpose(0, 2, 1, 3)
+    if block_size == 1:
+        return by_component.reshape(len(cells), len(points) * components, dofs_from)
+    # A blocked target interleaves its dual dofs by component rather than grouping them.
+    data = np.zeros((len(cells), len(points) * components, dofs_from), dtype=values.dtype)
+    for block in range(block_size):
+        data[:, block::block_size, :] = by_component[:, block, :, :]
+    return data
+
+
 # Cache of assembled interpolation matrices, keyed by (id(space_from), id(space_to),
 # use_petsc), shared across all InterpolationBlocks to avoid redundant matrix assembly
 # (and, for PETSc matrices, MPI communicator exhaustion) when the same pair of spaces is
@@ -87,32 +147,45 @@ def get_mult(
     if isinstance(mat, _MatrixCSRWorkspace):
         workspace = mat
 
-        def mult(v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector):
-            in_size_local = v_in.index_map.size_local * v_in.block_size
-            out_size_local = v_out.index_map.size_local * v_out.block_size
-
+        def apply_once(source: np.ndarray, in_size_local: int, out_size_local: int) -> np.ndarray:
+            """Apply the matrix (or its transpose) once, returning the owned output values."""
             workspace.row_vec.array[:] = 0.0
             workspace.col_vec.array[:] = 0.0
 
             if transpose:
-                workspace.row_vec.array[:in_size_local] = v_in.array[:in_size_local]
+                workspace.row_vec.array[:in_size_local] = source[:in_size_local]
                 workspace.row_vec.scatter_forward()
-
                 workspace.mat.mult(workspace.row_vec, workspace.col_vec, transpose=True)
-                if accumulate:
-                    v_out.array[:out_size_local] += workspace.col_vec.array[:out_size_local]
-                else:
-                    v_out.array[:out_size_local] = workspace.col_vec.array[:out_size_local]
+                return workspace.col_vec.array[:out_size_local].copy()
+
+            workspace.col_vec.array[:in_size_local] = source[:in_size_local]
+            workspace.col_vec.scatter_forward()
+            workspace.mat.mult(workspace.col_vec, workspace.row_vec)
+            return workspace.row_vec.array[:out_size_local].copy()
+
+        def mult(v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector):
+            in_size_local = v_in.index_map.size_local * v_in.block_size
+            out_size_local = v_out.index_map.size_local * v_out.block_size
+
+            if np.iscomplexobj(v_in.array) and not np.iscomplexobj(workspace.mat.data):
+                # Interpolation between two spaces is a real linear map -- it depends on the
+                # elements and the mesh, not on the field -- and DOLFINx builds the matrix in
+                # the real dtype even under a complex-scalar build. Its scratch vectors
+                # therefore cannot hold a complex vector: writing one into them discards the
+                # imaginary part silently. Apply the real matrix to each part instead, which
+                # is exactly A(x) = A(Re x) + i*A(Im x) for real A. Only under a complex build,
+                # and only for this matrix path -- a PETSc matrix carries PETSc's own scalar
+                # type and needs none of this.
+                result = apply_once(v_in.array.real, in_size_local, out_size_local) + 1j * apply_once(
+                    v_in.array.imag, in_size_local, out_size_local
+                )
             else:
-                workspace.col_vec.array[:in_size_local] = v_in.array[:in_size_local]
-                workspace.col_vec.scatter_forward()
+                result = apply_once(v_in.array, in_size_local, out_size_local)
 
-                workspace.mat.mult(workspace.col_vec, workspace.row_vec)
-
-                if accumulate:
-                    v_out.array[:out_size_local] += workspace.row_vec.array[:out_size_local]
-                else:
-                    v_out.array[:out_size_local] = workspace.row_vec.array[:out_size_local]
+            if accumulate:
+                v_out.array[:out_size_local] += result
+            else:
+                v_out.array[:out_size_local] = result
 
             v_out.scatter_forward()
 
@@ -514,14 +587,31 @@ class MatrixFreeInterpolationOperator:
         if len(args) != 1:
             raise ValueError("MatrixFreeInterpolationOperator only supports expressions with a single argument.")
         space_from = args[0].ufl_function_space()
+        if space_to.mesh is not space_from.mesh:
+            # Every index below is a cell index, and the two spaces' dofmaps are read with the
+            # same one: the operator is built cell by cell from values evaluated on the
+            # expression's mesh, then reshaped by the target mesh's cell count. That is only
+            # meaningful when both spaces sit on the same mesh. A target on a submesh (of either
+            # codimension) needs a cell map that neither this path nor scifem's
+            # ``prepare_interpolation_data`` takes, and without this check the mismatch surfaces
+            # either as a bare reshape ValueError naming neither space or -- when the two meshes
+            # happen to have the same number of cells -- as an operator that is silently wrong.
+            raise NotImplementedError(
+                "Interpolating a UFL expression onto a function space on a different mesh is not "
+                "supported. The expression's argument is defined on a mesh with "
+                f"{space_from.mesh.topology.index_map(space_from.mesh.topology.dim).size_global} "
+                "cells and the target space on one with "
+                f"{space_to.mesh.topology.index_map(space_to.mesh.topology.dim).size_global} "
+                "cells; cell-local interpolation data indexes both by the same cells. Interpolate "
+                "within one mesh, or transfer between meshes outside the tape."
+            )
 
         # Unroll DOF maps using your optimized function
         Q_dofmap = unroll_dofmap(space_to.dofmap.list, space_to.dofmap.bs)
         V_dofmap = unroll_dofmap(space_from.dofmap.list, space_from.dofmap.bs)
 
-        # Get raw cell-local interpolation data from scifem
-        scifem = _import_scifem()
-        raw_data = scifem.prepare_interpolation_data(expr, space_to)
+        # Get raw cell-local interpolation data (from scifem, where it can supply it)
+        raw_data = _prepare_interpolation_data(expr, space_to)
 
         num_cells = space_to.mesh.topology.index_map(space_to.mesh.topology.dim).size_local
         self.num_rows_local = space_to.dofmap.index_map.size_local * space_to.dofmap.bs
@@ -563,15 +653,22 @@ class MatrixFreeInterpolationOperator:
         v_out.array[: self.num_rows_local] += y_local
 
     def mult_transpose(self, v_in: dolfinx.la.Vector, v_out: dolfinx.la.Vector, accumulate: bool = False):
-        """Adjoint action: A^T * v_in -> v_out (Pullback)"""
+        """Adjoint action: A^H * v_in -> v_out (Pullback)"""
         v_in.scatter_forward()
 
         # Extract corresponding target DOFs. Direct slice!
         y_in = v_in.array[: self.num_rows_local]
 
-        # Scale every coefficient row by the target DOF value
+        # Conjugated, because the adjoint of a complex operator is its *Hermitian* transpose
+        # and that is the convention every seed in this package is carried in (ufl.adjoint,
+        # dolfinx.cpp.la.inner_product, the rank-0 Wirtinger seed). The operator's entries are
+        # complex whenever the interpolated expression carries a complex coefficient, e.g.
+        # interpolate(alpha * u, W); a plain transpose would return a seed conjugated relative
+        # to everything downstream, which the terminal `2*Re[.]` cannot repair. On a
+        # real-valued operator -- every real build, and a complex build whose expression has
+        # no complex coefficient -- conjugation is a no-op.
         # scaled_A shape: (num_local_Q, num_v_per_cell)
-        scaled_A = self.A_reduced * y_in[:, None]
+        scaled_A = self.A_reduced.conj() * y_in[:, None]
 
         if not accumulate:
             v_out.array[:] = 0.0

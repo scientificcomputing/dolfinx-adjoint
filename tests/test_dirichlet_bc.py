@@ -27,7 +27,7 @@ def _poisson_bc_control_problem(mesh, g):
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
-    L = ufl.inner(dolfinx.fem.Constant(mesh, 0.0), v) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)), v) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -82,7 +82,12 @@ def _assert_bc_control_gradient_and_hessian(Jhat, m0, h, *, hessian_atol):
             # float (matching how `g`/`g0` were originally constructed, `Constant(mesh,
             # 2.0)`) gives shape () for this scalar test, whereas the raw length-1 array
             # would give shape (1,) and mismatch it under ufl.replace.
-            mp = Constant(m0.function_space.mesh, float(perturbed_array[0]))
+            #
+            # `.real` rather than a bare float(): under a complex build the control is a
+            # real-valued quantity carried in the build's complex dtype, so taking the real
+            # part is what is meant, and saying so keeps numpy from warning about a cast it
+            # cannot tell is deliberate.
+            mp = Constant(m0.function_space.mesh, float(perturbed_array[0].real))
         else:
             mp = Function(m0.function_space)
             mp.x.array[:] = perturbed_array
@@ -292,7 +297,11 @@ def test_time_dependent_bc_replay():
     u_prev = Function(V, name="state_prev")
     assign(0.0, u_prev)
 
-    F = (u - u_prev) / dt * v * ufl.dx + ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx - m * v * ufl.dx
+    F = (
+        ufl.inner((u - u_prev) / dt, v) * ufl.dx
+        + ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+        - ufl.inner(m, v) * ufl.dx
+    )
     a, L = ufl.system(F)
 
     bc_func = Function(V, name="bc_func")

@@ -20,6 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         label: ["stable", "nightly"]
+        scalar-type: ["real", "complex"]
 
     env:
       OMPI_ALLOW_RUN_AS_ROOT: 1
@@ -28,6 +29,15 @@ jobs:
       PIP_NO_BUILD_ISOLATION: 0
     steps:
       - uses: actions/checkout@v7
+
+      - name: Select ${{ matrix.scalar-type }} PETSc scalar type
+        run: |
+          . /usr/local/bin/dolfinx-${{ matrix.scalar-type }}-mode
+          echo "PETSC_ARCH=$PETSC_ARCH" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$PYTHONPATH" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
       - name: Install package
         run: python3 -m pip install .[test]

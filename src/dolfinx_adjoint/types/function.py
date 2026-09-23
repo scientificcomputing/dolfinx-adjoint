@@ -18,7 +18,64 @@ from ufl.core.ufl_id import attach_ufl_id
 from ..blocks._vector import _SpecialVector, _vector
 from ..blocks.assembly import assemble_compiled_form
 from ..checkpointing import SnapshotCheckpoint, maybe_disk_checkpoint
-from ..utils import function_from_vector, gather
+from ..utils import _compile_form, function_from_vector, gather
+
+
+def _extract_real_parameter_gradient(
+    value: typing.Union[dolfinx.la.Vector, numpy.number, complex],
+    V: dolfinx.fem.FunctionSpace | None = None,
+) -> typing.Union[dolfinx.la.Vector, numpy.number, complex]:
+    """Turn a Control's accumulated adjoint value into a real parameter's gradient.
+
+    A Control under a complex-scalar build is real-valued -- complex-valued controls are out
+    of scope -- and is represented as a complex Function whose imaginary part is identically
+    zero, which is simply what constructing one with the default dtype gives under such a
+    build. The adjoint machinery upstream assembles a genuinely complex Hermitian pairing, and
+    the gradient of a real Functional with respect to a real parameter is its real part
+    doubled:
+
+    .. math::
+
+        \\frac{dJ}{dm} = 2\\,\\mathrm{Re}\\left[\\lambda^H \\frac{dR}{dm}\\right]
+
+    This is the only implementation of that extraction, and every path that reaches a
+    real-valued parameter goes through it. Most arrive at a Control, through the two hooks
+    pyadjoint routes a Control's derivative via -- ``_ad_convert_riesz`` (for
+    ``apply_riesz=True``) and ``_ad_init_object`` (for ``apply_riesz=False``, which is what
+    ``ReducedFunctional.derivative`` and ``taylor_test`` use). The exception is an
+    ``AdjFloat`` parameter, which is real-valued by construction and offers pyadjoint no
+    Control-side hook of its own, so
+    {py:meth}`~dolfinx_adjoint.blocks.function_assigner.FunctionAssignBlock.evaluate_adj_component`
+    calls this at the boundary where the float enters instead. In every case "this value is a
+    terminal gradient rather than a mid-chain adjoint seed" holds by construction of the call
+    site, with no marker type needed to record it. Because :math:`2\\mathrm{Re}[\\cdot]`
+    is linear, applying it once to the accumulated adjoint value is identical to applying it
+    inside each contributing Block, and doing it here covers every Block type at once --
+    including those whose complex-mode support is not yet written, and ``Constant`` controls.
+
+    Never writes to ``value``, which belongs to the caller; a vector gradient is returned as
+    a new vector.
+
+    Args:
+        value: The accumulated adjoint value -- a {py:class}`dolfinx.la.Vector` when the
+            parameter is a Function or Constant, or a scalar when it is an ``AdjFloat``.
+        V: The Control's function space, which the returned gradient lives in. Required for
+            a vector ``value``, and meaningless for a scalar one.
+
+    Returns:
+        ``2*Re[value]`` under a complex build, or ``value`` unchanged under a real one, in
+        whichever of the two representations it arrived in.
+    """
+    if V is None:
+        # Scalar parameter (`AdjFloat`): nothing to allocate, and no space it lives in.
+        scalar = typing.cast(typing.Union[numpy.number, complex], value)
+        return 2.0 * scalar.real if numpy.iscomplexobj(scalar) else scalar
+    vector = typing.cast(dolfinx.la.Vector, value)
+    if not numpy.iscomplexobj(vector.array):
+        return vector
+    real_value = _vector(V.dofmap.index_map, V.dofmap.index_map_bs, function_space=V, dtype=vector.array.dtype)
+    real_value.array[:] = 2.0 * vector.array.real
+    return real_value
 
 
 def _create_function(
@@ -90,6 +147,14 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     @classmethod
     def _ad_init_object(cls, obj):
+        if isinstance(obj, _SpecialVector):
+            # A bare vector reaches `_ad_init_object` from exactly one place:
+            # `Control.get_derivative(apply_riesz=False)`, converting a Control's accumulated
+            # adjoint value into a control-typed dual object. That is the default path for
+            # `ReducedFunctional.derivative` and hence for `taylor_test`, so the real-parameter
+            # extraction has to happen here as well as in `_ad_convert_riesz`. Every other
+            # caller (`create_overloaded_object`) passes a `dolfinx.fem.Function` instead.
+            obj = _extract_real_parameter_gradient(obj, obj.function_space)
         return cls(obj.function_space, obj.x, obj.name)
 
     @property
@@ -131,12 +196,23 @@ class Function(dolfinx.fem.Function, FloatingType):
         options = {} if options is None else options
         riesz_representation = options.get("riesz_representation", "l2")
         if riesz_representation == "l2":
-            return dolfinx.cpp.la.inner_product(self.x._cpp_object, other.x._cpp_object)  # type: ignore[arg-type]
+            inner = dolfinx.cpp.la.inner_product(self.x._cpp_object, other.x._cpp_object)  # type: ignore[arg-type]
+            # Real part only, for the same reason `assemble_scalar` takes it: within the
+            # supported scope both operands are real-valued, and a real number is what every
+            # consumer (`taylor_test`'s remainders, optimiser line searches) expects back.
+            #
+            # Taking it also reconciles this branch with the "L2"/"H1" ones below, which
+            # would otherwise disagree with it by a conjugation on any complex input:
+            # `dolfinx.cpp.la.inner_product(a, b)` computes `sum(conj(a) * b)` (conjugating
+            # its *first* argument) while `ufl.inner(a, b)` in complex mode computes
+            # `sum(a * conj(b))` (conjugating its *second*). The two are complex conjugates
+            # of each other, so their real parts agree exactly.
+            return float(numpy.real(inner))
         elif riesz_representation == "L2":
             form_compiler_options = options.get("form_compiler_options", None)
             jit_options = options.get("jit_options", None)
             mass = ufl.inner(self, other) * ufl.dx
-            compiled_form = dolfinx.fem.form(
+            compiled_form = _compile_form(
                 mass,
                 jit_options=jit_options,
                 form_compiler_options=form_compiler_options,
@@ -146,7 +222,7 @@ class Function(dolfinx.fem.Function, FloatingType):
             form_compiler_options = options.get("form_compiler_options", None)
             jit_options = options.get("jit_options", None)
             mass_and_stiffness = ufl.inner(self, other) * ufl.dx + ufl.inner(ufl.grad(self), ufl.grad(other)) * ufl.dx
-            compiled_form = dolfinx.fem.form(
+            compiled_form = _compile_form(
                 mass_and_stiffness,
                 jit_options=jit_options,
                 form_compiler_options=form_compiler_options,
@@ -201,6 +277,13 @@ class Function(dolfinx.fem.Function, FloatingType):
         """Convert a vector to a Riesz representation of the function."""
         options = {} if riesz_map is None else riesz_map
         riesz_representation = options.get("riesz_representation", "l2")
+        # Applied before the branch dispatch rather than within each branch: the "L2" and
+        # "H1" Riesz maps solve against mass/stiffness matrices whose entries are real (a
+        # Lagrange space stored in a complex dtype), and a real linear operator commutes with
+        # `2*Re[.]`, so the order does not matter there. For a caller-supplied callable Riesz
+        # map the order *is* observable, and pre-dispatch is the right choice: the callable
+        # then receives the real-valued gradient a real control's Riesz map expects.
+        value = _extract_real_parameter_gradient(value, self.function_space)
         if riesz_representation == "l2":
             return create_overloaded_object(function_from_vector(self.function_space, value))
         elif riesz_representation == "L2":
@@ -211,7 +294,7 @@ class Function(dolfinx.fem.Function, FloatingType):
             u = ufl.TrialFunction(self.function_space)
             v = ufl.TestFunction(self.function_space)
             riesz_form = ufl.inner(u, v) * ufl.dx
-            compiled_riesz = dolfinx.fem.form(
+            compiled_riesz = _compile_form(
                 riesz_form,
                 jit_options=options.get("jit_options", None),
                 form_compiler_options=options.get("form_compiler_options", None),
@@ -231,7 +314,7 @@ class Function(dolfinx.fem.Function, FloatingType):
             u = ufl.TrialFunction(self.function_space)
             v = ufl.TestFunction(self.function_space)
             riesz_form = ufl.inner(u, v) * ufl.dx + ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
-            compiled_riesz = dolfinx.fem.form(
+            compiled_riesz = _compile_form(
                 riesz_form,
                 jit_options=options.get("jit_options", None),
                 form_compiler_options=options.get("form_compiler_options", None),
@@ -256,6 +339,11 @@ class Function(dolfinx.fem.Function, FloatingType):
         else:
             m_v = m
         m_a = gather(m_v)
+        if numpy.iscomplexobj(m_a):
+            # The boundary to consumers that take a plain array of floats (scipy-style
+            # optimisers, in particular). Values crossing here are real-valued by scope --
+            # a real control, or the `2*Re[.]` gradient `_ad_convert_riesz` produces for one.
+            m_a = m_a.real
         return m_a.tolist()
 
     def _ad_copy(self):
@@ -333,6 +421,10 @@ class Constant(Function):
 
     @classmethod
     def _ad_init_object(cls, obj):
+        # See Function._ad_init_object: a bare vector here is a Control's adjoint value
+        # arriving via `Control.get_derivative(apply_riesz=False)`.
+        if isinstance(obj, _SpecialVector):
+            obj = _extract_real_parameter_gradient(obj, obj.function_space)
         return cls(obj.function_space.mesh, obj.x.array[:])
 
 

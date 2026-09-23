@@ -66,9 +66,12 @@ def _viscous_stokes(mesh):
 
     a = [
         [ufl.inner(mu * ufl.grad(u), ufl.grad(v)) * dx, ufl.inner(p, ufl.div(v)) * dx],
-        [ufl.inner(q, ufl.div(u)) * dx, None],
+        [ufl.inner(ufl.div(u), q) * dx, None],
     ]
-    L = [ufl.inner(f, v) * dx, dolfinx.fem.Constant(mesh, 0.0) * q * dx]
+    L = [
+        ufl.inner(f, v) * dx,
+        ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)), q) * dx,
+    ]
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -92,7 +95,7 @@ def _viscous_stokes(mesh):
     # stay well above round-off: a functional dominated by a control-independent term
     # bottoms out at machine precision before the third-order rate is visible.
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
-    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), Z
+    return problem.keep_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu))), Z
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])
@@ -161,7 +164,7 @@ def _navier_stokes(mesh):
         + ufl.inner(ph, ufl.div(v)) * dx
         - ufl.inner(f, v) * dx
     )
-    F1 = ufl.inner(q, ufl.div(uh)) * dx
+    F1 = ufl.inner(ufl.div(uh), q) * dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -203,7 +206,7 @@ def _navier_stokes(mesh):
     # Quartic in the state and with no constant offset, for the same round-off-avoidance
     # reason as _viscous_stokes's objective.
     J = assemble_scalar(ufl.inner(uh, uh) ** 2 * dx)
-    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu)), Z
+    return problem.keep_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(mu))), Z
 
 
 def test_hessian_is_independent_of_previous_evaluation_points_navier_stokes(
@@ -272,7 +275,7 @@ def _diffusive_poisson(mesh):
     # Quartic in the state, for the same round-off-avoidance reason as
     # ``_viscous_stokes``'s objective.
     J = assemble_scalar(uh**4 * dx)
-    return pyadjoint.ReducedFunctional(J, pyadjoint.Control(m)), Z
+    return problem.keep_alive(pyadjoint.ReducedFunctional(J, pyadjoint.Control(m))), Z
 
 
 @pytest.mark.parametrize("warm_up_at_another_point", [False, True])

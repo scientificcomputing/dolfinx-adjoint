@@ -109,7 +109,7 @@ def test_linear_mixed_derivative_hessian(mesh_2D):
 
     # Linear problem where the bilinear form explicitly depends on the control 'm'
     a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
-    L = f * v * ufl.dx
+    L = ufl.inner(f, v) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)

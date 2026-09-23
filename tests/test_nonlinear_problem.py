@@ -52,13 +52,17 @@ def test_sequential_nonlinear_problems():
     u1.interpolate(lambda x: np.ones_like(x[0]))  # Non-zero initial guess
     v1 = ufl.TestFunction(V)
 
-    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx(domain=mesh) - f * v1 * ufl.dx(domain=mesh)
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx(domain=mesh) - ufl.inner(f, v1) * ufl.dx(
+        domain=mesh
+    )
 
     # Setup PDE 2
     u2 = Function(V, name="state_2")
     u2.interpolate(lambda x: np.ones_like(x[0]))  # Non-zero initial guess
     v2 = ufl.TestFunction(V)
-    F2 = (2 + u2**2) * ufl.inner(ufl.grad(u2), ufl.grad(v2)) * ufl.dx(domain=mesh) - u1 * v2 * ufl.dx(domain=mesh)
+    F2 = (2 + u2**2) * ufl.inner(ufl.grad(u2), ufl.grad(v2)) * ufl.dx(domain=mesh) - ufl.inner(u1, v2) * ufl.dx(
+        domain=mesh
+    )
 
     # 4. Boundary Conditions (u = 1.0 on boundary)
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
