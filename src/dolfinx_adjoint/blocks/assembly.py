@@ -86,10 +86,12 @@ class AssembleBlock(Block):
             form, jit_options=jit_options, form_compiler_options=form_compiler_options, entity_maps=entity_maps
         )
 
-        # A form's dependence on geometry is carried by its SpatialCoordinate, so a mesh
-        # that has been moved is a dependency of every form posed on it -- differentiated
-        # below via ufl.derivative w.r.t. that coordinate. overloaded_mesh() returns None
-        # for a mesh that was never moved, which is every non-shape problem.
+        # A form's dependence on geometry is carried by its SpatialCoordinate, so an
+        # overloaded mesh is a dependency of every form posed on it -- differentiated below via
+        # ufl.derivative w.r.t. that coordinate. Overloading is something the user opts into
+        # explicitly with `dolfinx_adjoint.Mesh(mesh)`; for every other mesh, which is every
+        # problem that is not a shape optimization, the lookup comes back None and the
+        # dependency is skipped.
         from ..types.mesh import overloaded_mesh
         from ..ufl_utils import reject_geometry_without_shape_derivative
 
@@ -99,7 +101,7 @@ class AssembleBlock(Block):
             self.add_dependency(mesh, no_duplicates=True)
         else:
             # See _ProblemBlockBase._register_mesh_dependency: a block built before the mesh
-            # was annotated cannot be rewound, so record the domain for annotate_mesh().
+            # was overloaded cannot be rewound, so record the domain for move() to refuse on.
             domain = self.form.ufl_domain()
             self._unannotated_domain = None if domain is None else domain.ufl_id()
         for coefficient in self.form.coefficients():

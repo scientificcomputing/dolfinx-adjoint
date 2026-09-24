@@ -225,14 +225,16 @@ ds = ufl.Measure("ds", domain=mesh, subdomain_data=facet_tags)
 x = ufl.SpatialCoordinate(mesh)
 # -
 
-# **Put the mesh on the tape before anything is posed on it.** The deformation problem below
-# is solved on $\Omega_0$, but the mesh it is posed on is the same object that is moved a few
-# lines later. Registering it now is what lets every block record *which* geometry it was
-# built on, so that replaying the tape rewinds the mesh to $\Omega_0$ before re-solving the
-# deformation problem rather than re-solving it on the previously deformed domain. Without
-# this the gradient is quietly wrong from the second evaluation onwards.
+# **Track the mesh before anything is posed on it.** `dolfinx_adjoint.Mesh` copies nothing --
+# it promotes this very mesh and hands the same object back, so there is one mesh throughout.
+#
+# The deformation problem below is solved on $\Omega_0$, but the mesh it is posed on is the
+# same object that is moved a few lines later. Tracking it now is what lets every block record
+# *which* geometry it was built on, so that replaying the tape rewinds the mesh to $\Omega_0$
+# before re-solving the deformation problem rather than re-solving it on the previously
+# deformed domain. Tracking it after a form has been built is refused for that reason.
 
-dolfinx_adjoint.annotate_mesh(mesh)
+mesh = dolfinx_adjoint.Mesh(mesh)
 
 # The control is the traction $h$ on the obstacle. It lives in the mesh's geometry function
 # space, which is also where the displacement has to live for

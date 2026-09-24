@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import ufl
 from pyadjoint.overloaded_type import OverloadedType
-from pyadjoint.tape import get_working_tape, no_annotations
+from pyadjoint.tape import no_annotations
 
 __all__ = ["Mesh", "annotate_mesh", "geometry_function_space", "overloaded_mesh"]
 
@@ -37,69 +37,41 @@ def geometry_function_space(mesh: dolfinx.mesh.Mesh) -> dolfinx.fem.FunctionSpac
     try:
         import scifem.mesh
     except ImportError as e:
-        raise ImportError("scifem is required for shape control: pip install scifem") from e
-    try:
-        return scifem.mesh.create_geometry_function_space(mesh)
-    except TypeError:
-        # `create_geometry_function_space` hands `mesh.geometry.index_map()` to
-        # `dolfinx.cpp.fem.DofMap`. From DOLFINx 0.12 (FEniCS/dolfinx#4496) the accessor
-        # returns the Python `dolfinx.common.IndexMap` wrapper while the nanobind constructor
-        # still wants the raw `dolfinx.cpp.common.IndexMap`, so the call raises before the
-        # space exists -- and this is the one object every shape workflow starts from.
-        # `blocks._vector` routes around the same change by delegating to a factory that
-        # follows the release; there is no such factory here, so unwrap for the duration of
-        # the call. Harmless on 0.11, where the accessor already returns the raw object and
-        # `getattr(..., "_cpp_object", ...)` is the identity.
-        return _create_geometry_function_space_unwrapped(mesh)
-
-
-def _create_geometry_function_space_unwrapped(mesh: dolfinx.mesh.Mesh) -> dolfinx.fem.FunctionSpace:
-    """Build scifem's geometry function space with the index map unwrapped.
-
-    See {py:func}`geometry_function_space`. Retries the same scifem call with
-    ``dolfinx.cpp.fem.DofMap`` temporarily replaced by a subclass that accepts either the
-    wrapped or the raw index map, so a single DOLFINx-version difference does not take the
-    whole feature out. Restores the real class on the way out, success or not.
-
-    Args:
-        mesh: The mesh whose geometry is to be displaced.
-
-    Returns:
-        The vector-valued function space of the mesh's coordinate element.
-    """
-    import scifem.mesh
-
-    real = dolfinx.cpp.fem.DofMap
-
-    class _UnwrappingDofMap(real):  # type: ignore[misc,valid-type]
-        def __init__(self, layout, index_map, index_map_bs, dofmap, bs):
-            super().__init__(
-                layout, getattr(index_map, "_cpp_object", index_map), index_map_bs, dofmap, bs
-            )
-
-    dolfinx.cpp.fem.DofMap = _UnwrappingDofMap  # type: ignore[misc]
-    scifem.mesh.dolfinx.cpp.fem.DofMap = _UnwrappingDofMap
-    try:
-        return scifem.mesh.create_geometry_function_space(mesh)
-    finally:
-        dolfinx.cpp.fem.DofMap = real  # type: ignore[misc]
-        scifem.mesh.dolfinx.cpp.fem.DofMap = real
+        raise ImportError("scifem >= 0.25 is required for shape control: pip install 'scifem>=0.25'") from e
+    return scifem.mesh.create_geometry_function_space(mesh)
 
 
 class Mesh(dolfinx.mesh.Mesh, OverloadedType):
-    """A {py:class}`dolfinx.mesh.Mesh` extended so that its geometry can be differentiated
-    through.
+    """A {py:class}`dolfinx.mesh.Mesh` whose geometry can be differentiated through.
 
-    Instances are not constructed directly. An existing mesh is promoted in place by
-    {py:func}`annotate_mesh`, which is called for you by {py:func}`~dolfinx_adjoint.move`.
+    Wrap a mesh once, where you create or read it, to make it a shape-differentiable mesh::
+
+        mesh = dolfinx.io.gmshio.read_from_msh("duct.msh", MPI.COMM_WORLD).mesh
+        mesh = dolfinx_adjoint.Mesh(mesh)          # from here on, forms on it are tracked
+
+    **This copies nothing**: it promotes the object you passed and returns it, so
+    ``dolfinx_adjoint.Mesh(m) is m``. Assigning the result to a new name gives a second name for
+    one mesh, not a tracked copy beside an untracked original, and moving it moves what every
+    function space, form and compiled kernel already built on it sees.
+
+    Promoting in place, rather than returning a new object, is what lets a mesh from any of
+    DOLFINx's entry points -- {py:func}`dolfinx.mesh.create_unit_square`, ``gmshio``, XDMF, a
+    submesh -- take part in a shape optimization without this package overloading each of them,
+    and it keeps everything already built on the mesh valid, since its identity never changes.
+
+    Wrap it **before** posing anything on it. A form built earlier cannot take the mesh as a
+    dependency, and replaying the tape would then re-evaluate that form on whatever geometry the
+    previous replay left behind. Wrapping late is not refused here -- on its own it changes
+    nothing -- but {py:func}`~dolfinx_adjoint.move` refuses to move a mesh that has such a form
+    on the tape, rather than return a quietly wrong gradient.
 
     Note:
         The base order is load-bearing and must stay
         ``(dolfinx.mesh.Mesh, OverloadedType)``. CPython only permits assigning to
         ``__class__`` between types whose instance layouts agree, and with
         {py:class}`~pyadjoint.OverloadedType` listed first the resulting layout no longer
-        matches a plain {py:class}`dolfinx.mesh.Mesh` -- the promotion in
-        {py:func}`annotate_mesh` then fails with ``object layout differs``.
+        matches a plain {py:class}`dolfinx.mesh.Mesh` -- wrapping a mesh then fails with
+        ``object layout differs``.
 
     Note:
         The value this type carries on the tape is the mesh's coordinates. It is not
@@ -109,12 +81,37 @@ class Mesh(dolfinx.mesh.Mesh, OverloadedType):
         form posed on the mesh.
     """
 
+    def __new__(cls, mesh: dolfinx.mesh.Mesh) -> "Mesh":
+        """Track ``mesh`` for shape differentiation and return it.
+
+        Args:
+            mesh: The mesh to track. Already-tracked meshes are returned unchanged, keeping the
+                block variable they have accumulated on the tape.
+
+        Returns:
+            ``mesh`` itself, now a :py:class:`Mesh`.
+
+        Raises:
+            RuntimeError: If the working tape already holds a block posed on ``mesh``.
+        """
+        return annotate_mesh(mesh)
+
+    def __init__(self, mesh: dolfinx.mesh.Mesh) -> None:
+        """Deliberately does nothing.
+
+        ``__new__`` returned the promoted ``mesh``, already initialised. Python calls
+        ``__init__`` on it anyway, since it is an instance of this class; doing nothing here is
+        what stops the DOLFINx constructor and the pyadjoint initialisation re-running over a
+        live mesh.
+        """
+
     def _ad_init_mesh(self) -> None:
         """Initialise the pyadjoint side of an already-constructed mesh.
 
         Separate from ``__init__`` because instances are produced by reassigning
         ``__class__`` on a live mesh (see {py:func}`annotate_mesh`), so the DOLFINx
-        constructor has already run and must not run again.
+        constructor has already run and must not run again. Called once per mesh:
+        :py:func:`annotate_mesh` skips it for a mesh that is already promoted.
         """
         OverloadedType.__init__(self)
         self._ad_coordinate_space: dolfinx.fem.FunctionSpace | None = None
@@ -165,62 +162,27 @@ def annotate_mesh(mesh: dolfinx.mesh.Mesh) -> Mesh:
     Idempotent: a mesh that is already annotated is returned unchanged, keeping the block
     variable it has accumulated on the tape.
 
-    Must be called before anything is posed on the mesh. A block built earlier cannot take the
+    Should be called before anything is posed on the mesh. A block built earlier cannot take the
     mesh as a dependency, so replaying the tape does not rewind the geometry before re-running
     it -- the block is re-evaluated on whatever the previous replay left behind, and the
     gradient drifts from the second distinct control value onwards while every Taylor test
-    still passes. :py:func:`_reject_blocks_predating_annotation` refuses that up front.
+    still passes. Annotating late is not refused here, though: on its own it costs nothing, and
+    nothing can go wrong until the geometry actually changes. The refusal sits in
+    {py:func}`~dolfinx_adjoint.move`, which checks for such blocks before it moves anything.
 
     Args:
         mesh: The mesh to promote.
 
     Returns:
         The same object, now an overloaded {py:class}`Mesh`.
-
-    Raises:
-        RuntimeError: If the working tape already holds a block posed on ``mesh``.
     """
     if not isinstance(mesh, Mesh):
-        _reject_blocks_predating_annotation(mesh)
         mesh.__class__ = Mesh  # type: ignore[assignment]
         typing.cast(Mesh, mesh)._ad_init_mesh()
     domain = mesh.ufl_domain()
     assert domain is not None
     _annotated_meshes[domain.ufl_id()] = typing.cast(Mesh, mesh)
     return typing.cast(Mesh, mesh)
-
-
-def _reject_blocks_predating_annotation(mesh: dolfinx.mesh.Mesh) -> None:
-    """Refuse to annotate a mesh that already has tape blocks posed on it.
-
-    Blocks that would have taken a mesh dependency record the domain they were built on when
-    the lookup came back empty (``_unannotated_domain``). If any of them names this mesh, the
-    tape cannot be replayed correctly and no later call can repair it, so this raises instead.
-
-    Args:
-        mesh: The mesh about to be promoted.
-
-    Raises:
-        RuntimeError: If such a block is on the working tape.
-    """
-    domain = mesh.ufl_domain()
-    if domain is None:
-        return
-    ufl_id = domain.ufl_id()
-    stale = [
-        type(block).__name__
-        for block in get_working_tape().get_blocks()
-        if getattr(block, "_unannotated_domain", None) == ufl_id
-    ]
-    if stale:
-        raise RuntimeError(
-            f"This mesh already has {len(stale)} block(s) recorded on the tape "
-            f"({', '.join(sorted(set(stale)))}), built before the mesh was annotated. Those "
-            "blocks do not depend on the mesh, so replaying the tape will not rewind the "
-            "geometry before re-running them and the gradient would be silently wrong from the "
-            "second evaluation onwards. Call dolfinx_adjoint.annotate_mesh(mesh) (or move()) "
-            "before posing anything on the mesh, or clear the tape and rebuild."
-        )
 
 
 def overloaded_mesh(domain: ufl.Mesh | None) -> Mesh | None:

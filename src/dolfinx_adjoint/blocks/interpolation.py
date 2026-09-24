@@ -323,8 +323,8 @@ class ExprInterpolationBlock(Block):
                 self.add_dependency(op, no_duplicates=True)
                 self._deps.append(op)
 
-        # An expression that reads the coordinates moves with the mesh, so a moved mesh is a
-        # dependency of it just as any coefficient is. Registered *after* the coefficients and
+        # An expression that reads the coordinates moves with the mesh, so an overloaded mesh
+        # is a dependency of it just as any coefficient is. Registered *after* the coefficients and
         # deliberately kept out of `self._deps`, whose indices line up with the leading
         # dependencies: the mesh's index is therefore `len(self._deps)`, and every
         # `self._deps[idx]` lookup below stays valid because the mesh is handled before them.

@@ -104,6 +104,7 @@ def _shape_setup(n: int = 8) -> tuple[dolfinx.mesh.Mesh, dolfinx.fem.FunctionSpa
     reference = _cell_jacobians(mesh)
     S = dxa.geometry_function_space(mesh)
     s = dxa.Function(S)
+    mesh = dxa.Mesh(mesh)
     dxa.move(mesh, s)
     return mesh, S, s, reference
 
@@ -126,6 +127,7 @@ def test_move_records_the_displacement():
     S = dxa.geometry_function_space(mesh)
     s = dxa.Function(S)
     s.x.array[:] = 0.01
+    mesh = dxa.Mesh(mesh)
     moved = dxa.move(mesh, s)
 
     assert moved is mesh, "the mesh must be promoted in place, so existing forms stay valid"
@@ -135,20 +137,18 @@ def test_move_records_the_displacement():
     assert np.allclose(mesh.geometry.x[:, gdim:], before[:, gdim:]), "padding columns must not move"
 
 
-def test_move_rejects_a_displacement_outside_the_geometry_space():
-    """A displacement in the wrong space is refused, pointing at the interpolation that fixes it."""
-    pyadjoint.get_working_tape().clear_tape()
-    mesh = _unit_square(4)
-    W = dolfinx.fem.functionspace(mesh, ("Lagrange", 2, (mesh.geometry.dim,)))
-    with pytest.raises(ValueError, match="geometry function space"):
-        dxa.move(mesh, dxa.Function(W))
+def test_move_by_a_bare_spatial_coordinate():
+    """``SpatialCoordinate`` is a legal displacement: it dilates the mesh about the origin.
 
-
-def test_move_rejects_a_non_function_displacement():
+    Previously refused outright, along with every other expression. It has the right shape for
+    the geometry space, so it interpolates and moves each node to twice its position.
+    """
     pyadjoint.get_working_tape().clear_tape()
-    mesh = _unit_square(4)
-    with pytest.raises(ValueError, match="Function"):
-        dxa.move(mesh, ufl.SpatialCoordinate(mesh))  # type: ignore[arg-type]
+    mesh = dxa.Mesh(_unit_square(4))
+    before = mesh.geometry.x.copy()
+    dxa.move(mesh, ufl.SpatialCoordinate(mesh))
+    gdim = mesh.geometry.dim
+    assert np.allclose(mesh.geometry.x[:, :gdim], 2.0 * before[:, :gdim])
 
 
 def test_shape_derivative_of_a_functional():
@@ -495,6 +495,7 @@ def test_gradient_is_correct_when_the_mesh_is_moved_twice():
 
     second = dxa.Function(S)
     second.x.array[:] = 0.05 * _dilation(S).x.array
+    mesh = dxa.Mesh(mesh)
     dxa.move(mesh, second)
     J = dxa.assemble_scalar(J_first + ufl.inner(X, X) * ufl.dx)
 
@@ -529,6 +530,7 @@ def _heat_loop(n_steps: int, displacement_values: np.ndarray | None = None, sche
     s = dxa.Function(S, name="displacement")
     if displacement_values is not None:
         s.x.array[:] = displacement_values
+    mesh = dxa.Mesh(mesh)
     dxa.move(mesh, s)
 
     V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
@@ -642,6 +644,7 @@ def test_shape_derivative_of_a_blocked_problem():
         s = dxa.Function(S)
         if displacement_values is not None:
             s.x.array[:] = displacement_values
+        mesh = dxa.Mesh(mesh)
         dxa.move(mesh, s)
 
         V = dolfinx.fem.functionspace(
@@ -733,6 +736,7 @@ def test_shape_derivative_through_an_interpolated_expression():
         s = dxa.Function(S)
         if displacement_values is not None:
             s.x.array[:] = displacement_values
+        mesh = dxa.Mesh(mesh)
         dxa.move(mesh, s)
         V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
         X = ufl.SpatialCoordinate(mesh)
@@ -773,6 +777,7 @@ def test_interpolating_a_coefficient_carries_no_geometry_dependence():
         s = dxa.Function(S)
         if displacement_values is not None:
             s.x.array[:] = displacement_values
+        mesh = dxa.Mesh(mesh)
         dxa.move(mesh, s)
         V1 = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
         V2 = dolfinx.fem.functionspace(mesh, ("Lagrange", 2))
@@ -813,6 +818,7 @@ def test_shape_derivative_through_an_interpolated_dirichlet_value():
         s = dxa.Function(S)
         if displacement_values is not None:
             s.x.array[:] = displacement_values
+        mesh = dxa.Mesh(mesh)
         dxa.move(mesh, s)
 
         V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
@@ -883,6 +889,7 @@ def test_move_refuses_a_recomputing_schedule():
     mesh = _unit_square(4)
     s = dxa.Function(dxa.geometry_function_space(mesh))
     with pytest.raises(NotImplementedError, match="not supported under the checkpoint schedule"):
+        mesh = dxa.Mesh(mesh)
         dxa.move(mesh, s)
 
 
@@ -903,6 +910,7 @@ def test_move_accepts_a_retaining_schedule(schedule_name):
     tape.enable_checkpointing(getattr(checkpoint_schedules, schedule_name)())
     mesh = _unit_square(4)
     s = dxa.Function(dxa.geometry_function_space(mesh))
+    mesh = dxa.Mesh(mesh)
     dxa.move(mesh, s)  # must not raise
 
 
@@ -963,6 +971,7 @@ def test_assemble_scalar_shape_derivative_over_measures_and_geometry(integrand):
         s = dxa.Function(S)
         if displacement_values is not None:
             s.x.array[:] = displacement_values
+        mesh = dxa.Mesh(mesh)
         dxa.move(mesh, s)
         return dxa.assemble_scalar(integrand(mesh)), s, S
 
@@ -981,3 +990,170 @@ def test_assemble_scalar_shape_derivative_over_measures_and_geometry(integrand):
     fd = (float(forward(eps * h_values)[0]) - float(forward(-eps * h_values)[0])) / (2 * eps)
     assert abs(fd) > 1e-8, f"the finite difference is ~0 ({fd}): this integrand tests nothing"
     assert np.isclose(directional, fd, rtol=1e-5), f"adjoint {directional} vs finite difference {fd}"
+
+
+def test_move_accepts_a_ufl_expression():
+    """``move`` takes any UFL expression over the mesh, not only a geometry-space Function.
+
+    The expression is interpolated into the geometry space by the annotating
+    ``dolfinx_adjoint.interpolate``, so the interpolation contributes its own block and the
+    chain rule through it is recorded -- the same packing ``dolfinx_adjoint.dirichletbc`` does
+    for a boundary value. Checked by value: the gradient with respect to the coefficient the
+    expression is built from has to match a finite difference of an independently rebuilt
+    forward, which it cannot if the interpolation is untracked.
+    """
+
+    def forward(amplitude: float):
+        pyadjoint.get_working_tape().clear_tape()
+        mesh = dxa.Mesh(_unit_square())
+        Q = dolfinx.fem.functionspace(mesh, ("DG", 0))
+        alpha = dxa.Function(Q, name="amplitude")
+        alpha.x.array[:] = amplitude
+        x = ufl.SpatialCoordinate(mesh)
+        # A dilation about the origin, scaled by the control. Deliberately not a rigid
+        # rotation: rotating the unit square leaves an integrand with the symmetry of
+        # sin(pi x) cos(pi y) stationary at alpha = 0, so the finite difference comes out at
+        # 1e-12 and the test proves nothing. The domain here becomes [0, 1+alpha]^2 and the
+        # functional (1+alpha)^3 / 2, whose derivative is 3/2 at alpha = 0.
+        dxa.move(mesh, alpha * ufl.as_vector((x[0], x[1])))
+        J = dxa.assemble_scalar(x[0] * ufl.dx)
+        return J, alpha, Q
+
+    J, alpha, Q = forward(0.1)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(alpha))
+    direction = dxa.Function(Q)
+    direction.x.array[:] = 1.0
+    owned = Q.dofmap.index_map.size_local * Q.dofmap.index_map_bs
+    directional = MPI.COMM_WORLD.allreduce(
+        float(np.dot(Jhat.derivative().x.array[:owned], direction.x.array[:owned])), op=MPI.SUM
+    )
+
+    eps = 1e-6
+    fd = (float(forward(0.1 + eps)[0]) - float(forward(0.1 - eps)[0])) / (2 * eps)
+    assert abs(fd) > 1e-8, f"the finite difference is ~0 ({fd}): this direction tests nothing"
+    assert np.isclose(directional, fd, rtol=1e-5), f"adjoint {directional} vs finite difference {fd}"
+
+
+def test_move_by_a_coordinate_expression_matches_the_equivalent_function():
+    """Moving by an expression and by its interpolation must land on the same geometry.
+
+    Pins the forward half: whatever the tape does with it, ``move`` applied to an expression
+    has to displace the mesh exactly as ``move`` applied to that expression interpolated by
+    hand does. A mismatch here would mean the packing changed the displacement itself.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    by_expression = dxa.Mesh(_unit_square(6))
+    x = ufl.SpatialCoordinate(by_expression)
+    dxa.move(by_expression, ufl.as_vector((0.1 * x[1], -0.1 * x[0])))
+
+    pyadjoint.get_working_tape().clear_tape()
+    by_function = dxa.Mesh(_unit_square(6))
+    S = dxa.geometry_function_space(by_function)
+    s = dxa.Function(S)
+    s.interpolate(lambda p: np.vstack((0.1 * p[1], -0.1 * p[0])))
+    dxa.move(by_function, s)
+
+    assert np.allclose(by_expression.geometry.x, by_function.geometry.x)
+
+
+def test_move_by_an_expression_in_another_space_is_interpolated():
+    """A Function in some other space on this mesh is interpolated, not refused.
+
+    Only a Function already in the geometry space takes the fast path; anything else goes
+    through the annotating interpolation, so a P2 vector field is a legal displacement.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dxa.Mesh(_unit_square(6))
+    reference = _cell_jacobians(mesh)
+    W = dolfinx.fem.functionspace(mesh, ("Lagrange", 2, (mesh.geometry.dim,)))
+    s = dxa.Function(W)
+    s.interpolate(_interior_bump_values)
+    # Elsewhere this field is a Taylor direction and is always scaled; applied at full
+    # amplitude it is the size of the domain and tangles the mesh.
+    s.x.array[:] *= 0.05
+    before = mesh.geometry.x.copy()
+
+    dxa.move(mesh, s)
+
+    assert not np.allclose(mesh.geometry.x, before), "the mesh did not move"
+    _assert_mesh_is_valid(mesh, reference)
+
+
+def test_move_refuses_a_displacement_from_another_mesh():
+    """Interpolating between meshes has its own adjoint, so it is not done silently here."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dxa.Mesh(_unit_square(4))
+    other = _unit_square(4)
+    foreign = dxa.Function(dxa.geometry_function_space(other))
+    with pytest.raises(ValueError, match="different mesh"):
+        dxa.move(mesh, foreign)
+
+
+def test_move_requires_an_explicitly_tracked_mesh():
+    """Tracking is opt-in: ``move`` will not promote a plain mesh behind the user's back.
+
+    Promoting here would be too late for anything already posed on the mesh, and would leave
+    every later form on it carrying a shape dependency nobody asked for.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(4)
+    s = dxa.Function(dxa.geometry_function_space(mesh))
+    with pytest.raises(ValueError, match="dolfinx_adjoint.Mesh"):
+        dxa.move(mesh, s)
+
+
+def test_tracking_a_mesh_copies_nothing():
+    """``dolfinx_adjoint.Mesh(m)`` returns ``m`` itself, promoted -- not a copy."""
+    pyadjoint.get_working_tape().clear_tape()
+    plain = _unit_square(4)
+    coordinates = plain.geometry.x
+    tracked = dxa.Mesh(plain)
+
+    assert tracked is plain, "tracking must not create a second mesh"
+    # `geometry.x` hands back a fresh view on each access, so identity is not the question --
+    # whether the two views address the same buffer is.
+    assert np.shares_memory(tracked.geometry.x, coordinates), "tracking must not copy the coordinates"
+    assert dxa.Mesh(tracked) is tracked, "tracking twice must be a no-op"
+
+
+def test_a_form_on_an_untracked_mesh_takes_no_mesh_dependency():
+    """A block only depends on the mesh if the user opted that mesh in.
+
+    Tracking is explicit, so every problem that is not a shape optimization -- which is most of
+    them -- must be untouched by shape control: no mesh among the block's dependencies, and no
+    refusal of the geometric quantities (here ``FacetNormal``) that a shape derivative cannot
+    carry.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(4)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u = dxa.Function(V)
+    u.x.array[:] = 1.0
+    n = ufl.FacetNormal(mesh)
+    dxa.assemble_scalar(ufl.inner(n, n) * u * ufl.ds)
+
+    blocks = pyadjoint.get_working_tape().get_blocks()
+    assert len(blocks) == 1
+    dependencies = [dep.output for dep in blocks[0].get_dependencies()]
+    assert not any(isinstance(dep, dolfinx.mesh.Mesh) for dep in dependencies)
+
+
+def test_tracking_a_mesh_late_is_refused_by_move_not_by_the_wrap():
+    """Wrapping late is harmless; *moving* a mesh that has stale blocks on it is not.
+
+    A block built before the wrap does not depend on the mesh, so replaying the tape would
+    re-run it on whatever geometry the previous replay left behind -- a gradient that drifts
+    from the second control value on while every Taylor test still passes. Nothing can go wrong
+    until the geometry actually changes, so the wrap is allowed and ``move`` is what refuses.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(4)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u = dxa.Function(V)
+    u.x.array[:] = 1.0
+    dxa.assemble_scalar(u * ufl.dx)
+
+    tracked = dxa.Mesh(mesh)  # allowed: no geometry has changed yet
+    s = dxa.Function(dxa.geometry_function_space(tracked))
+    with pytest.raises(RuntimeError, match="built before the mesh was annotated"):
+        dxa.move(tracked, s)

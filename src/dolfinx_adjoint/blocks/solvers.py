@@ -282,13 +282,15 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         return result
 
     def _register_mesh_dependency(self) -> None:
-        """Record the mesh as a dependency, if it has been moved.
+        """Record the mesh as a dependency, if it has been overloaded for shape control.
 
-        A residual posed on a moved mesh depends on that mesh's geometry through its
+        A residual posed on an overloaded mesh depends on that mesh's geometry through its
         {py:class}`ufl.SpatialCoordinate`, exactly as it depends on any coefficient
-        appearing in it. {py:func}`~dolfinx_adjoint.types.mesh.overloaded_mesh` returns
-        ``None`` for a mesh that was never passed to {py:func}`~dolfinx_adjoint.move`,
-        which is every problem that is not a shape optimization, and then this is a no-op.
+        appearing in it. Overloading is explicit -- the user wraps the mesh in
+        {py:class}`dolfinx_adjoint.Mesh` -- so
+        {py:func}`~dolfinx_adjoint.types.mesh.overloaded_mesh` returns ``None`` for every mesh
+        nobody opted in for, which is every problem that is not a shape optimization, and then
+        this is a no-op.
 
         Every form the block will differentiate is checked, not only ``self._rhs``. For a
         :py:class:`LinearProblemBlock` the residual is ``action(a, u) - L``, so a geometric
@@ -306,10 +308,12 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                 reject_geometry_without_shape_derivative(form)
             self.add_dependency(mesh, no_duplicates=True)
         else:
-            # The mesh has not been annotated yet, so this block cannot take it as a
-            # dependency and replaying the tape will not rewind the geometry before
-            # re-running the block. Remember which domain that was, so annotate_mesh() can
-            # refuse rather than let the gradient drift -- see types.mesh.annotate_mesh.
+            # The mesh is not overloaded, so it is not a control and the dependency is
+            # skipped. Should it be overloaded later, this block still could not take it as a
+            # dependency, and replaying the tape would not rewind the geometry before
+            # re-running the block. Remember which domain that was, so move() can refuse
+            # rather than let the gradient drift -- see
+            # types.mesh._reject_blocks_predating_annotation.
             domain = u.function_space.mesh.ufl_domain()
             self._unannotated_domain = None if domain is None else domain.ufl_id()
 
@@ -542,8 +546,8 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
                         "This block depends on a moved mesh, but the problem's tangent-linear "
                         "templates were built before the mesh was moved, so there is no dF/dX "
                         "term to assemble and the tangent-linear model would be silently "
-                        "incomplete. Call dolfinx_adjoint.move() (or annotate_mesh()) before "
-                        "the first solve of this problem."
+                        "incomplete. Wrap the mesh with dolfinx_adjoint.Mesh(mesh) before "
+                        "building this problem."
                     )
                 continue
             seed = seed_placeholders[block_variable.output]

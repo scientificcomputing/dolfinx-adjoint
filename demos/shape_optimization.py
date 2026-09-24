@@ -99,6 +99,7 @@ s = dolfinx_adjoint.Function(S, name="displacement")
 # Moving by a zero displacement changes nothing, but it puts the mesh on the tape: from here
 # on, every form posed on `mesh` depends on `s`.
 
+mesh = dolfinx_adjoint.Mesh(mesh)
 dolfinx_adjoint.move(mesh, s)
 
 # The state equation is an ordinary {py:class}`dolfinx_adjoint.LinearProblem`. Nothing about it
