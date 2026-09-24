@@ -11,9 +11,16 @@ import ufl
 from pyadjoint import Block, OverloadedType
 from pyadjoint.tape import stop_annotating
 from ufl.algorithms.analysis import traverse_unique_terminals
+from ufl.algorithms.apply_derivatives import apply_coordinate_derivatives
+from ufl.algorithms.apply_geometry_lowering import GeometryLoweringApplier
+from ufl.classes import Jacobian, ReferenceValue
+from ufl.corealg.map_dag import map_expr_dag
+from ufl.corealg.multifunction import MultiFunction
 
-from ..compat import get_interpolation_points
+from ..compat import apply_pullback_inverse, get_interpolation_points
 from ..types.function import Function, _create_function
+from ..types.mesh import Mesh, overloaded_mesh
+from ..ufl_utils import reject_geometry_in_expression
 from ..utils import unroll_dofmap
 
 if typing.TYPE_CHECKING:
@@ -285,6 +292,55 @@ class InterpolationBlock(Block):
         return output
 
 
+def _reads_geometry(expr: ufl.core.expr.Expr) -> bool:
+    """Whether ``expr`` reads the mesh geometry, and so moves when the mesh does.
+
+    True exactly when a {py:class}`ufl.classes.GeometricQuantity` -- a
+    {py:class}`ufl.SpatialCoordinate` above all -- appears in the expression. A
+    coefficient carries *no* geometry dependence here even though it is defined on the
+    mesh: interpolating between Lagrange spaces evaluates nodal values at reference
+    points, so moving the mesh moves the points and the basis functions together and the
+    interpolated dof values do not change. Verified numerically -- interpolating a
+    Function into another space on a moved mesh matches a finite difference to 1e-12.
+    """
+    return any(isinstance(terminal, ufl.classes.GeometricQuantity) for terminal in traverse_unique_terminals(expr))
+
+
+class _ToPhysical(MultiFunction):
+    """Rewrite a reference-frame perturbation direction back into physical quantities.
+
+    :py:func:`~ufl.algorithms.apply_derivatives.apply_coordinate_derivatives` only differentiates
+    a {py:class}`~ufl.classes.Jacobian` when the direction it is differentiating along is wrapped
+    in a {py:class}`~ufl.classes.ReferenceValue`, which is how the form compiler presents it --
+    the pullback runs before the coordinate derivative. Nothing here goes through the form
+    compiler, so the wrapper is added by hand and undone again afterwards: what comes out has to
+    be an ordinary physical expression, because {py:class}`dolfinx.fem.Expression` applies the
+    pullback itself and would otherwise try to wrap it a second time.
+
+    Both rewrites are exact, not approximations, and rely on the direction living in the geometry
+    space, whose pullback is the identity: ``ReferenceValue(f)`` is then ``f`` itself, and
+    ``ReferenceGrad(ReferenceValue(f))`` is ``df/dX_ref = (df/dx)(dx/dX_ref)``, i.e.
+    ``grad(f) . J``.
+
+    Args:
+        domain: The domain whose Jacobian relates the two frames.
+    """
+
+    def __init__(self, domain):
+        super().__init__()
+        self._domain = domain
+
+    expr = MultiFunction.reuse_if_untouched
+
+    def reference_value(self, o, f):
+        """Identity pullback: the reference value is the physical one."""
+        return f
+
+    def reference_grad(self, o, f):
+        """Chain rule from the reference frame to the physical one."""
+        return ufl.dot(ufl.grad(f), Jacobian(self._domain))
+
+
 class ExprInterpolationBlock(Block):
     """Block for interpolating a UFL expression with runtime-evaluated Jacobians via scifem."""
 
@@ -306,12 +362,44 @@ class ExprInterpolationBlock(Block):
                 self.add_dependency(op, no_duplicates=True)
                 self._deps.append(op)
 
+        # An expression that reads the coordinates moves with the mesh, so an overloaded mesh
+        # is a dependency of it just as any coefficient is. Registered *after* the coefficients and
+        # deliberately kept out of `self._deps`, whose indices line up with the leading
+        # dependencies: the mesh's index is therefore `len(self._deps)`, and every
+        # `self._deps[idx]` lookup below stays valid because the mesh is handled before them.
+        self._mesh: Mesh | None = None
+        if _reads_geometry(self.expr):
+            domain = ufl.domain.extract_unique_domain(self.expr)
+            self._mesh = overloaded_mesh(domain)
+            if self._mesh is None:
+                # See _ProblemBlockBase._register_mesh_dependency.
+                self._unannotated_domain = None if domain is None else domain.ufl_id()
+            if self._mesh is not None:
+                # Same refusal the assembly and solver blocks apply: `_reads_geometry` fires on
+                # any GeometricQuantity, including the ones UFL differentiates to zero, so
+                # without this an expression mixing a dropped quantity with a live one would
+                # lose half its derivative silently.
+                reject_geometry_in_expression(self.expr)
+                self.add_dependency(self._mesh, no_duplicates=True)
+        self._mesh_output: dolfinx.fem.Function | None = None
+
         self._adj_output: dict[int, dolfinx.fem.Function] = {}
         self._tlm_output: dolfinx.fem.Function | None = None
         self._hessian_output: dict[int, dolfinx.fem.Function] = {}
 
     def __str__(self):
         return f"interpolate_expression_{str(self.expr)}_to_{str(self.space_to)}"
+
+    def _replaced_expression(self, inputs: list | None):
+        """``self.expr`` with each coefficient dependency at its checkpointed value.
+
+        ``inputs`` is parallel to ``self.get_dependencies()``, which is one longer than
+        ``self._deps`` when the mesh is among them; only the leading entries are coefficients,
+        and the mesh needs no substitution since it is mutated in place.
+        """
+        if inputs is None:
+            return self.expr
+        return ufl.replace(self.expr, {self._deps[i]: inputs[i] for i in range(len(self._deps))})
 
     def _assemble_operator(self, idx: int, inputs: list | None = None):
         """
@@ -332,21 +420,102 @@ class ExprInterpolationBlock(Block):
         dE = ufl.derivative(current_expr, target_dep, du)
         return MatrixFreeInterpolationOperator(dE, self.space_to)
 
+    def _coordinate_derivative(self, expr: ufl.core.expr.Expr, direction) -> ufl.core.expr.Expr:
+        r"""Differentiate ``expr`` with respect to the mesh coordinates, along ``direction``.
+
+        ``expand_derivatives`` leaves a {py:class}`ufl.classes.CoordinateDerivative` node in
+        place -- it is normally expanded by the form compiler, after the pullback to reference
+        coordinates. There is no form here to compile, so it has to be expanded explicitly with
+        {py:func}`ufl.algorithms.apply_derivatives.apply_coordinate_derivatives`.
+
+        The rest of this reproduces, by hand, the frame the form compiler would have supplied,
+        because the *interpolation operator itself* depends on the geometry whenever the target
+        space is not identity-pullback. Interpolating into a Lagrange space is point evaluation,
+        ``c_i = v(x_i)``, so the only way the geometry enters is through where ``x_i`` sits and
+        differentiating ``expr`` gives the whole answer. An H(div) or H(curl) element instead
+        evaluates at points on the relevant facet or edge and pulls the values back to the
+        reference cell with a Piola map built from the cell Jacobian before applying the
+        interpolation matrix: ``c = M . P^-1(v)``. The dofs then move for a second reason, and it
+        is not a small one -- for a uniform dilation of the unit square it is about three
+        quarters of the derivative.
+
+        So the derivative taken here is of ``P^-1(expr)``, the quantity the dofs are actually
+        built from, and the result is pushed forward with ``P`` again because
+        {py:class}`dolfinx.fem.Expression` applies ``P^-1`` itself when it interpolates. Two
+        details make UFL cooperate: ``JacobianDeterminant`` and ``JacobianInverse`` have no
+        coordinate-derivative rule and would silently differentiate to zero, so they are lowered
+        onto {py:class}`~ufl.classes.Jacobian`, which does have one; and that rule only fires for
+        a direction wrapped in a {py:class}`~ufl.classes.ReferenceValue`, which
+        :py:class:`_ToPhysical` then unwinds.
+
+        Dof transformations play no part. They are keyed on cell orientations taken from the
+        global vertex numbering, which displacing the coordinates does not change, so they are
+        constant under a shape perturbation.
+
+        Args:
+            expr: The expression being interpolated, at its checkpointed dependency values.
+            direction: The perturbation of the coordinates -- an
+                {py:class}`ufl.Argument` on the geometry space for the adjoint, a
+                {py:class}`~dolfinx_adjoint.Function` for the tangent-linear model.
+
+        Returns:
+            The expanded derivative, ready to interpolate.
+
+        Raises:
+            NotImplementedError: If ``expr`` also contains a coefficient. UFL cannot
+                differentiate one with respect to the coordinates in physical space, so such
+                an expression raises rather than silently dropping the term.
+        """
+        assert self._mesh is not None
+        domain = self._mesh.ufl_domain()
+        pullback = self.space_to.ufl_element().pullback
+        reference_expr = expr if pullback.is_identity else apply_pullback_inverse(pullback, expr, domain)
+        reference_expr = map_expr_dag(GeometryLoweringApplier(preserve_types=(Jacobian,)), reference_expr)
+        derivative = ufl.algorithms.expand_derivatives(
+            ufl.derivative(reference_expr, ufl.SpatialCoordinate(self._mesh), ReferenceValue(direction))
+        )
+        try:
+            expanded = map_expr_dag(_ToPhysical(domain), apply_coordinate_derivatives(derivative))
+            return expanded if pullback.is_identity else pullback.apply(expanded, domain)
+        except NotImplementedError as error:
+            raise NotImplementedError(
+                "Cannot take the shape derivative of the interpolated expression "
+                f"'{self.expr}': UFL cannot differentiate a coefficient with respect to the "
+                "coordinates in physical space, so an expression mixing a Function with "
+                f"SpatialCoordinate is not supported ({error}). Interpolate the "
+                "coordinate-dependent part on its own, then combine the results."
+            ) from error
+
     # --- Adjoint ---
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
         operators = {}
-        for idx, _dep in relevant_dependencies:
-            operators[idx] = self._assemble_operator(idx, inputs)
+        for idx, dep in relevant_dependencies:
+            if isinstance(dep.output, Mesh):
+                # dE/dX, as a map from the geometry space into the target space -- the same
+                # shape of operator as for a coefficient, so evaluate_adj_component below
+                # applies its transpose in exactly the same way.
+                current_expr = self._replaced_expression(inputs)
+                V_geom = dep.output._ad_function_space()
+                operators[idx] = MatrixFreeInterpolationOperator(
+                    self._coordinate_derivative(current_expr, ufl.TrialFunction(V_geom)), self.space_to
+                )
+            else:
+                operators[idx] = self._assemble_operator(idx, inputs)
         return operators
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
         adj_input = adj_inputs[0]
         operator = prepared[idx]
 
-        if idx not in self._adj_output:
-            self._adj_output[idx] = _create_function(self._deps[idx].function_space)
-        out_func = self._adj_output[idx]
+        if isinstance(block_variable.output, Mesh):
+            if self._mesh_output is None:
+                self._mesh_output = _create_function(block_variable.output._ad_function_space())
+            out_func = self._mesh_output
+        else:
+            if idx not in self._adj_output:
+                self._adj_output[idx] = _create_function(self._deps[idx].function_space)
+            out_func = self._adj_output[idx]
 
         out_func.x.array[:] = 0.0
         operator.mult_transpose(adj_input.x, out_func.x)
@@ -368,10 +537,15 @@ class ExprInterpolationBlock(Block):
         # 2. Build the total directional derivative matrix-free: dE_total = sum( dE/dx_j * \delta x_j )
         dE_total = None
         for i, tlm_val in enumerate(tlm_inputs):
-            if tlm_val is not None:
-                target_dep = inputs[i]
-                term = ufl.derivative(current_expr, target_dep, tlm_val)
-                dE_total = term if dE_total is None else dE_total + term
+            if tlm_val is None:
+                continue
+            if isinstance(self.get_dependencies()[i].output, Mesh):
+                # A displacement direction: differentiate w.r.t. the coordinates instead, and
+                # expand the coordinate derivative now -- nothing downstream will do it.
+                term = self._coordinate_derivative(current_expr, tlm_val)
+            else:
+                term = ufl.derivative(current_expr, inputs[i], tlm_val)
+            dE_total = term if dE_total is None else dE_total + term
 
         # 3. Force UFL to evaluate the calculus before compiling the Expression
         if dE_total is None:
@@ -396,6 +570,20 @@ class ExprInterpolationBlock(Block):
 
     # --- Hessian ---
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
+        # The loops below index `inputs`/`self._deps` positionally and differentiate w.r.t.
+        # `inputs[i]`, which is the mesh itself rather than its coordinates for a mesh
+        # dependency. Rather than quietly compute the wrong second derivative, refuse -- the
+        # solver blocks refuse a shape Hessian for the same reason.
+        for index, dep in enumerate(self.get_dependencies()):
+            if isinstance(dep.output, Mesh) and (
+                dep.tlm_value is not None or any(index == idx for idx, _ in relevant_dependencies)
+            ):
+                raise NotImplementedError(
+                    "Second-order shape derivatives through an interpolated expression are "
+                    "not supported yet; only the first-order adjoint and the tangent-linear "
+                    "model are."
+                )
+
         operators = {}
 
         # 1. Substitute current optimization step's inputs into the expression

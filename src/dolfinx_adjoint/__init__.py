@@ -9,8 +9,9 @@ from .assembly import assemble_scalar, error_norm
 from .checkpointing import enable_disk_checkpointing
 from .function import assign
 from .interpolation import interpolate, interpolate_nonmatching
+from .mesh import annotate_mesh, geometry_function_space, move
 from .solvers import LinearProblem, NonlinearProblem
-from .types import Constant, Function, dirichletbc
+from .types import Constant, Function, Mesh, dirichletbc
 
 meta = metadata("dolfinx_adjoint")
 __version__ = meta.get("Version")
@@ -26,6 +27,7 @@ _pyad.continue_annotation()
 __all__ = [
     "Constant",
     "Function",
+    "Mesh",
     "dirichletbc",
     "LinearProblem",
     "NonlinearProblem",
@@ -40,4 +42,7 @@ __all__ = [
     "__program_name__",
     "interpolate",
     "interpolate_nonmatching",
+    "annotate_mesh",
+    "geometry_function_space",
+    "move",
 ]

@@ -24,7 +24,7 @@ dependencies = [
 
 
 [project.optional-dependencies]
-scifem = ["scifem"]
+scifem = ["scifem>=0.25"]
 fenicsx_ii = ["fenicsx_ii>=0.6.0"]
 test = ["pytest", "dolfinx-adjoint[scifem,fenicsx_ii]"]
 dev = ["pdbpp", "ipython", "mypy", "ruff"]
@@ -36,6 +36,7 @@ docs = [
       # first (see README.md's Development Install section, and .github/workflows/build_docs.yml).
 
       "gmsh",
+      "matplotlib",
       "pandas",
       "pyvista[all]>0.45",
       "networkx",

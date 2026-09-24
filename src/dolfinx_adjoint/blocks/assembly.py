@@ -11,7 +11,9 @@ from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
 
 
 def assemble_compiled_form(
-    form: dolfinx.fem.Form, tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None
+    form: dolfinx.fem.Form,
+    tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None,
+    finalize: bool = True,
 ) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
     """Assemble a compiled form into ``tensor`` (or return a new scalar).
 
@@ -19,6 +21,14 @@ def assemble_compiled_form(
         form: Compiled form to assemble.
         tensor: For a rank-1 form, the vector to accumulate the assembled contribution
             into, while it is unused for a rank-0 form.
+        finalize: Whether to reduce ``tensor`` across ranks once the contribution is in.
+            Leave it ``True`` for a vector this is the only contribution to. Pass ``False``
+            for every call but the last when several forms accumulate into one vector, and
+            reduce once at the end: the reduction is ``scatter_reverse(add)`` followed by
+            ``scatter_forward()``, so reducing after each call would leave every ghost entry
+            holding a copy of its owner's running total, which the *next* call's
+            ``scatter_reverse`` would then add to the owner again -- once per ghosting rank.
+            That is invisible in serial and grows with the rank count.
     Returns:
         For a rank-1 form, ``tensor`` itself (mutated in place). For a rank-0 form, the
         assembled scalar as a Python ``float``.
@@ -31,8 +41,9 @@ def assemble_compiled_form(
             raise ValueError("tensor must be provided for rank-1 forms.")
         assert isinstance(tensor, dolfinx.la.Vector)
         dolfinx.fem.assemble._assemble_vector_array(tensor.array, form)
-        tensor.scatter_reverse(dolfinx.la.InsertMode.add)
-        tensor.scatter_forward()
+        if finalize:
+            tensor.scatter_reverse(dolfinx.la.InsertMode.add)
+            tensor.scatter_forward()
     elif form.rank == 0:
         local_val = dolfinx.fem.assemble_scalar(form)
         comm = form.mesh.comm
@@ -75,9 +86,24 @@ class AssembleBlock(Block):
             form, jit_options=jit_options, form_compiler_options=form_compiler_options, entity_maps=entity_maps
         )
 
-        # NOTE: Add when we want to do shape optimization
-        # mesh = self.form.ufl_domain().ufl_cargo()
-        # self.add_dependency(mesh)
+        # A form's dependence on geometry is carried by its SpatialCoordinate, so an
+        # overloaded mesh is a dependency of every form posed on it -- differentiated below via
+        # ufl.derivative w.r.t. that coordinate. Overloading is something the user opts into
+        # explicitly with `dolfinx_adjoint.Mesh(mesh)`; for every other mesh, which is every
+        # problem that is not a shape optimization, the lookup comes back None and the
+        # dependency is skipped.
+        from ..types.mesh import overloaded_mesh
+        from ..ufl_utils import reject_geometry_without_shape_derivative
+
+        mesh = overloaded_mesh(self.form.ufl_domain())
+        if mesh is not None:
+            reject_geometry_without_shape_derivative(self.form)
+            self.add_dependency(mesh, no_duplicates=True)
+        else:
+            # See _ProblemBlockBase._register_mesh_dependency: a block built before the mesh
+            # was overloaded cannot be rewound, so record the domain for move() to refuse on.
+            domain = self.form.ufl_domain()
+            self._unannotated_domain = None if domain is None else domain.ufl_id()
         for coefficient in self.form.coefficients():
             if isinstance(coefficient, OverloadedType):
                 self.add_dependency(coefficient, no_duplicates=True)
@@ -203,16 +229,20 @@ class AssembleBlock(Block):
 
         from ufl.algorithms.analysis import extract_arguments
 
+        from ..types.mesh import Mesh
+
         arity_form = len(extract_arguments(form))
 
-        # if isinstance(c, dolfin.Constant):
-        #     mesh = extract_mesh_from_form(self.form)
-        #     space = c._ad_function_space(mesh)
-        if isinstance(c, dolfinx.fem.Function):
+        if isinstance(c, Mesh):
+            # Differentiate w.r.t. the coordinate field rather than the mesh object: that
+            # is what the form actually references. c_rep is the checkpointed coordinate
+            # array, which is not a UFL object, so the mesh itself supplies both.
+            c_rep = ufl.SpatialCoordinate(c)
+            space = c._ad_function_space()
+        elif isinstance(c, dolfinx.fem.Function):
             space = c.function_space
-        # elif isinstance(c, dolfin.Mesh):
-        #     c_rep = dolfin.SpatialCoordinate(c_rep)
-        #     space = c._ad_function_space()
+        else:
+            raise NotImplementedError(f"Unsupported control {type(c)}")
 
         return self.compute_action_adjoint(adj_input, arity_form, form, c_rep, space)[0]
 
@@ -225,14 +255,16 @@ class AssembleBlock(Block):
 
         from ufl.algorithms.analysis import extract_arguments
 
+        from ..types.mesh import Mesh
+
         arity_form = len(extract_arguments(form))
         for bv in self.get_dependencies():
             c_rep = bv.saved_output
             tlm_value = bv.tlm_value
             if tlm_value is None:
                 continue
-            if isinstance(c_rep, dolfinx.mesh.Mesh):
-                X = ufl.SpatialCoordinate(c_rep)
+            if isinstance(bv.output, Mesh):
+                X = ufl.SpatialCoordinate(bv.output)
                 dform += ufl.derivative(form, X, tlm_value)
             else:
                 dform += ufl.derivative(form, c_rep, tlm_value)
@@ -269,6 +301,8 @@ class AssembleBlock(Block):
 
         from ufl.algorithms.analysis import extract_arguments
 
+        from ..types.mesh import Mesh
+
         arity_form = len(extract_arguments(form))
 
         c1 = block_variable.output
@@ -278,12 +312,14 @@ class AssembleBlock(Block):
             raise RuntimeError(
                 "All constants should have been replaced with real space coefficients before this point."
             )
-        if isinstance(c1, dolfinx.fem.Function):
+        if isinstance(c1, Mesh):
+            # Differentiate w.r.t. the coordinate field rather than the mesh object: that is
+            # what the form actually references. The mesh's checkpoint is a coordinate array,
+            # not a UFL object, so the mesh itself supplies both.
+            c1_rep = ufl.SpatialCoordinate(c1)
+            space = c1._ad_function_space()
+        elif isinstance(c1, dolfinx.fem.Function):
             space = c1.function_space
-        # TODO: Add support for shape optimization
-        # elif isinstance(c1, dolfinx.mesh.Mesh):
-        #     c1_rep = ufl.SpatialCoordinate(c1)
-        #     space = c1._ad_function_space()
         else:
             return None
         hessian_outputs, dform = self.compute_action_adjoint(hessian_input, arity_form, form, c1_rep, space)
@@ -295,8 +331,8 @@ class AssembleBlock(Block):
             if tlm_input is None:
                 continue
 
-            if isinstance(c2_rep, dolfinx.mesh.Mesh):
-                X = ufl.SpatialCoordinate(c2_rep)
+            if isinstance(bv.output, Mesh):
+                X = ufl.SpatialCoordinate(bv.output)
                 ddform += ufl.derivative(dform, X, tlm_input)
             else:
                 ddform += ufl.derivative(dform, c2_rep, tlm_input)

@@ -34,7 +34,7 @@ def assert_hessian_matches_finite_difference():
         *,
         fd_eps: float = 1e-3,
         rtol: float = 1e-2,
-        atol: float = 1e-2,
+        atol: float = 1e-8,
     ) -> None:
         """Verify ``Jhat``'s Hessian-vector product against a central difference of its own gradient.
 
