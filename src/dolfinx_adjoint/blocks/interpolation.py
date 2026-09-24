@@ -12,8 +12,12 @@ from pyadjoint import Block, OverloadedType
 from pyadjoint.tape import stop_annotating
 from ufl.algorithms.analysis import traverse_unique_terminals
 from ufl.algorithms.apply_derivatives import apply_coordinate_derivatives
+from ufl.algorithms.apply_geometry_lowering import GeometryLoweringApplier
+from ufl.classes import Jacobian, ReferenceValue
+from ufl.corealg.map_dag import map_expr_dag
+from ufl.corealg.multifunction import MultiFunction
 
-from ..compat import get_interpolation_points
+from ..compat import apply_pullback_inverse, get_interpolation_points
 from ..types.function import Function, _create_function
 from ..types.mesh import Mesh, overloaded_mesh
 from ..ufl_utils import reject_geometry_in_expression
@@ -302,6 +306,41 @@ def _reads_geometry(expr: ufl.core.expr.Expr) -> bool:
     return any(isinstance(terminal, ufl.classes.GeometricQuantity) for terminal in traverse_unique_terminals(expr))
 
 
+class _ToPhysical(MultiFunction):
+    """Rewrite a reference-frame perturbation direction back into physical quantities.
+
+    :py:func:`~ufl.algorithms.apply_derivatives.apply_coordinate_derivatives` only differentiates
+    a {py:class}`~ufl.classes.Jacobian` when the direction it is differentiating along is wrapped
+    in a {py:class}`~ufl.classes.ReferenceValue`, which is how the form compiler presents it --
+    the pullback runs before the coordinate derivative. Nothing here goes through the form
+    compiler, so the wrapper is added by hand and undone again afterwards: what comes out has to
+    be an ordinary physical expression, because {py:class}`dolfinx.fem.Expression` applies the
+    pullback itself and would otherwise try to wrap it a second time.
+
+    Both rewrites are exact, not approximations, and rely on the direction living in the geometry
+    space, whose pullback is the identity: ``ReferenceValue(f)`` is then ``f`` itself, and
+    ``ReferenceGrad(ReferenceValue(f))`` is ``df/dX_ref = (df/dx)(dx/dX_ref)``, i.e.
+    ``grad(f) . J``.
+
+    Args:
+        domain: The domain whose Jacobian relates the two frames.
+    """
+
+    def __init__(self, domain):
+        super().__init__()
+        self._domain = domain
+
+    expr = MultiFunction.reuse_if_untouched
+
+    def reference_value(self, o, f):
+        """Identity pullback: the reference value is the physical one."""
+        return f
+
+    def reference_grad(self, o, f):
+        """Chain rule from the reference frame to the physical one."""
+        return ufl.dot(ufl.grad(f), Jacobian(self._domain))
+
+
 class ExprInterpolationBlock(Block):
     """Block for interpolating a UFL expression with runtime-evaluated Jacobians via scifem."""
 
@@ -389,6 +428,30 @@ class ExprInterpolationBlock(Block):
         coordinates. There is no form here to compile, so it has to be expanded explicitly with
         {py:func}`ufl.algorithms.apply_derivatives.apply_coordinate_derivatives`.
 
+        The rest of this reproduces, by hand, the frame the form compiler would have supplied,
+        because the *interpolation operator itself* depends on the geometry whenever the target
+        space is not identity-pullback. Interpolating into a Lagrange space is point evaluation,
+        ``c_i = v(x_i)``, so the only way the geometry enters is through where ``x_i`` sits and
+        differentiating ``expr`` gives the whole answer. An H(div) or H(curl) element instead
+        evaluates at points on the relevant facet or edge and pulls the values back to the
+        reference cell with a Piola map built from the cell Jacobian before applying the
+        interpolation matrix: ``c = M . P^-1(v)``. The dofs then move for a second reason, and it
+        is not a small one -- for a uniform dilation of the unit square it is about three
+        quarters of the derivative.
+
+        So the derivative taken here is of ``P^-1(expr)``, the quantity the dofs are actually
+        built from, and the result is pushed forward with ``P`` again because
+        {py:class}`dolfinx.fem.Expression` applies ``P^-1`` itself when it interpolates. Two
+        details make UFL cooperate: ``JacobianDeterminant`` and ``JacobianInverse`` have no
+        coordinate-derivative rule and would silently differentiate to zero, so they are lowered
+        onto {py:class}`~ufl.classes.Jacobian`, which does have one; and that rule only fires for
+        a direction wrapped in a {py:class}`~ufl.classes.ReferenceValue`, which
+        :py:class:`_ToPhysical` then unwinds.
+
+        Dof transformations play no part. They are keyed on cell orientations taken from the
+        global vertex numbering, which displacing the coordinates does not change, so they are
+        constant under a shape perturbation.
+
         Args:
             expr: The expression being interpolated, at its checkpointed dependency values.
             direction: The perturbation of the coordinates -- an
@@ -404,11 +467,16 @@ class ExprInterpolationBlock(Block):
                 an expression raises rather than silently dropping the term.
         """
         assert self._mesh is not None
+        domain = self._mesh.ufl_domain()
+        pullback = self.space_to.ufl_element().pullback
+        reference_expr = expr if pullback.is_identity else apply_pullback_inverse(pullback, expr, domain)
+        reference_expr = map_expr_dag(GeometryLoweringApplier(preserve_types=(Jacobian,)), reference_expr)
         derivative = ufl.algorithms.expand_derivatives(
-            ufl.derivative(expr, ufl.SpatialCoordinate(self._mesh), direction)
+            ufl.derivative(reference_expr, ufl.SpatialCoordinate(self._mesh), ReferenceValue(direction))
         )
         try:
-            return apply_coordinate_derivatives(derivative)
+            expanded = map_expr_dag(_ToPhysical(domain), apply_coordinate_derivatives(derivative))
+            return expanded if pullback.is_identity else pullback.apply(expanded, domain)
         except NotImplementedError as error:
             raise NotImplementedError(
                 "Cannot take the shape derivative of the interpolated expression "

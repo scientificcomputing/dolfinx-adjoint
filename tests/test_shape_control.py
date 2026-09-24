@@ -1157,3 +1157,141 @@ def test_tracking_a_mesh_late_is_refused_by_move_not_by_the_wrap():
     s = dxa.Function(dxa.geometry_function_space(tracked))
     with pytest.raises(RuntimeError, match="built before the mesh was annotated"):
         dxa.move(tracked, s)
+
+
+def _directional(vec, direction, S) -> float:
+    """``<vec, direction>``, summed over owned dofs only."""
+    owned = S.dofmap.index_map.size_local * S.dofmap.index_map_bs
+    return MPI.COMM_WORLD.allreduce(float(np.dot(vec.x.array[:owned], direction.x.array[:owned])), op=MPI.SUM)
+
+
+@pytest.mark.parametrize("family", ["RT", "N1curl", "Lagrange"])
+def test_shape_derivative_of_interpolation_into_a_piola_mapped_space(family):
+    """Interpolating into H(div)/H(curl) differentiates the interpolation operator too.
+
+    The dof is not a point evaluation: the expression is evaluated at points on the facet or
+    edge and pulled back to the reference cell by a Piola map built from the cell Jacobian
+    before the interpolation matrix is applied. The operator is therefore a function of the
+    geometry, and differentiating only the expression -- which is the whole answer for a
+    Lagrange target, included here as the control -- loses about three quarters of this one.
+    """
+
+    def forward(step, direction):
+        pyadjoint.get_working_tape().clear_tape()
+        mesh = _unit_square(6)
+        S = dxa.geometry_function_space(mesh)
+        s = dxa.Function(S)
+        if step is not None:
+            s.x.array[:] = step * direction
+        mesh = dxa.Mesh(mesh)
+        dxa.move(mesh, s)
+        X = ufl.SpatialCoordinate(mesh)
+        spec = (family, 1, (mesh.geometry.dim,)) if family == "Lagrange" else (family, 1)
+        V = dolfinx.fem.functionspace(mesh, spec)
+        u = dxa.interpolate(ufl.as_vector((X[1] ** 2 + 1.0, X[0] ** 2 + 2.0)), V)
+        return dxa.assemble_scalar(ufl.inner(u, u) * ufl.dx), s, S
+
+    h = _dilation(dxa.geometry_function_space(_unit_square(6))).x.array.copy()
+    eps = 1e-6
+    fd = (float(forward(eps, h)[0]) - float(forward(-eps, h)[0])) / (2 * eps)
+    assert abs(fd) > 1e-8, "the direction must actually change the functional"
+
+    J, s, S = forward(None, h)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    assert abs(_directional(Jhat.derivative(), hf, S) - fd) < 1e-6 * abs(fd)
+
+
+@pytest.mark.parametrize("family", ["RT", "N1curl"])
+def test_shape_derivative_of_a_form_with_a_piola_mapped_coefficient(family):
+    """The form path needs no such handling: UFL pulls back before differentiating.
+
+    Worth pinning separately from the interpolation case above, because the two get the
+    Jacobian terms by entirely different routes -- here the form compiler's, there
+    :py:meth:`ExprInterpolationBlock._coordinate_derivative`'s. The coefficient is held fixed in
+    its dofs, which is what the adjoint assumes.
+
+    The direction is a shear rather than the dilation used everywhere else in this file, because
+    ``int |u|^2 dx`` is *invariant* under a uniform dilation for both Piola families: scaling the
+    square by ``1 + h`` scales ``u`` by ``1 / (1 + h)`` -- contravariant ``J / det J`` and
+    covariant ``J^-T`` both do -- while ``dx`` scales by ``(1 + h)^2``. The derivative is then
+    exactly zero and the test would pass without testing anything.
+    """
+
+    def forward(step, direction):
+        pyadjoint.get_working_tape().clear_tape()
+        mesh = _unit_square(6)
+        S = dxa.geometry_function_space(mesh)
+        s = dxa.Function(S)
+        if step is not None:
+            s.x.array[:] = step * direction
+        mesh = dxa.Mesh(mesh)
+        dxa.move(mesh, s)
+        V = dolfinx.fem.functionspace(mesh, (family, 1))
+        u = dxa.Function(V)
+        # A pattern keyed on the *global* dof index, so every rank fills the same field.
+        imap = V.dofmap.index_map
+        indices = np.arange(imap.size_local + imap.num_ghosts, dtype=np.int32)
+        u.x.array[:] = np.sin(imap.local_to_global(indices).astype(np.float64))
+        return dxa.assemble_scalar(ufl.inner(u, u) * ufl.dx), s, S
+
+    shear = dxa.Function(dxa.geometry_function_space(_unit_square(6)))
+    shear.interpolate(lambda x: np.vstack((x[0] * (1.0 + 0.5 * x[1]), x[1])))
+    h = shear.x.array.copy()
+    eps = 1e-6
+    fd = (float(forward(eps, h)[0]) - float(forward(-eps, h)[0])) / (2 * eps)
+    assert abs(fd) > 1e-8, "the direction must actually change the functional"
+
+    J, s, S = forward(None, h)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    assert abs(_directional(Jhat.derivative(), hf, S) - fd) < 1e-6 * abs(fd)
+
+
+_PULLBACK_OPERANDS = {
+    "IdentityPullback": "scalar",
+    "ContravariantPiola": "vector",
+    "CovariantPiola": "vector",
+    "L2Piola": "scalar",
+    "DoubleContravariantPiola": "tensor",
+    "DoubleCovariantPiola": "tensor",
+    "CovariantContravariantPiola": "tensor",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PULLBACK_OPERANDS))
+def test_the_manual_pullback_inverse_matches_ufls(name):
+    """The closed forms in ``compat`` must agree with UFL's own ``apply_inverse``.
+
+    They exist only for a UFL predating FEniCS/ufl#511, so on a current UFL they are never
+    reached and would rot unnoticed. Comparing them against the implementation they stand in for
+    is the only thing keeping them honest.
+    """
+    import ufl.pullback
+
+    from dolfinx_adjoint.compat import _INVERSE_PULLBACKS
+
+    pullback = getattr(ufl.pullback, name)()
+    if not hasattr(pullback, "apply_inverse"):
+        pytest.skip(f"this UFL has no {name}.apply_inverse to compare against")
+
+    mesh = _unit_square(4)
+    domain = mesh.ufl_domain()
+    X = ufl.SpatialCoordinate(mesh)
+    operand = {
+        "scalar": lambda: X[0] ** 2 + X[1] + 1.0,
+        "vector": lambda: ufl.as_vector((X[1] ** 2 + 1.0, X[0] ** 2 + 2.0)),
+        "tensor": lambda: ufl.as_matrix(((X[0] + 1.0, X[1]), (X[1] ** 2, X[0] * X[1] + 2.0))),
+    }[_PULLBACK_OPERANDS[name]]()
+
+    reference = pullback.apply_inverse(operand, domain)
+    manual = _INVERSE_PULLBACKS[name](operand, domain)
+
+    def norm(e):
+        local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(ufl.inner(e, e) * ufl.dx))
+        return np.sqrt(MPI.COMM_WORLD.allreduce(local, op=MPI.SUM))
+
+    assert norm(reference) > 1e-8, "the comparison must not be against zero"
+    assert norm(reference - manual) < 1e-12 * norm(reference)

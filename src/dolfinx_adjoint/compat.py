@@ -1,11 +1,13 @@
 from collections.abc import Sequence
 
 import dolfinx
+from ufl import as_tensor, indices
 from ufl.algebra import Conj
 from ufl.algorithms.formsplitter import extract_blocks
 from ufl.algorithms.map_integrands import map_integrands
 from ufl.algorithms.replace import replace
 from ufl.argument import Argument
+from ufl.classes import Jacobian, JacobianDeterminant, JacobianInverse
 
 try:
     from ufl.algorithms.extract_linear_combination import extract_linear_combination
@@ -330,3 +332,102 @@ def bcs_by_block(
         return getattr(space, "_cpp_object", space)
 
     return [[bc for bc in bcs if _cpp(V).contains(_cpp(bc.function_space))] if V is not None else [] for V in spaces]
+
+
+# --- Pullbacks -----------------------------------------------------------------------------
+#
+# `AbstractPullback.apply_inverse` -- the physical-to-reference direction -- arrived in
+# FEniCS/ufl#511. It is needed to differentiate an interpolation into a space whose pullback is
+# not the identity, because the dofs are built from the pulled-back expression rather than from
+# the expression itself. Only the inverse is missing on older UFL, not `apply`, and each one is
+# a short closed-form expression, so they are written out here rather than requiring the newer
+# UFL. `_INVERSE_PULLBACKS` is keyed by class name to avoid importing classes that a given UFL
+# may not define.
+
+
+def _inverse_identity(expr, domain):
+    return expr
+
+
+def _inverse_contravariant_piola(expr, domain):
+    """``v = J vhat / detJ`` inverts to ``vhat = detJ K v``."""
+    detJ = JacobianDeterminant(Jacobian(domain))
+    K = JacobianInverse(domain)
+    *k, i, j = indices(len(expr.ufl_shape) + 1)
+    return as_tensor(detJ * K[i, j] * expr[(*k, j)], (*k, i))
+
+
+def _inverse_covariant_piola(expr, domain):
+    """``v = K^T vhat`` inverts to ``vhat = J^T v``."""
+    J = Jacobian(domain)
+    *k, i, j = indices(len(expr.ufl_shape) + 1)
+    return as_tensor(J[j, i] * expr[(*k, j)], (*k, i))
+
+
+def _inverse_l2_piola(expr, domain):
+    """``v = vhat / detJ`` inverts to ``vhat = detJ v``."""
+    return expr * JacobianDeterminant(domain)
+
+
+def _inverse_double_contravariant_piola(expr, domain):
+    """``v = J vhat J^T / detJ^2`` inverts to ``vhat = detJ^2 K v K^T``."""
+    detJ = JacobianDeterminant(Jacobian(domain))
+    K = JacobianInverse(domain)
+    *k, i, j, m, n = indices(len(expr.ufl_shape) + 2)
+    return as_tensor(detJ**2 * K[i, m] * expr[(*k, m, n)] * K[j, n], (*k, i, j))
+
+
+def _inverse_double_covariant_piola(expr, domain):
+    """``v = K^T vhat K`` inverts to ``vhat = J^T v J``."""
+    J = Jacobian(domain)
+    *k, i, j, m, n = indices(len(expr.ufl_shape) + 2)
+    return as_tensor(J[m, i] * expr[(*k, m, n)] * J[n, j], (*k, i, j))
+
+
+def _inverse_covariant_contravariant_piola(expr, domain):
+    """``v = K^T vhat J^T / detJ`` inverts to ``vhat = detJ J^T v K^T``."""
+    J = Jacobian(domain)
+    detJ = JacobianDeterminant(J)
+    K = JacobianInverse(domain)
+    *k, i, j, m, n = indices(len(expr.ufl_shape) + 2)
+    return as_tensor(detJ * J[m, i] * expr[(*k, m, n)] * K[j, n], (*k, i, j))
+
+
+_INVERSE_PULLBACKS = {
+    "IdentityPullback": _inverse_identity,
+    "ContravariantPiola": _inverse_contravariant_piola,
+    "CovariantPiola": _inverse_covariant_piola,
+    "L2Piola": _inverse_l2_piola,
+    "DoubleContravariantPiola": _inverse_double_contravariant_piola,
+    "DoubleCovariantPiola": _inverse_double_covariant_piola,
+    "CovariantContravariantPiola": _inverse_covariant_contravariant_piola,
+}
+
+
+def apply_pullback_inverse(pullback, expr, domain):
+    """Map ``expr`` from the physical cell to the reference cell.
+
+    Args:
+        pullback: The element's pullback.
+        expr: A physical-cell expression.
+        domain: The domain whose Jacobian relates the two cells.
+
+    Returns:
+        ``expr`` pulled back to the reference cell.
+
+    Raises:
+        NotImplementedError: If this UFL has no ``apply_inverse`` for ``pullback`` and no
+            closed form is written out here -- the composite pullbacks (mixed, symmetric) and
+            the ones that are not a fixed expression at all (custom, physical, undefined).
+    """
+    if hasattr(pullback, "apply_inverse"):
+        return pullback.apply_inverse(expr, domain)
+    name = type(pullback).__name__
+    try:
+        return _INVERSE_PULLBACKS[name](expr, domain)
+    except KeyError:
+        raise NotImplementedError(
+            f"This UFL does not provide {name}.apply_inverse (added in FEniCS/ufl#511) and "
+            "dolfinx-adjoint has no closed form for it, so an interpolation into a space with "
+            "this pullback cannot be shape-differentiated. Upgrade UFL."
+        ) from None
