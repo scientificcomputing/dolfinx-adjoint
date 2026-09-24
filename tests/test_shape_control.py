@@ -1295,3 +1295,44 @@ def test_the_manual_pullback_inverse_matches_ufls(name):
 
     assert norm(reference) > 1e-8, "the comparison must not be against zero"
     assert norm(reference - manual) < 1e-12 * norm(reference)
+
+
+@pytest.mark.parametrize("tracked", ["source", "target"])
+def test_nonmatching_interpolation_on_a_tracked_mesh_is_refused(tracked):
+    """Non-matching interpolation has no shape derivative, and fails the forward too.
+
+    Where the two meshes sit relative to each other is computed once and cached on the block, so
+    once either moves, replaying the tape returns the wrong *value* -- 31% wrong on a unit square
+    contracted by 0.1 -- quite apart from the two derivative terms nobody records. Refused rather
+    than left to produce a plausible number.
+    """
+    pytest.importorskip("fenicsx_ii")
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 7, 7)
+    mesh_b = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 5, 5)
+
+    moved = dxa.Mesh(mesh_a if tracked == "source" else mesh_b)
+    dxa.move(moved, dxa.Function(dxa.geometry_function_space(moved)))
+
+    u = dxa.Function(dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2)))
+    u.interpolate(lambda x: x[0] ** 2 + 2.0 * x[1])
+    with pytest.raises(NotImplementedError, match=f"the {tracked} mesh is tracked"):
+        dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1)))
+
+
+def test_nonmatching_interpolation_without_shape_control_still_works():
+    """The refusal must not reach the ordinary case, which is most of them."""
+    pytest.importorskip("fenicsx_ii")
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 7, 7)
+    mesh_b = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 5, 5)
+    V = dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2))
+    u = dxa.Function(V)
+    u.x.array[:] = 1.0
+
+    ub = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1)))
+    J = dxa.assemble_scalar(ufl.inner(ub, ub) * ufl.dx)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(u))
+    h = dxa.Function(V)
+    h.interpolate(lambda x: np.sin(np.pi * x[0]) * np.cos(np.pi * x[1]))
+    assert pyadjoint.taylor_test(Jhat, u, h) > 1.9
