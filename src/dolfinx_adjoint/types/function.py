@@ -15,8 +15,8 @@ from pyadjoint.overloaded_type import (
 from pyadjoint.tape import no_annotations
 from ufl.core.ufl_id import attach_ufl_id
 
+from ..blocks._assemble import assemble_compiled_form
 from ..blocks._vector import _SpecialVector, _vector
-from ..blocks.assembly import assemble_compiled_form
 from ..checkpointing import SnapshotCheckpoint, maybe_disk_checkpoint
 from ..utils import function_from_vector, gather
 

@@ -8,7 +8,7 @@ import numpy.typing as npt
 import pyadjoint
 from pyadjoint.tape import no_annotations
 
-from ..types.mesh import Mesh
+from ..types.mesh import Mesh, apply_displacement
 from ._vector import _SpecialVector, _vector
 
 
@@ -131,8 +131,6 @@ class MoveBlock(pyadjoint.Block):
         earlier recompute -- which matters because a checkpoint schedule replays the
         forward many times.
         """
-        from ..mesh import apply_displacement
-
         mesh, displacement = inputs[0], inputs[1]
         apply_displacement(mesh, displacement)
         return mesh._ad_create_checkpoint()

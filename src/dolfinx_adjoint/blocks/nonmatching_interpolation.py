@@ -11,7 +11,7 @@ from pyadjoint.tape import stop_annotating
 
 from ..compat import get_interpolation_points
 from ..types.function import _create_function
-from ..types.mesh import Mesh, overloaded_mesh
+from ..types.mesh import Mesh, get_overloaded_mesh_if_annotated
 from .interpolation import MatrixFreeInterpolationOperator, _MatrixCSRWorkspace, get_mult
 
 
@@ -44,37 +44,38 @@ def _coordinate_degree(mesh: dolfinx.mesh.Mesh) -> int:
     return (cmaps[0] if cmaps is not None else mesh.geometry.cmap).degree
 
 
-def _reject_unsupported_shape_control(space_from, space_to, red_op) -> None:
-    """Refuse the cases whose shape derivative the terms below do not cover.
+def _reject_unsupported_shape_control(space_from, space_to, red_op, source_tracked: bool) -> None:
+    """Refuse what the shape terms below do not cover.
 
-    The derivative assumes the target dof is a point evaluation, ``c_i = u(x_i)``, and that the
-    source function is carried along by its mesh with its dofs fixed. Both break for an element
-    whose pullback is not the identity: the dof is then a Piola-mapped moment, and the geometry
-    enters the interpolation operator as well as the points. The same goes for a custom reduction
-    operator, which replaces point evaluation with something else entirely (an average over a
-    circle, say), and whose derivative is a different calculation.
+    They assume each target dof is the source's value at a target point, and that the source is
+    carried along with its mesh. A Piola-mapped target or a Piola-mapped source on a moving mesh
+    breaks that; :py:func:`dolfinx_adjoint.interpolate_nonmatching` splits both cases into
+    blocks that do satisfy it. A custom reduction operator is a different calculation.
 
     Args:
         space_from: The source function's space.
         space_to: The space being interpolated into.
         red_op: The reduction operator, or ``None`` for point evaluation.
+        source_tracked: Whether the source mesh is tracked for shape differentiation.
 
     Raises:
-        NotImplementedError: If either space is not identity-pullback, or a custom ``red_op``
-            is in use.
+        NotImplementedError: For a custom ``red_op``, a Piola-mapped target, or a Piola-mapped
+            source on a tracked mesh.
     """
     if red_op is not None:
         raise NotImplementedError(
             "Shape derivatives of a non-matching interpolation are only implemented for point "
             "evaluation; a custom red_op reduces the source differently and has its own derivative."
         )
-    for label, space in (("source", space_from), ("target", space_to)):
+    checked = [("target", space_to)] + ([("source", space_from)] if source_tracked else [])
+    for label, space in checked:
         pullback = space.ufl_element().pullback
-        if not isinstance(pullback, ufl.pullback.IdentityPullback):
+        if not pullback.is_identity:
             raise NotImplementedError(
-                f"Shape derivatives of a non-matching interpolation need point-evaluation dofs, but "
-                f"the {label} space uses a {type(pullback).__name__} pullback, whose dofs are "
-                "Piola-mapped moments rather than values at points."
+                f"This block's shape terms need an identity-pullback {label}, but it uses a "
+                f"{type(pullback).__name__} pullback. dolfinx_adjoint.interpolate_nonmatching "
+                "handles that case by splitting it into supported steps; use it instead of "
+                "constructing the block directly."
             )
 
 
@@ -114,11 +115,11 @@ class NonmatchingInterpolationBlock(Block):
         # either side is a dependency -- and everything cached about that relative position has
         # to be rebuilt whenever it changes. `_mesh_from` and `_mesh_to` may be the same object,
         # in which case the two derivative terms below cancel, as they should.
-        self._mesh_from = overloaded_mesh(self.space_from.mesh.ufl_domain())
-        self._mesh_to = overloaded_mesh(self.space_to.mesh.ufl_domain())
+        self._mesh_from = get_overloaded_mesh_if_annotated(self.space_from.mesh.ufl_domain())
+        self._mesh_to = get_overloaded_mesh_if_annotated(self.space_to.mesh.ufl_domain())
         self._tracks_geometry = self._mesh_from is not None or self._mesh_to is not None
         if self._tracks_geometry:
-            _reject_unsupported_shape_control(self.space_from, self.space_to, red_op)
+            _reject_unsupported_shape_control(self.space_from, self.space_to, red_op, self._mesh_from is not None)
             for mesh in (self._mesh_from, self._mesh_to):
                 if mesh is not None:
                     self.add_dependency(mesh, no_duplicates=True)
@@ -185,9 +186,11 @@ class NonmatchingInterpolationBlock(Block):
         exact on both.
 
         Returned one component at a time -- entry ``m`` holds ``grad(u_m)`` -- rather than as a
-        single tensor-valued field, because ``fenicsx_ii.create_interpolation_matrix`` cannot
-        build a transfer for a tensor-shaped space. Splitting it also means every component
-        shares one cached matrix, since they all live in the same vector-valued space.
+        single tensor-valued field, so that every component, and every other ``(gdim,)``-valued
+        field the second-order terms transfer, shares one cached matrix. A tensor-valued transfer
+        needs a matrix of its own, and a build costs the same whatever the value shape (~23 s at
+        64x64 to 50x50 P2, against well under 1 ms per application), repeated on every replay
+        that moves a mesh.
 
         Args:
             func_from: The source function, at its checkpointed values.
@@ -247,7 +250,7 @@ class NonmatchingInterpolationBlock(Block):
         """
         assert self._mesh_to is not None
         if "target_op" not in self._shape_workspace:
-            w = ufl.TrialFunction(self._mesh_to._ad_function_space())
+            w = ufl.TrialFunction(self._mesh_to._ad_function_space)
             expression = (
                 ufl.dot(grads[0], w) if self._value_size() == 1 else ufl.as_vector([ufl.dot(grad, w) for grad in grads])
             )
@@ -396,7 +399,7 @@ class NonmatchingInterpolationBlock(Block):
             sampled = dolfinx.fem.Function(self._displacement_space())
             sampled.x.array[:] = 0.0
             mult = get_mult(
-                self._transfer_matrix(mesh._ad_function_space(), self._displacement_space()),
+                self._transfer_matrix(mesh._ad_function_space, self._displacement_space()),
                 transpose=False,
                 accumulate=False,
             )
@@ -429,19 +432,19 @@ class NonmatchingInterpolationBlock(Block):
         """The transpose of :py:meth:`_tangent_geometry_component`, into ``mesh``'s geometry space."""
         out_func = self._geometry_output.get(id(mesh))
         if out_func is None:
-            out_func = _create_function(mesh._ad_function_space())
+            out_func = _create_function(mesh._ad_function_space)
             self._geometry_output[id(mesh)] = out_func
         out_func.x.array[:] = 0.0
 
         if mesh is self._mesh_to:
             out_func.x.array[:] += self._reduced_transpose(
-                self._target_motion_operator(grad_to), adj_vector, mesh._ad_function_space()
+                self._target_motion_operator(grad_to), adj_vector, mesh._ad_function_space
             )
         if mesh is self._mesh_from:
             sampled = dolfinx.fem.Function(self._displacement_space())
             sampled.x.array[:] = -self._contract(adj_vector.array, grad_to, transpose=True)
             mult = get_mult(
-                self._transfer_matrix(mesh._ad_function_space(), self._displacement_space()),
+                self._transfer_matrix(mesh._ad_function_space, self._displacement_space()),
                 transpose=True,
                 accumulate=True,
             )
@@ -539,13 +542,17 @@ class NonmatchingInterpolationBlock(Block):
             d1 = np.zeros_like(grads[0].x.array).reshape(-1, gdim)
             if target_motion is not None:
                 sampled = dolfinx.fem.Function(self._displacement_space())
-                sampled.interpolate(target_motion)  # same mesh: the target points' own motion
+                # Same mesh: the target points' own motion. An Expression, since DOLFINx cannot
+                # interpolate a Function into a quadrature space (the split Piola case uses one).
+                sampled.interpolate(
+                    dolfinx.fem.Expression(target_motion, get_interpolation_points(sampled.function_space))
+                )
                 d1 += sampled.x.array.reshape(-1, gdim)
             if sigma is not None:
                 sampled = dolfinx.fem.Function(self._displacement_space())
                 sampled.x.array[:] = 0.0
                 mult = get_mult(
-                    self._transfer_matrix(self._mesh_from._ad_function_space(), self._displacement_space()),
+                    self._transfer_matrix(self._mesh_from._ad_function_space, self._displacement_space()),
                     transpose=False,
                     accumulate=False,
                 )
@@ -616,20 +623,20 @@ class NonmatchingInterpolationBlock(Block):
                 return out
             lam = adj_input.array.reshape(-1, value_size)
             if mesh is self._mesh_to:
-                w = ufl.TrialFunction(mesh._ad_function_space())
+                w = ufl.TrialFunction(mesh._ad_function_space)
                 q = second["q"]
                 operator = MatrixFreeInterpolationOperator(
                     ufl.dot(q[0], w) if value_size == 1 else ufl.as_vector([ufl.dot(q_m, w) for q_m in q]),
                     self.space_to,
                 )
-                out.array[:] += self._reduced_transpose(operator, adj_input, mesh._ad_function_space())
+                out.array[:] += self._reduced_transpose(operator, adj_input, mesh._ad_function_space)
             if mesh is self._mesh_from:
                 weighted = dolfinx.fem.Function(self._displacement_space())
                 weighted.x.array[:] = -sum(
                     lam[:, m, None] * q_m.x.array.reshape(-1, gdim) for m, q_m in enumerate(second["q"])
                 ).reshape(-1)
                 get_mult(
-                    self._transfer_matrix(mesh._ad_function_space(), self._displacement_space()),
+                    self._transfer_matrix(mesh._ad_function_space, self._displacement_space()),
                     transpose=True,
                     accumulate=True,
                 )(weighted.x, out)
@@ -637,7 +644,7 @@ class NonmatchingInterpolationBlock(Block):
                     grads = [g.x.array.reshape(-1, gdim) for g in prepared["grad"]]
                     for k in range(gdim):
                         weights = sum(lam[:, m, None] * g[:, k, None] * second["d1"] for m, g in enumerate(grads))
-                        out.array[:] -= self._gradient_transpose(weights, mesh._ad_function_space(), k)
+                        out.array[:] -= self._gradient_transpose(weights, mesh._ad_function_space, k)
             out.scatter_forward()
             return out
 

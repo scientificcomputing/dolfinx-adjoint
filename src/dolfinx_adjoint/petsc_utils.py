@@ -113,12 +113,24 @@ class HomogeneousBCLinearProblem(dolfinx.fem.petsc.LinearProblem):
         # dolfinx-adjoint-knowledge's scratch/boundary-control/spec.md for the full
         # derivation.
         if self.tlm_bcs:
+            # Lifted into a zeroed vector of its own and reduced on its own: the caller's
+            # right-hand side arrives already reduced, with its pre-reduction values still in the
+            # ghost entries, so reducing self._b again would add those to their owners a second
+            # time -- wrong in parallel only, and only when both terms are present.
+            lifting = self._b.duplicate()
+            # duplicate() does not carry the block offsets a monolithic blocked vector keeps as
+            # an attribute, which apply_lifting reads to tell it apart from a plain one.
+            if (blocks := self._b.getAttr("_blocks")) is not None:
+                lifting.setAttr("_blocks", blocks)
+            dolfinx.la.petsc._zero_vector(lifting)
             if isinstance(self._u, list):
                 bcs_lift = bcs_by_block(dolfinx.fem.extract_function_spaces(self._L), self.tlm_bcs)  # type: ignore[arg-type]
-                dolfinx.fem.petsc.apply_lifting(self._b, self._a, bcs=bcs_lift)  # type: ignore
+                dolfinx.fem.petsc.apply_lifting(lifting, self._a, bcs=bcs_lift)  # type: ignore
             else:
-                dolfinx.fem.petsc.apply_lifting(self._b, [self._a], bcs=[self.tlm_bcs])  # type: ignore
-            self._b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)  # type: ignore
+                dolfinx.fem.petsc.apply_lifting(lifting, [self._a], bcs=[self.tlm_bcs])  # type: ignore
+            dolfinx.la.petsc._ghost_update(lifting, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore
+            self._b.axpy(1.0, lifting)
+            lifting.destroy()
 
         if self.bcs is not None:
             if isinstance(self._u, list):

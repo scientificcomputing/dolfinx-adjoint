@@ -238,7 +238,7 @@ def test_D_same_quantity_in_the_rhs_is_refused():
 
 def test_E_celldiameter_in_an_interpolated_expression_is_accepted_and_wrong():
     """`ExprInterpolationBlock` registers the mesh for any GeometricQuantity but never
-    calls `reject_geometry_without_shape_derivative`, so the dropped term is silent."""
+    calls `reject_form_with_unsupported_shape_derivative`, so the dropped term is silent."""
 
     def forward(values=None, mix=True):
         pyadjoint.get_working_tape().clear_tape()

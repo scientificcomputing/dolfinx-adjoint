@@ -347,3 +347,54 @@ def test_time_dependent_bc_replay():
     Jhat(m)
     min_rate_grad = pyadjoint.taylor_test(Jhat, m, pert)
     assert np.isclose(min_rate_grad, 2.0, rtol=1e-2, atol=5e-2), f"Expected 2.0, got {min_rate_grad}"
+
+
+def test_tangent_linear_with_a_bc_control_and_a_source_control():
+    """The tangent-linear model with a Dirichlet-value direction and another right-hand-side term.
+
+    The TLM solve lifts the bc direction into a right-hand side that already holds, reduced, the
+    source control's term. Lifting into that same vector and reducing it again added the ghost
+    entries' pre-reduction values to their owners a second time: exact in serial, 3e-3 wrong on
+    two ranks. Checked by value, so a parallel run of this test catches it.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    g = Function(V, name="g")
+    g.interpolate(lambda x: x[0] ** 2 + x[1])
+    f = Function(V, name="f")
+    f.interpolate(lambda x: 1.0 + x[0] * x[1])
+    bc = dirichletbc(g, dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets))
+    problem = LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(f, v) * ufl.dx,
+        bcs=[bc],
+        petsc_options=direct_solve,
+        adjoint_petsc_options=direct_solve,
+        tlm_petsc_options=direct_solve,
+        petsc_options_prefix="test_bc_and_source_tlm_",
+    )
+    uh = problem.solve()
+    J = assemble_scalar(uh * uh * ufl.dx)
+    controls = [pyadjoint.Control(g), pyadjoint.Control(f)]
+    Jhat = pyadjoint.ReducedFunctional(J, controls)
+    dg, df = Function(V), Function(V)
+    dg.interpolate(lambda x: np.sin(3 * x[0]) + x[1] ** 2)
+    df.interpolate(lambda x: np.cos(x[1]))
+    tlm = float(Jhat.tlm([dg, df]))
+
+    eps = 1e-6
+    base_g, base_f = g.x.array.copy(), f.x.array.copy()
+
+    def J_at(step):
+        gs, fs = Function(V), Function(V)
+        gs.x.array[:] = base_g + step * dg.x.array
+        fs.x.array[:] = base_f + step * df.x.array
+        return float(Jhat([gs, fs]))
+
+    fd = (J_at(eps) - J_at(-eps)) / (2 * eps)
+    assert abs(fd) > 1e-8
+    assert abs(tlm - fd) < 1e-7 * abs(fd), f"tangent-linear {tlm} vs finite difference {fd}"

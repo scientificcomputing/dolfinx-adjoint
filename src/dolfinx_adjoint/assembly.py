@@ -10,6 +10,7 @@ from pyadjoint.overloaded_type import create_overloaded_object
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 
 from .blocks.assembly import AssembleBlock
+from .ufl_utils import pin_quadrature_degrees
 
 
 def assemble_scalar(form: ufl.Form, **kwargs):
@@ -25,6 +26,8 @@ def assemble_scalar(form: ufl.Form, **kwargs):
             assembling with Arguments and coefficients form meshes that has some relation.
     """
     ad_block_tag = kwargs.pop("ad_block_tag", None)
+    # So every derivative of the functional uses the quadrature it was assembled with.
+    form = pin_quadrature_degrees(form)
 
     annotate = annotate_tape(kwargs)
     with stop_annotating():

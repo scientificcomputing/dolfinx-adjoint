@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import typing
 import weakref
 
@@ -10,7 +11,7 @@ import ufl
 from pyadjoint.overloaded_type import OverloadedType
 from pyadjoint.tape import no_annotations
 
-__all__ = ["Mesh", "annotate_mesh", "geometry_function_space", "overloaded_mesh"]
+__all__ = ["Mesh", "annotate_mesh", "apply_displacement", "geometry_function_space", "get_overloaded_mesh_if_annotated"]
 
 
 # Maps a `ufl.Mesh` domain to the annotated `dolfinx.mesh.Mesh` carrying it, so that a
@@ -23,10 +24,10 @@ _annotated_meshes: weakref.WeakValueDictionary[int, "Mesh"] = weakref.WeakValueD
 def geometry_function_space(mesh: dolfinx.mesh.Mesh) -> dolfinx.fem.FunctionSpace:
     """Return the function space a displacement of ``mesh``'s geometry lives in.
 
-    This is {py:func}`scifem.mesh.create_geometry_function_space`'s space: it is built on
-    the geometry dofmap, so its dofs correspond one-to-one, in order, with the rows of
-    ``mesh.geometry.x``. That correspondence is what makes an assembled shape derivative
-    and a displacement applied by {py:func}`~dolfinx_adjoint.move` the same vector.
+    Wrapper around {py:func}`scifem.mesh.create_geometry_function_space` that
+    creates a {py:class}`dolfinx.fem.FunctionSpace` on the mesh's coordinate element,
+    so addition into the underlying {py:attr}`dolfinx.mesh.Geometry.x` is possible to do
+    with operations such as ``+=``.
 
     Args:
         mesh: The mesh whose geometry is to be displaced.
@@ -39,6 +40,22 @@ def geometry_function_space(mesh: dolfinx.mesh.Mesh) -> dolfinx.fem.FunctionSpac
     except ImportError as e:
         raise ImportError("scifem >= 0.25 is required for shape control: pip install 'scifem>=0.25'") from e
     return scifem.mesh.create_geometry_function_space(mesh)
+
+
+def apply_displacement(mesh: dolfinx.mesh.Mesh, displacement: dolfinx.fem.Function) -> None:
+    """Add ``displacement`` to ``mesh``'s coordinates, without touching the tape.
+
+    The unannotated core of {py:func}`move`, shared with
+    {py:meth}`~dolfinx_adjoint.blocks.mesh.MoveBlock.recompute_component`.
+
+    Args:
+        mesh: The mesh to move. Must already be tracked -- wrap it with
+            {py:class}`dolfinx_adjoint.Mesh` where you create or read it.
+        displacement: The displacement, in the mesh's geometry function space.
+    """
+    displacement.x.scatter_forward()  # Ensure that ghost nodes are up to date
+    gdim = mesh.geometry.dim
+    mesh.geometry.x[:, :gdim] += displacement.x.array.reshape(-1, gdim)
 
 
 class Mesh(dolfinx.mesh.Mesh, OverloadedType):
@@ -114,13 +131,15 @@ class Mesh(dolfinx.mesh.Mesh, OverloadedType):
         :py:func:`annotate_mesh` skips it for a mesh that is already promoted.
         """
         OverloadedType.__init__(self)
-        self._ad_coordinate_space: dolfinx.fem.FunctionSpace | None = None
 
+    @functools.cached_property
     def _ad_function_space(self) -> dolfinx.fem.FunctionSpace:
-        """The geometry function space, built once and cached on the mesh."""
-        if self._ad_coordinate_space is None:
-            self._ad_coordinate_space = geometry_function_space(self)
-        return self._ad_coordinate_space
+        """The geometry function space, built on first use.
+
+        Cached for the mesh's lifetime: moving the mesh changes its coordinates, never the
+        geometry dofmap or index map the space is built on.
+        """
+        return geometry_function_space(self)
 
     @no_annotations
     def _ad_create_checkpoint(self) -> npt.NDArray[np.floating]:
@@ -152,23 +171,17 @@ class Mesh(dolfinx.mesh.Mesh, OverloadedType):
 def annotate_mesh(mesh: dolfinx.mesh.Mesh) -> Mesh:
     """Promote ``mesh`` in place so that its geometry can be differentiated through.
 
-    The mesh's ``__class__`` is reassigned to {py:class}`Mesh`. Promoting in place, rather
-    than returning a new object, is what lets a mesh created by any of DOLFINx's many
-    entry points -- {py:func}`dolfinx.mesh.create_unit_square`, ``gmshio``, XDMF, a
-    submesh -- take part in a shape optimization without this package having to overload
-    each of them. Every function space, form and compiled kernel already built on the mesh
-    keeps working, since the object's identity is unchanged.
+    Done so that the user can supply the msh from any of DOLFINx's entry points.
 
     Idempotent: a mesh that is already annotated is returned unchanged, keeping the block
     variable it has accumulated on the tape.
 
     Should be called before anything is posed on the mesh. A block built earlier cannot take the
     mesh as a dependency, so replaying the tape does not rewind the geometry before re-running
-    it -- the block is re-evaluated on whatever the previous replay left behind, and the
+    it. The block is re-evaluated on whatever the previous replay left behind, and the
     gradient drifts from the second distinct control value onwards while every Taylor test
-    still passes. Annotating late is not refused here, though: on its own it costs nothing, and
-    nothing can go wrong until the geometry actually changes. The refusal sits in
-    {py:func}`~dolfinx_adjoint.move`, which checks for such blocks before it moves anything.
+    still passes. Annotating late is not refused here, it should be refused in classes that modify
+    the mesh geometry, i.e. {py:func}`~dolfinx_adjoint.move`.
 
     Args:
         mesh: The mesh to promote.
@@ -185,20 +198,19 @@ def annotate_mesh(mesh: dolfinx.mesh.Mesh) -> Mesh:
     return typing.cast(Mesh, mesh)
 
 
-def overloaded_mesh(domain: ufl.Mesh | None) -> Mesh | None:
+def get_overloaded_mesh_if_annotated(domain: ufl.Mesh | None) -> Mesh | None:
     """Return the annotated mesh carrying ``domain``, or ``None`` if there is none.
 
-    A block generally holds a form, and a form knows only its {py:class}`ufl.Mesh` domain
-    -- whose ``ufl_cargo()`` is the *C++* mesh, not the Python one that carries the tape's
-    block variable. This is the lookup back to the Python mesh, and returning ``None`` is
-    the ordinary answer for any problem that is not a shape optimization.
+    In most places DOLFINx objects holds a direct reference to the C++ mesh, rather than
+    the {py:class}`dolfinx.mesh.Mesh` (because it is accessed through `ufl_cargo()`.
+    This gets the annotated mesh from a lookup table (based on the domain's unique `ufl_id()`).
 
     Args:
         domain: The form's UFL domain, or ``None``.
 
     Returns:
         The annotated mesh, or ``None`` if ``domain`` is ``None`` or its mesh was never
-        passed to {py:func}`~dolfinx_adjoint.move`.
+        wrapped in {py:class}`dolfinx_adjoint.Mesh`.
     """
     if domain is None:
         return None

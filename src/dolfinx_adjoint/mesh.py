@@ -8,7 +8,8 @@ import ufl
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 
 from .blocks.mesh import MoveBlock
-from .types.mesh import Mesh, annotate_mesh, geometry_function_space
+from .interpolation import interpolate
+from .types.mesh import Mesh, annotate_mesh, apply_displacement, geometry_function_space
 
 __all__ = ["move", "annotate_mesh", "geometry_function_space", "apply_displacement"]
 
@@ -85,22 +86,6 @@ def _reject_schedule_that_breaks_shape_derivatives() -> None:
         f"that retains every step -- {', '.join(sorted(_SHAPE_SAFE_SCHEDULES))} -- or no "
         "schedule at all."
     )
-
-
-def apply_displacement(mesh: dolfinx.mesh.Mesh, displacement: dolfinx.fem.Function) -> None:
-    """Add ``displacement`` to ``mesh``'s coordinates, without touching the tape.
-
-    The unannotated core of {py:func}`move`, shared with
-    {py:meth}`~dolfinx_adjoint.blocks.mesh.MoveBlock.recompute_component`.
-
-    Args:
-        mesh: The mesh to move. Must already be tracked -- wrap it with
-            {py:class}`dolfinx_adjoint.Mesh` where you create or read it.
-        displacement: The displacement, in the mesh's geometry function space.
-    """
-    displacement.x.scatter_forward()  # Ensure that ghost nodes are up to date
-    gdim = mesh.geometry.dim
-    mesh.geometry.x[:, :gdim] += displacement.x.array.reshape(-1, gdim)
 
 
 def _is_geometry_function(mesh: dolfinx.mesh.Mesh, candidate: typing.Any, V_geom: dolfinx.fem.FunctionSpace) -> bool:
@@ -196,8 +181,6 @@ def _as_geometry_displacement(
             (:py:func:`~dolfinx_adjoint.interpolate_nonmatching`), not something to do silently
             here.
     """
-    from .interpolation import interpolate
-
     if _is_geometry_function(mesh, displacement, V_geom):
         return displacement
 

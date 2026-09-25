@@ -5,53 +5,13 @@ from mpi4py import MPI
 import dolfinx
 import ufl
 from pyadjoint import Block, OverloadedType, create_overloaded_object
+from ufl.algorithms.analysis import extract_arguments
 from ufl.formatting.ufl2unicode import ufl2unicode
 
+from ..types.mesh import Mesh, get_overloaded_mesh_if_annotated
+from ..ufl_utils import reject_form_with_unsupported_shape_derivative
+from ._assemble import assemble_compiled_form  # noqa: F401
 from ._vector import _create_vector, _SpecialVector, _vector  # noqa: F401
-
-
-def assemble_compiled_form(
-    form: dolfinx.fem.Form,
-    tensor: typing.Union[dolfinx.la.Vector, _SpecialVector | float] | None = None,
-    finalize: bool = True,
-) -> typing.Union[dolfinx.la.Vector, _SpecialVector, float]:
-    """Assemble a compiled form into ``tensor`` (or return a new scalar).
-
-    Args:
-        form: Compiled form to assemble.
-        tensor: For a rank-1 form, the vector to accumulate the assembled contribution
-            into, while it is unused for a rank-0 form.
-        finalize: Whether to reduce ``tensor`` across ranks once the contribution is in.
-            Leave it ``True`` for a vector this is the only contribution to. Pass ``False``
-            for every call but the last when several forms accumulate into one vector, and
-            reduce once at the end: the reduction is ``scatter_reverse(add)`` followed by
-            ``scatter_forward()``, so reducing after each call would leave every ghost entry
-            holding a copy of its owner's running total, which the *next* call's
-            ``scatter_reverse`` would then add to the owner again -- once per ghosting rank.
-            That is invisible in serial and grows with the rank count.
-    Returns:
-        For a rank-1 form, ``tensor`` itself (mutated in place). For a rank-0 form, the
-        assembled scalar as a Python ``float``.
-    Raises:
-        NotImplementedError: If the form's rank is not 0 or 1.
-    """
-
-    if form.rank == 1:
-        if tensor is None:
-            raise ValueError("tensor must be provided for rank-1 forms.")
-        assert isinstance(tensor, dolfinx.la.Vector)
-        dolfinx.fem.assemble._assemble_vector_array(tensor.array, form)
-        if finalize:
-            tensor.scatter_reverse(dolfinx.la.InsertMode.add)
-            tensor.scatter_forward()
-    elif form.rank == 0:
-        local_val = dolfinx.fem.assemble_scalar(form)
-        comm = form.mesh.comm
-        tensor = comm.allreduce(local_val, op=MPI.SUM)
-    else:
-        raise NotImplementedError("Only 1-form assembly is currently supported.")
-    assert tensor is not None
-    return tensor
 
 
 class AssembleBlock(Block):
@@ -86,18 +46,11 @@ class AssembleBlock(Block):
             form, jit_options=jit_options, form_compiler_options=form_compiler_options, entity_maps=entity_maps
         )
 
-        # A form's dependence on geometry is carried by its SpatialCoordinate, so an
-        # overloaded mesh is a dependency of every form posed on it -- differentiated below via
-        # ufl.derivative w.r.t. that coordinate. Overloading is something the user opts into
-        # explicitly with `dolfinx_adjoint.Mesh(mesh)`; for every other mesh, which is every
-        # problem that is not a shape optimization, the lookup comes back None and the
-        # dependency is skipped.
-        from ..types.mesh import overloaded_mesh
-        from ..ufl_utils import reject_geometry_without_shape_derivative
-
-        mesh = overloaded_mesh(self.form.ufl_domain())
+        # If the mesh is annotated, it means that it potentially needs shape derivatives, and we store
+        # it as a dependency of the block.
+        mesh = get_overloaded_mesh_if_annotated(self.form.ufl_domain())
         if mesh is not None:
-            reject_geometry_without_shape_derivative(self.form)
+            reject_form_with_unsupported_shape_derivative(self.form)
             self.add_dependency(mesh, no_duplicates=True)
         else:
             # See _ProblemBlockBase._register_mesh_dependency: a block built before the mesh
@@ -227,10 +180,6 @@ class AssembleBlock(Block):
         c = block_variable.output
         c_rep = block_variable.saved_output
 
-        from ufl.algorithms.analysis import extract_arguments
-
-        from ..types.mesh import Mesh
-
         arity_form = len(extract_arguments(form))
 
         if isinstance(c, Mesh):
@@ -238,7 +187,7 @@ class AssembleBlock(Block):
             # is what the form actually references. c_rep is the checkpointed coordinate
             # array, which is not a UFL object, so the mesh itself supplies both.
             c_rep = ufl.SpatialCoordinate(c)
-            space = c._ad_function_space()
+            space = c._ad_function_space
         elif isinstance(c, dolfinx.fem.Function):
             space = c.function_space
         else:
@@ -252,10 +201,6 @@ class AssembleBlock(Block):
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
         form = prepared
         dform = 0.0
-
-        from ufl.algorithms.analysis import extract_arguments
-
-        from ..types.mesh import Mesh
 
         arity_form = len(extract_arguments(form))
         for bv in self.get_dependencies():
@@ -299,10 +244,6 @@ class AssembleBlock(Block):
         hessian_input = hessian_inputs[0]
         adj_input = adj_inputs[0]
 
-        from ufl.algorithms.analysis import extract_arguments
-
-        from ..types.mesh import Mesh
-
         arity_form = len(extract_arguments(form))
 
         c1 = block_variable.output
@@ -317,7 +258,7 @@ class AssembleBlock(Block):
             # what the form actually references. The mesh's checkpoint is a coordinate array,
             # not a UFL object, so the mesh itself supplies both.
             c1_rep = ufl.SpatialCoordinate(c1)
-            space = c1._ad_function_space()
+            space = c1._ad_function_space
         elif isinstance(c1, dolfinx.fem.Function):
             space = c1.function_space
         else:

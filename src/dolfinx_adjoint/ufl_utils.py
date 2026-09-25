@@ -4,9 +4,59 @@ import typing
 
 import ufl
 from ufl.algorithms.analysis import extract_type
+from ufl.algorithms.compute_form_data import attach_estimated_degrees, preprocess_form
+from ufl.algorithms.domain_analysis import group_form_integrals
 
 from .compat import compute_form_adjoint
 from .typing_utils import NestedSequence
+
+
+def pin_quadrature_degrees(form: typing.Any) -> typing.Any:
+    """``form`` with each integral's quadrature degree fixed to the one FFCx would estimate for it.
+
+    FFCx estimates a degree per form, so a derivative form built from ``form`` would otherwise get
+    its own, and for a non-polynomial integrand would not be the exact derivative of what was
+    assembled. Pinning the degree on the forms dxa is given, before anything is derived from them,
+    keeps every derivative on the same quadrature rule, since ``ufl.derivative``, ``action`` and
+    ``replace`` keep integral metadata. The estimate is computed as ``compute_form_data`` computes
+    it, so the forward result does not change.
+
+    Args:
+        form: A form, ``None``, or a (nested) sequence of them, as a blocked problem passes.
+
+    Returns:
+        The same structure, with ``quadrature_degree`` set on every integral that had none.
+    """
+    if form is None:
+        return None
+    if isinstance(form, (list, tuple)):
+        return type(form)(pin_quadrature_degrees(part) for part in form)
+    if not isinstance(form, ufl.Form) or form.empty():
+        return form
+    grouped = group_form_integrals(
+        preprocess_form(form, False), form.ufl_domains(), do_append_everywhere_integrals=False
+    )
+    degrees: dict[tuple, int] = {}
+    for integral in attach_estimated_degrees(grouped).integrals():
+        metadata = dict(integral.metadata())
+        degree = int(metadata.pop("estimated_polynomial_degree"))
+        for subdomain in integral.subdomain_id():
+            key = (integral.ufl_domain(), integral.integral_type(), subdomain, repr(sorted(metadata.items())))
+            degrees[key] = max(degree, degrees.get(key, degree))
+    pinned = []
+    for integral in form.integrals():
+        metadata = integral.metadata()
+        if "quadrature_degree" in metadata:
+            pinned.append(integral)
+            continue
+        subdomains = integral.subdomain_id()
+        subdomains = subdomains if isinstance(subdomains, tuple) else (subdomains,)
+        subdomains = tuple("otherwise" if sid == "everywhere" else sid for sid in subdomains)
+        md = repr(sorted(metadata.items()))
+        degree = max(degrees[(integral.ufl_domain(), integral.integral_type(), sid, md)] for sid in subdomains)
+        pinned.append(integral.reconstruct(metadata={**metadata, "quadrature_degree": degree}))
+    return ufl.Form(pinned)
+
 
 # Geometric quantities whose shape derivative UFL gets right. Everything else in
 # `ufl.classes.GeometricQuantity` is differentiated to *zero*: `CoordinateDerivativeRuleset`
@@ -27,83 +77,54 @@ from .typing_utils import NestedSequence
 _SHAPE_DIFFERENTIABLE_GEOMETRY = frozenset({"SpatialCoordinate", "FacetNormal", "CellVolume", "FacetArea"})
 
 
-def geometry_without_shape_derivative(form: NestedSequence[ufl.BaseForm | None]) -> set[str]:
-    """Names of geometric quantities in ``form`` that UFL differentiates to zero.
+def geometry_with_unsupported_shape_derivative(
+    obj: NestedSequence[ufl.BaseForm | ufl.core.expr.Expr | None],
+) -> set[str]:
+    """Names of geometric quantities in ``obj`` that UFL differentiates to zero.
 
     Args:
-        form: A single form, ``None``, or an arbitrarily nested sequence of forms/``None``
+        obj: A form, an expression, ``None``, or an arbitrarily nested sequence of these
             (a blocked system's right-hand side is a list, and ``ufl.extract_blocks`` returns
             tuples).
 
     Returns:
         The distinct type names of the offending quantities, empty if there are none.
     """
-    if form is None:
+    if obj is None:
         return set()
-    if isinstance(form, ufl.BaseForm):
+    if isinstance(obj, ufl.BaseForm | ufl.core.expr.Expr):
         return {
             type(quantity).__name__
-            for quantity in extract_type(form, ufl.classes.GeometricQuantity)
+            for quantity in extract_type(obj, ufl.classes.GeometricQuantity)
             if type(quantity).__name__ not in _SHAPE_DIFFERENTIABLE_GEOMETRY
         }
     offenders: set[str] = set()
-    for part in form:
-        offenders |= geometry_without_shape_derivative(part)
+    for part in obj:
+        offenders |= geometry_with_unsupported_shape_derivative(part)
     return offenders
 
 
-def reject_geometry_without_shape_derivative(form: NestedSequence[ufl.BaseForm | None]) -> None:
-    """Refuse a form whose shape derivative UFL would silently get wrong.
+def reject_form_with_unsupported_shape_derivative(
+    obj: NestedSequence[ufl.BaseForm | ufl.core.expr.Expr | None],
+) -> None:
+    """Refuse a form or expression whose shape derivative UFL would silently get wrong.
 
     Called only once a mesh is known to have been moved, so a form using these quantities on a
     mesh nobody differentiates through is left alone.
 
     Args:
-        form: The form, or nested structure of forms, about to gain a mesh dependency.
+        obj: The form, expression, or nested structure of forms, about to gain a mesh
+            dependency.
 
     Raises:
-        NotImplementedError: If ``form`` contains a geometric quantity that UFL differentiates
+        NotImplementedError: If ``obj`` contains a geometric quantity that UFL differentiates
             to zero with respect to the coordinates.
     """
-    offenders = geometry_without_shape_derivative(form)
+    offenders = geometry_with_unsupported_shape_derivative(obj)
     if offenders:
         raise NotImplementedError(
-            f"Cannot take a shape derivative of a form containing {', '.join(sorted(offenders))}: "
-            "UFL differentiates every geometric quantity except "
-            f"{', '.join(sorted(_SHAPE_DIFFERENTIABLE_GEOMETRY))} to zero with respect to the "
-            "coordinates, so the contribution would be dropped and the gradient would be "
-            "silently wrong rather than merely incomplete. Express the quantity through "
-            "SpatialCoordinate instead, or do not move this mesh."
-        )
-
-
-def reject_geometry_in_expression(expr: ufl.core.expr.Expr) -> None:
-    """Refuse a bare expression whose shape derivative UFL would silently get wrong.
-
-    The expression counterpart of {py:func}`reject_geometry_without_shape_derivative`, for
-    interpolation, where there is no form to scan and no measure to attach one to.
-
-    Args:
-        expr: The expression about to gain a mesh dependency.
-
-    Raises:
-        NotImplementedError: If ``expr`` contains a geometric quantity that UFL differentiates
-            to zero with respect to the coordinates.
-    """
-    from ufl.algorithms.analysis import traverse_unique_terminals
-
-    offenders = sorted(
-        {
-            type(terminal).__name__
-            for terminal in traverse_unique_terminals(expr)
-            if isinstance(terminal, ufl.classes.GeometricQuantity)
-            and type(terminal).__name__ not in _SHAPE_DIFFERENTIABLE_GEOMETRY
-        }
-    )
-    if offenders:
-        raise NotImplementedError(
-            f"Cannot take a shape derivative of an expression containing {', '.join(offenders)}: "
-            "UFL differentiates every geometric quantity except "
+            f"Cannot take a shape derivative of a form or expression containing "
+            f"{', '.join(sorted(offenders))}: UFL differentiates every geometric quantity except "
             f"{', '.join(sorted(_SHAPE_DIFFERENTIABLE_GEOMETRY))} to zero with respect to the "
             "coordinates, so the contribution would be dropped and the gradient would be "
             "silently wrong rather than merely incomplete. Express the quantity through "

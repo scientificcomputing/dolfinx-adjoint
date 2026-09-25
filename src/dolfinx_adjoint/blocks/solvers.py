@@ -15,12 +15,12 @@ import ufl
 
 from ..compat import bcs_by_block
 from ..types import Function
-from ..types.mesh import Mesh, overloaded_mesh
+from ..types.mesh import Mesh, get_overloaded_mesh_if_annotated
 from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
 from ..ufl_utils import (
     assign_mixed_parts,
     get_sorted_arguments,
-    reject_geometry_without_shape_derivative,
+    reject_form_with_unsupported_shape_derivative,
     sum_form,
 )
 from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form
@@ -288,7 +288,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         {py:class}`ufl.SpatialCoordinate`, exactly as it depends on any coefficient
         appearing in it. Overloading is explicit -- the user wraps the mesh in
         {py:class}`dolfinx_adjoint.Mesh` -- so
-        {py:func}`~dolfinx_adjoint.types.mesh.overloaded_mesh` returns ``None`` for every mesh
+        {py:func}`~dolfinx_adjoint.types.mesh.get_overloaded_mesh_if_annotated` returns ``None`` for every mesh
         nobody opted in for, which is every problem that is not a shape optimization, and then
         this is a no-op.
 
@@ -302,10 +302,11 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         """
         u = self._u[0] if isinstance(self._u, list) else self._u
         assert isinstance(u, dolfinx.fem.Function)
-        mesh = overloaded_mesh(u.function_space.mesh.ufl_domain())
+        mesh = get_overloaded_mesh_if_annotated(u.function_space.mesh.ufl_domain())
         if mesh is not None:
-            for form in (self._rhs, getattr(self, "_lhs", None), getattr(self, "_preconditioner", None)):
-                reject_geometry_without_shape_derivative(form)
+            reject_form_with_unsupported_shape_derivative(
+                [self._rhs, getattr(self, "_lhs", None), getattr(self, "_preconditioner", None)]
+            )
             self.add_dependency(mesh, no_duplicates=True)
         else:
             # The mesh is not overloaded, so it is not a control and the dependency is
@@ -403,7 +404,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         test_functions = list(get_sorted_arguments(residual.arguments(), 0))
         contracted = ufl.replace(residual, dict(zip(test_functions, adjoint_solutions, strict=True)))
 
-        V_geom = mesh._ad_function_space()
+        V_geom = mesh._ad_function_space
         dFdX = ufl.algorithms.expand_derivatives(
             ufl.derivative(contracted, ufl.SpatialCoordinate(mesh), ufl.TestFunction(V_geom))
         )
@@ -1153,7 +1154,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             # The shape terms differentiate w.r.t. ufl.SpatialCoordinate(c) rather than a
             # placeholder Function (see _ProblemBase._differentiation_targets), so their
             # one-forms test against the geometry space.
-            W = c._ad_function_space()
+            W = c._ad_function_space
         else:
             assert isinstance(c, dolfinx.fem.Function)
             W = c.function_space

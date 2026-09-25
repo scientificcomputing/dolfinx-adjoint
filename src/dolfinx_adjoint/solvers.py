@@ -17,11 +17,13 @@ from .blocks.solvers import (
 )
 from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
+from .types.mesh import get_overloaded_mesh_if_annotated
 from .typing_utils import MaybeBlocked, MaybeBlockedMatrix
 from .ufl_utils import (
     assign_mixed_parts,
     compute_adjoint,
     get_sorted_arguments,
+    pin_quadrature_degrees,
     recursive_replace,
     sum_form,
 )
@@ -306,10 +308,8 @@ class _ProblemBase(abc.ABC):
         dropped from the tangent-linear right-hand side. The lookup is one dictionary access
         into a ``WeakValueDictionary``; the templates it guards are compiled code.
         """
-        from .types.mesh import overloaded_mesh
-
         u = self._u[0] if isinstance(self._u, list) else self._u
-        return overloaded_mesh(u.function_space.mesh.ufl_domain())
+        return get_overloaded_mesh_if_annotated(u.function_space.mesh.ufl_domain())
 
     def _differentiation_targets(self, seed_placeholders: dict) -> list:
         """Every quantity the Hessian templates differentiate with respect to.
@@ -327,7 +327,7 @@ class _ProblemBase(abc.ABC):
         ]
         mesh = self._get_shape_mesh()
         if mesh is not None:
-            targets.append((mesh, ufl.SpatialCoordinate(mesh), seed_placeholders[mesh], mesh._ad_function_space()))
+            targets.append((mesh, ufl.SpatialCoordinate(mesh), seed_placeholders[mesh], mesh._ad_function_space))
         return targets
 
     @abc.abstractmethod
@@ -460,7 +460,7 @@ class _ProblemBase(abc.ABC):
                 # after: scaling a form that still holds an unexpanded CoordinateDerivative
                 # puts a node outside it, and UFL rejects that ("CoordinateDerivative(s) must
                 # be outermost").
-                V_geom = mesh._ad_function_space()
+                V_geom = mesh._ad_function_space
                 seed = dolfinx.fem.Function(V_geom, name="shape_tlm_seed")
                 dFdX = ufl.algorithms.expand_derivatives(ufl.derivative(-F_template, ufl.SpatialCoordinate(mesh), seed))
                 if isinstance(self._u, list):
@@ -960,6 +960,8 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
             a, L = assign_mixed_parts(a, L)  # type: ignore[arg-type]
             if P is not None:
                 P, _ = assign_mixed_parts(P, L)  # type: ignore[arg-type]
+        # Before anything is derived from them, so every derivative uses the forward's quadrature.
+        a, L, P = pin_quadrature_degrees(a), pin_quadrature_degrees(L), pin_quadrature_degrees(P)
 
         self._u = find_or_create_then_overload(u, L)  # type: ignore[arg-type]
 
@@ -1175,6 +1177,8 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         # components.
         if not isinstance(F, ufl.Form):
             F = assign_mixed_parts(F)  # type: ignore[arg-type]
+        # Before anything is derived from them, so every derivative uses the forward's quadrature.
+        F, J, P = pin_quadrature_degrees(F), pin_quadrature_degrees(J), pin_quadrature_degrees(P)
 
         self._u = find_or_create_then_overload(u, F)  # type: ignore[arg-type]
         self._bcs = [] if bcs is None else bcs
