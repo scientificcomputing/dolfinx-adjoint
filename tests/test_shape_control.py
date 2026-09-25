@@ -1297,27 +1297,122 @@ def test_the_manual_pullback_inverse_matches_ufls(name):
     assert norm(reference - manual) < 1e-12 * norm(reference)
 
 
-@pytest.mark.parametrize("tracked", ["source", "target"])
-def test_nonmatching_interpolation_on_a_tracked_mesh_is_refused(tracked):
-    """Non-matching interpolation has no shape derivative, and fails the forward too.
+def _nonmatching_forward(step, direction, moved: str, vector: bool = False, same_mesh: bool = False):
+    """A functional of ``interpolate_nonmatching(u, V_B)``, with one mesh displaced.
 
-    Where the two meshes sit relative to each other is computed once and cached on the block, so
-    once either moves, replaying the tape returns the wrong *value* -- 31% wrong on a unit square
-    contracted by 0.1 -- quite apart from the two derivative terms nobody records. Refused rather
-    than left to produce a plausible number.
+    ``u``'s dofs are set on the *undeformed* mesh, before the move. The adjoint holds a
+    coefficient's dofs fixed, so the finite difference has to as well; interpolating after the
+    move would re-sample the function at the moved nodes and hold the function fixed instead --
+    for a quadratic in P2 that makes a source-mesh displacement change nothing at all.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    mesh_b = mesh_a if same_mesh else _unit_square(5)
+    tracked = dxa.Mesh(mesh_a if moved == "source" else mesh_b)
+
+    shape = (2,) if vector else ()
+    V_a = dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2, shape))
+    u = dxa.Function(V_a)
+    if vector:
+        u.interpolate(lambda x: np.vstack((x[0] ** 2 + 2.0 * x[1], x[1] ** 2 - x[0])))
+    else:
+        u.interpolate(lambda x: x[0] ** 2 + 2.0 * x[1])
+
+    S = dxa.geometry_function_space(tracked)
+    s = dxa.Function(S)
+    if step is not None:
+        s.x.array[:] = step * direction
+    dxa.move(tracked, s)
+
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1, shape)))
+    return dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx), s, S
+
+
+def _contraction(n: int) -> np.ndarray:
+    """A displacement towards the centre, so the moved mesh stays inside the other one."""
+    d = dolfinx.fem.Function(dxa.geometry_function_space(_unit_square(n)))
+    d.interpolate(lambda x: np.vstack((0.3 * (0.5 - x[0]), 0.3 * (0.5 - x[1]))))
+    return d.x.array.copy()
+
+
+@pytest.mark.parametrize(
+    "moved,vector,same_mesh",
+    [
+        ("target", False, False),
+        ("source", False, False),
+        ("target", True, False),
+        ("source", True, False),
+        ("target", False, True),
+    ],
+    ids=["target", "source", "target-vector", "source-vector", "same-mesh"],
+)
+def test_shape_derivative_of_nonmatching_interpolation(moved, vector, same_mesh):
+    """Both ways a non-matching interpolation depends on the geometry, checked by value.
+
+    Writing ``c_i = u_A(x_i)`` for the target dofs: displacing the target moves the points,
+    ``dc_i = grad(u_A)(x_i) . dx_B(x_i)``; displacing the source carries ``u_A`` along with its
+    mesh, ``du_A = -grad(u_A) . s_A``. On one mesh the two cancel, leaving only the measure's
+    contribution from the functional -- which a wrong sign on either would not.
     """
     pytest.importorskip("fenicsx_ii")
+    h = _contraction(7 if (moved == "source" or same_mesh) else 5)
+    eps = 1e-6
+    # Every rebuild first: a clear_tape() under a live ReducedFunctional invalidates it.
+    fd = (
+        float(_nonmatching_forward(eps, h, moved, vector, same_mesh)[0])
+        - float(_nonmatching_forward(-eps, h, moved, vector, same_mesh)[0])
+    ) / (2 * eps)
+    assert abs(fd) > 1e-8, "the direction must actually change the functional"
+
+    J, s, S = _nonmatching_forward(None, h, moved, vector, same_mesh)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    assert abs(_directional(Jhat.derivative(), hf, S) - fd) < 1e-6 * abs(fd)
+    assert abs(float(Jhat.tlm(hf)) - fd) < 1e-6 * abs(fd), "the tangent-linear model must agree too"
+
+
+@pytest.mark.parametrize("moved", ["source", "target"])
+def test_nonmatching_interpolation_replays_at_the_moved_geometry(moved):
+    """Where the meshes sit relative to each other has to be recomputed on every replay.
+
+    ``interpolation_data`` locates each target point inside a source cell and stores its
+    reference coordinates there. Kept from the first evaluation, it describes a geometry that no
+    longer exists, and the replayed *value* is wrong before any derivative is involved -- 2% when
+    the target moves and more than 100% when the source does, for this displacement.
+    """
+    pytest.importorskip("fenicsx_ii")
+    h = _contraction(7 if moved == "source" else 5)
+    steps = (0.05, 0.10, 0.05)
+    rebuilt = {step: float(_nonmatching_forward(step, h, moved)[0]) for step in steps}
+    J, s, S = _nonmatching_forward(None, h, moved)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    for step in steps:
+        f = dxa.Function(S)
+        f.x.array[:] = step * h
+        assert abs(float(Jhat(f)) - rebuilt[step]) < 1e-11 * abs(rebuilt[step]), f"s = {step}"
+
+
+def test_nonmatching_shape_hessian_is_refused():
+    """The second derivative needs grad(grad(u)) and the derivative of the point location."""
+    pytest.importorskip("fenicsx_ii")
+    J, s, S = _nonmatching_forward(None, _contraction(5), "target")
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.interpolate(_dilation_values)
+    with pytest.raises(NotImplementedError, match="Second-order shape derivatives of a non-matching"):
+        Jhat.hessian(hf)
+
+
+def test_nonmatching_shape_control_into_a_piola_mapped_space_is_refused():
+    """The derivative above assumes point-evaluation dofs, which an H(div) space does not have."""
+    pytest.importorskip("fenicsx_ii")
     pyadjoint.get_working_tape().clear_tape()
-    mesh_a = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 7, 7)
-    mesh_b = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 5, 5)
-
-    moved = dxa.Mesh(mesh_a if tracked == "source" else mesh_b)
-    dxa.move(moved, dxa.Function(dxa.geometry_function_space(moved)))
-
-    u = dxa.Function(dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2)))
-    u.interpolate(lambda x: x[0] ** 2 + 2.0 * x[1])
-    with pytest.raises(NotImplementedError, match=f"the {tracked} mesh is tracked"):
-        dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1)))
+    mesh_a, mesh_b = _unit_square(7), dxa.Mesh(_unit_square(5))
+    dxa.move(mesh_b, dxa.Function(dxa.geometry_function_space(mesh_b)))
+    u = dxa.Function(dolfinx.fem.functionspace(mesh_a, ("RT", 1)))
+    with pytest.raises(NotImplementedError, match="ContravariantPiola"):
+        dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("RT", 1)))
 
 
 def test_nonmatching_interpolation_without_shape_control_still_works():

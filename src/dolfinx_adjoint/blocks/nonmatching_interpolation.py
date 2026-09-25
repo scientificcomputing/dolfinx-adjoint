@@ -352,6 +352,18 @@ class NonmatchingInterpolationBlock(Block):
     def _owned(function: dolfinx.fem.Function) -> int:
         return function.function_space.dofmap.index_map.size_local * function.function_space.dofmap.index_map_bs
 
+    def _involves_geometry(self, relevant_dependencies) -> bool:
+        """Whether a sweep reaches one of the meshes.
+
+        ``relevant_dependencies`` may be ``None`` when a block is driven directly rather than by
+        the tape; that is treated as "possibly", so a tracked mesh is never silently skipped.
+        """
+        if not self._tracks_geometry:
+            return False
+        if relevant_dependencies is None:
+            return True
+        return any(isinstance(dependency.output, Mesh) for _, dependency in relevant_dependencies)
+
     def _prepared(self, inputs, needs_geometry: bool) -> dict:
         """The transfer matrix, plus ``grad(u)`` at the target points when a mesh is involved."""
         prepared = {"matrix": self._get_interpolation_matrix(), "grad": None}
@@ -407,11 +419,13 @@ class NonmatchingInterpolationBlock(Block):
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
         self._refresh_geometry()
-        return self._prepared(inputs, any(isinstance(dep.output, Mesh) for _, dep in relevant_dependencies))
+        return self._prepared(inputs, self._involves_geometry(relevant_dependencies))
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
-        if isinstance(block_variable.output, Mesh):
-            return self._adjoint_geometry_component(adj_inputs[0], block_variable.output, prepared["grad"])
+        # The source function is always dependency 0; any tracked mesh was registered after it.
+        if idx > 0:
+            mesh = self.get_dependencies()[idx].output
+            return self._adjoint_geometry_component(adj_inputs[0], mesh, prepared["grad"])
 
         if self._adj_output is None:
             self._adj_output = _create_function(self.space_from)
@@ -428,12 +442,11 @@ class NonmatchingInterpolationBlock(Block):
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
         # The second derivative brings in grad(grad(u)) and the derivative of the point location
         # itself; neither is built here, and a Hessian that quietly omits them is worse than none.
-        for _, dependency in relevant_dependencies:
-            if isinstance(dependency.output, Mesh):
-                raise NotImplementedError(
-                    "Second-order shape derivatives of a non-matching interpolation are not "
-                    "supported; only the first-order adjoint and the tangent-linear model are."
-                )
+        if self._involves_geometry(relevant_dependencies):
+            raise NotImplementedError(
+                "Second-order shape derivatives of a non-matching interpolation are not "
+                "supported; only the first-order adjoint and the tangent-linear model are."
+            )
         self._refresh_geometry()
         return self._get_interpolation_matrix()
 
