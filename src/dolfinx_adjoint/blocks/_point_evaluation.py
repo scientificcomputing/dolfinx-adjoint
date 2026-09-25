@@ -84,7 +84,9 @@ class SourcePointEvaluator:
             num_recv = len(self._cells)
         received = np.zeros((num_recv, width), dtype=data.dtype)
         datatype = dtlib.from_numpy_dtype(data.dtype)
-        comm = self._mesh.comm.Create_dist_graph_adjacent(sources.tolist(), destinations.tolist(), reorder=False)
+        mesh_comm = self._mesh.comm
+        assert isinstance(mesh_comm, MPI.Intracomm)
+        comm = mesh_comm.Create_dist_graph_adjacent(sources.tolist(), destinations.tolist(), reorder=False)
         try:
             comm.Neighbor_alltoallv(
                 [np.ascontiguousarray(data).reshape(-1), send_counts * width, datatype],
