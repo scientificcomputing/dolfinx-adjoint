@@ -19,6 +19,7 @@ from ufl.algorithms.apply_geometry_lowering import apply_geometry_lowering
 from ufl.classes import Jacobian, ReferenceGrad, ReferenceValue
 from ufl.core.expr import Expr
 from ufl.corealg.dag_traverser import DAGTraverser
+from ufl.domain import extract_unique_domain
 
 from ..compat import apply_pullback_inverse, get_interpolation_points
 from ..types.function import Function, _create_function
@@ -320,20 +321,32 @@ def _reads_geometry(expr: ufl.core.expr.Expr, space_to: dolfinx.fem.FunctionSpac
     return bool(extract_type(apply_algebra_lowering(expr), ufl.classes.Grad))
 
 
+def _jacobian_as_coordinate_gradient(expr: ufl.core.expr.Expr) -> ufl.core.expr.Expr:
+    """Write every :py:class:`~ufl.classes.Jacobian` in ``expr`` as ``ReferenceGrad(x)``, its definition.
+
+    On a non-affine cell ``grad(J)`` lowers to ``ReferenceGrad(J)``, which the coordinate-derivative
+    rules do not accept; ``ReferenceGrad(ReferenceGrad(x))`` they do.
+    """
+    jacobians = extract_type(expr, Jacobian)
+    if not jacobians:
+        return expr
+    return ufl.replace(expr, {J: ReferenceGrad(ufl.SpatialCoordinate(extract_unique_domain(J))) for J in jacobians})
+
+
 def _reference_representation(expr: ufl.core.expr.Expr) -> ufl.core.expr.Expr:
     """Write ``expr`` on the reference cell, applying the same UFL passes, in the same order, as
     FFCx does for an expression.
 
     Coefficients become push-forwards of their ``ReferenceValue`` and geometric quantities are
-    lowered onto :py:class:`~ufl.classes.Jacobian`, so that
+    lowered onto the coordinate field, so that
     :py:func:`~ufl.algorithms.apply_derivatives.apply_coordinate_derivatives` can hold the
-    coefficients' reference values fixed and differentiate the Jacobian.
+    coefficients' reference values fixed and differentiate the geometry.
     """
-    expr = apply_derivatives(apply_algebra_lowering(expr))
+    expr = apply_derivatives(apply_algebra_lowering(_jacobian_as_coordinate_gradient(expr)))
     expr = apply_derivatives(apply_function_pullbacks(expr))
     for _ in range(2):  # lowering can expose derivatives of geometry, which lower again
         expr = apply_derivatives(apply_geometry_lowering(expr, (Jacobian,)))
-    return expr
+    return _jacobian_as_coordinate_gradient(expr)
 
 
 class _ToPhysical(DAGTraverser):
@@ -445,7 +458,7 @@ class ExprInterpolationBlock(Block):
         # `self._deps[idx]` lookup below stays valid because the mesh is handled before them.
         self._mesh: Mesh | None = None
         if _reads_geometry(self.expr, self.space_to):
-            domain = ufl.domain.extract_unique_domain(self.expr)
+            domain = extract_unique_domain(self.expr)
             self._mesh = get_overloaded_mesh_if_annotated(domain)
             if self._mesh is None:
                 # See _ProblemBlockBase._register_mesh_dependency.

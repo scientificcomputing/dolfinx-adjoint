@@ -63,54 +63,35 @@ def _interpolate_expression(expr, V: dolfinx.fem.FunctionSpace, annotate: bool, 
 
 
 def _needs_split(space_from: dolfinx.fem.FunctionSpace, space_to: dolfinx.fem.FunctionSpace) -> bool:
-    """Whether a shape-tracked non-matching interpolation has a Piola map the block cannot handle."""
-    source_tracked = get_overloaded_mesh_if_annotated(space_from.mesh.ufl_domain()) is not None
-    target_tracked = get_overloaded_mesh_if_annotated(space_to.mesh.ufl_domain()) is not None
-    piola_target = not space_to.ufl_element().pullback.is_identity
-    piola_source = not space_from.ufl_element().pullback.is_identity
-    return (piola_target and (source_tracked or target_tracked)) or (piola_source and source_tracked)
+    """Whether a shape-tracked non-matching interpolation has a Piola-mapped target."""
+    tracked = any(
+        get_overloaded_mesh_if_annotated(space.mesh.ufl_domain()) is not None for space in (space_from, space_to)
+    )
+    return tracked and not space_to.ufl_element().pullback.is_identity
 
 
 def _interpolate_nonmatching_split(u_from, V_to, cells, interpolation_data, tol, maxit, ad_block_tag, petsc_mat):
-    """Non-matching interpolation with a Piola map on a tracked mesh, as supported steps.
+    """Non-matching interpolation into a Piola-mapped space on a tracked mesh, as supported steps.
 
-    A Piola-mapped source is first interpolated into a discontinuous space on its own mesh, and a
-    Piola-mapped target is reached through a quadrature space at its interpolation points. Both
-    extra steps are expression interpolations, whose shape derivatives include the Piola maps,
-    and the non-matching step between them has identity pullbacks on both sides. The target step
-    is exact; the source step is exact on an affine simplex mesh, where a Piola-mapped field is
-    polynomial on each cell.
+    The source is evaluated into a quadrature space at the target's interpolation points, an
+    identity-pullback non-matching step, and the Piola map is then applied by an expression
+    interpolation on the target mesh, whose shape derivative includes it. Both steps are exact.
     """
     if interpolation_data is not None:
         warnings.warn(
-            "interpolation_data is recomputed for the intermediate spaces of a shape-tracked "
-            "non-matching interpolation with a Piola-mapped space.",
+            "interpolation_data is recomputed for the intermediate quadrature space of a "
+            "shape-tracked non-matching interpolation into a Piola-mapped space.",
             stacklevel=3,
         )
-    space_from = u_from.function_space
-    source = u_from
-    if not space_from.ufl_element().pullback.is_identity and get_overloaded_mesh_if_annotated(
-        space_from.mesh.ufl_domain()
-    ):
-        if not space_from.mesh.ufl_domain().is_piecewise_linear_simplex_domain():
-            raise NotImplementedError(
-                "Shape derivatives of a non-matching interpolation from a Piola-mapped space are "
-                "only implemented on an affine simplex source mesh."
-            )
-        degree = space_from.ufl_element().embedded_superdegree
-        staged = dolfinx.fem.functionspace(space_from.mesh, ("DG", degree, tuple(space_from.value_shape)))
-        source = _interpolate_expression(u_from, staged, True, ad_block_tag, petsc_mat)
-
-    options = {"cells": cells, "tol": tol, "maxit": maxit, "ad_block_tag": ad_block_tag, "petsc_mat": petsc_mat}
-    if V_to.ufl_element().pullback.is_identity:
-        return interpolate_nonmatching(source, V_to, **options)
     X = V_to.element.interpolation_points
     points = basix.ufl.quadrature_element(V_to.mesh.basix_cell(), points=X, weights=np.ones(X.shape[0]))
     shape = tuple(V_to.value_shape)
     point_space = dolfinx.fem.functionspace(
         V_to.mesh, basix.ufl.blocked_element(points, shape=shape) if shape else points
     )
-    at_points = interpolate_nonmatching(source, point_space, **options)
+    at_points = interpolate_nonmatching(
+        u_from, point_space, cells=cells, tol=tol, maxit=maxit, ad_block_tag=ad_block_tag, petsc_mat=petsc_mat
+    )
     return _interpolate_expression(at_points, V_to, True, ad_block_tag, petsc_mat)
 
 
@@ -125,8 +106,8 @@ def interpolate_nonmatching(
 ):
     """Interpolate a Function into a different function space on a non-matching mesh.
 
-    On a mesh tracked for shape differentiation, a Piola-mapped target, or a Piola-mapped source on
-    a tracked mesh, is recorded as several blocks (see :py:func:`_interpolate_nonmatching_split`).
+    On a mesh tracked for shape differentiation, a Piola-mapped target is recorded as two blocks
+    (see :py:func:`_interpolate_nonmatching_split`).
     """
     ad_block_tag = kwargs.pop("ad_block_tag", None)
     petsc_mat = kwargs.pop("petsc_mat", False)

@@ -1,6 +1,5 @@
+import functools
 import typing
-
-from mpi4py import MPI
 
 import basix.ufl
 import dolfinx
@@ -12,7 +11,8 @@ from pyadjoint.tape import stop_annotating
 from ..compat import get_interpolation_points
 from ..types.function import _create_function
 from ..types.mesh import Mesh, get_overloaded_mesh_if_annotated
-from .interpolation import MatrixFreeInterpolationOperator, _MatrixCSRWorkspace, get_mult
+from ._point_evaluation import SourcePointEvaluator
+from .interpolation import MatrixFreeInterpolationOperator, _MatrixCSRWorkspace, coordinate_derivative, get_mult
 
 
 def _import_fenicsx_ii():
@@ -33,50 +33,29 @@ def _base_element(space: dolfinx.fem.FunctionSpace):
     return element.sub_elements[0] if element.num_sub_elements > 0 else element
 
 
-def _blocked_space(mesh: dolfinx.mesh.Mesh, base, shape: tuple[int, ...]) -> dolfinx.fem.FunctionSpace:
-    """``base`` blocked to ``shape`` on ``mesh``, so its points match the unblocked space's."""
-    return dolfinx.fem.functionspace(mesh, basix.ufl.blocked_element(base, shape=shape))
-
-
-def _coordinate_degree(mesh: dolfinx.mesh.Mesh) -> int:
-    """Degree of the coordinate element; ``geometry.cmap`` is deprecated in favour of ``cmaps[0]``."""
-    cmaps = getattr(mesh.geometry, "cmaps", None)
-    return (cmaps[0] if cmaps is not None else mesh.geometry.cmap).degree
-
-
-def _reject_unsupported_shape_control(space_from, space_to, red_op, source_tracked: bool) -> None:
+def _reject_unsupported_shape_control(space_to, red_op) -> None:
     """Refuse what the shape terms below do not cover.
 
-    They assume each target dof is the source's value at a target point, and that the source is
-    carried along with its mesh. A Piola-mapped target or a Piola-mapped source on a moving mesh
-    breaks that; :py:func:`dolfinx_adjoint.interpolate_nonmatching` splits both cases into
-    blocks that do satisfy it. A custom reduction operator is a different calculation.
-
-    Args:
-        space_from: The source function's space.
-        space_to: The space being interpolated into.
-        red_op: The reduction operator, or ``None`` for point evaluation.
-        source_tracked: Whether the source mesh is tracked for shape differentiation.
+    They assume each target dof is the source's value at a target point. A Piola-mapped target
+    breaks that; :py:func:`dolfinx_adjoint.interpolate_nonmatching` splits it into blocks that
+    do satisfy it. A custom reduction operator is a different calculation.
 
     Raises:
-        NotImplementedError: For a custom ``red_op``, a Piola-mapped target, or a Piola-mapped
-            source on a tracked mesh.
+        NotImplementedError: For a custom ``red_op`` or a Piola-mapped target.
     """
     if red_op is not None:
         raise NotImplementedError(
             "Shape derivatives of a non-matching interpolation are only implemented for point "
             "evaluation; a custom red_op reduces the source differently and has its own derivative."
         )
-    checked = [("target", space_to)] + ([("source", space_from)] if source_tracked else [])
-    for label, space in checked:
-        pullback = space.ufl_element().pullback
-        if not pullback.is_identity:
-            raise NotImplementedError(
-                f"This block's shape terms need an identity-pullback {label}, but it uses a "
-                f"{type(pullback).__name__} pullback. dolfinx_adjoint.interpolate_nonmatching "
-                "handles that case by splitting it into supported steps; use it instead of "
-                "constructing the block directly."
-            )
+    pullback = space_to.ufl_element().pullback
+    if not pullback.is_identity:
+        raise NotImplementedError(
+            "This block's shape terms need an identity-pullback target, but it uses a "
+            f"{type(pullback).__name__} pullback. dolfinx_adjoint.interpolate_nonmatching "
+            "handles that case by splitting it into supported steps; use it instead of "
+            "constructing the block directly."
+        )
 
 
 class NonmatchingInterpolationBlock(Block):
@@ -119,7 +98,7 @@ class NonmatchingInterpolationBlock(Block):
         self._mesh_to = get_overloaded_mesh_if_annotated(self.space_to.mesh.ufl_domain())
         self._tracks_geometry = self._mesh_from is not None or self._mesh_to is not None
         if self._tracks_geometry:
-            _reject_unsupported_shape_control(self.space_from, self.space_to, red_op, self._mesh_from is not None)
+            _reject_unsupported_shape_control(self.space_to, red_op)
             for mesh in (self._mesh_from, self._mesh_to):
                 if mesh is not None:
                     self.add_dependency(mesh, no_duplicates=True)
@@ -156,120 +135,65 @@ class NonmatchingInterpolationBlock(Block):
             self.space_to, self.space_from, self.cells, padding=self.tol
         )
 
-    def _transfer_matrix(self, space_from: dolfinx.fem.FunctionSpace, space_to: dolfinx.fem.FunctionSpace):
-        """A cached point-evaluation transfer matrix from ``space_from`` to ``space_to``."""
-        key = f"T{space_from.ufl_element()}->{space_to.ufl_element()}"
-        if key not in self._shape_workspace:
-            fenicsx_ii = _import_fenicsx_ii()
-            mat, _, _ = fenicsx_ii.create_interpolation_matrix(
-                space_from,
-                space_to,
-                red_op=fenicsx_ii.PointwiseTrace(space_to.mesh),
-                tol=self.tol,
-                use_petsc=self._use_petsc,
+    def _points(self) -> SourcePointEvaluator:
+        """The target's interpolation points, located on the source mesh at its current geometry."""
+        if "points" not in self._shape_workspace:
+            self._shape_workspace["points"] = SourcePointEvaluator(
+                self.space_from.mesh, self._displacement_space, self.tol
             )
-            self._shape_workspace[key] = mat if self._use_petsc else _MatrixCSRWorkspace(mat)
-        return self._shape_workspace[key]
+        return self._shape_workspace["points"]
 
-    def _gradient_at_target_points(self, func_from: dolfinx.fem.Function) -> list[dolfinx.fem.Function]:
-        r"""``grad(u)`` of the source function, evaluated at the target's interpolation points.
-
-        Both shape terms are built from this one quantity. It is obtained in two exact steps
-        rather than one: ``grad(u)`` is interpolated into a discontinuous space on the *source*
-        mesh, which represents it without error, and that is then transferred to the target by
-        the same point evaluation the forward interpolation uses. Going through a continuous
-        space instead would average across cells and quietly smooth the derivative.
-
-        The discontinuous space has the source element's own degree rather than one less. One
-        less is exact on a simplex, where ``grad(P_k) = [DG_{k-1}]^d``, but not on a
-        quadrilateral, where ``d/dx Q_k`` is still degree ``k`` in ``y``; the higher degree is
-        exact on both.
-
-        Returned one component at a time -- entry ``m`` holds ``grad(u_m)`` -- rather than as a
-        single tensor-valued field, so that every component, and every other ``(gdim,)``-valued
-        field the second-order terms transfer, shares one cached matrix. A tensor-valued transfer
-        needs a matrix of its own, and a build costs the same whatever the value shape (~23 s at
-        64x64 to 50x50 P2, against well under 1 ms per application), repeated on every replay
-        that moves a mesh.
-
-        Args:
-            func_from: The source function, at its checkpointed values.
-
-        Returns:
-            One Function per target value component, on the target mesh, holding that
-            component's gradient at the target points.
-        """
-        value_size = self._value_size()
-        if "grad" not in self._shape_workspace:
-            gdim = self.space_from.mesh.geometry.dim
-            # Also high enough for the gradient of a geometry-space field, which the second-order
-            # terms transfer through the same space.
-            degree = max(self.space_from.ufl_element().embedded_superdegree, _coordinate_degree(self.space_from.mesh))
-            self._shape_workspace["grad_from"] = dolfinx.fem.Function(
-                dolfinx.fem.functionspace(self.space_from.mesh, ("DG", degree, (gdim,)))
-            )
-            self._shape_workspace["grad"] = [
-                dolfinx.fem.Function(self._displacement_space()) for _ in range(value_size)
-            ]
-        grad_from = self._shape_workspace["grad_from"]
-        grads = self._shape_workspace["grad"]
-        mult = get_mult(
-            self._transfer_matrix(grad_from.function_space, self._displacement_space()),
-            transpose=False,
-            accumulate=False,
-        )
-        for component, grad_to in enumerate(grads):
-            expression = ufl.grad(func_from if value_size == 1 else func_from[component])
-            grad_from.interpolate(
-                dolfinx.fem.Expression(expression, get_interpolation_points(grad_from.function_space))
-            )
-            grad_from.x.scatter_forward()
-            grad_to.x.array[:] = 0.0
-            mult(grad_from.x, grad_to.x)
-        return grads
-
-    def _value_size(self) -> int:
-        """How many components the target function has at each point."""
-        return int(np.prod(self.space_to.ufl_element().reference_value_shape, dtype=int))
-
+    @functools.cached_property
     def _displacement_space(self) -> dolfinx.fem.FunctionSpace:
-        """The target-side space a displacement is evaluated into, ``(gdim,)``-valued."""
-        if "disp_space" not in self._shape_workspace:
-            self._shape_workspace["disp_space"] = _blocked_space(
-                self.space_to.mesh, _base_element(self.space_to), (self.space_to.mesh.geometry.dim,)
-            )
-        return self._shape_workspace["disp_space"]
+        """The target's base element blocked to ``(gdim,)``: one node per target point."""
+        shape = (self.space_to.mesh.geometry.dim,)
+        element = basix.ufl.blocked_element(_base_element(self.space_to), shape=shape)
+        return dolfinx.fem.functionspace(self.space_to.mesh, element)
 
-    def _target_motion_operator(self, grads: list[dolfinx.fem.Function]) -> MatrixFreeInterpolationOperator:
-        r"""The map ``dx_B -> grad(u)(x_i) . dx_B(x_i)``, from the target mesh's geometry space.
+    @property
+    def _value_shape(self) -> tuple[int, ...]:
+        return tuple(self.space_to.ufl_element().reference_value_shape)
 
-        The target's interpolation points ride along with its own mesh, so a displacement of it
-        moves every evaluation point. Since the result is again a point evaluation on the target
-        mesh, this is an ordinary same-mesh interpolation of ``dot(grad(u), w)`` -- the operator
-        {py:class}`~dolfinx_adjoint.blocks.interpolation.ExprInterpolationBlock` already uses.
+    def _eulerian(self, expression, direction):
+        r"""Derivative of the source-mesh field ``expression`` at a fixed physical point, as the
+        source mesh moves by ``direction``: ``D_sigma f - grad(f) sigma``.
+
+        ``D_sigma f`` is the derivative at a fixed reference point, nonzero for a Piola-mapped
+        ``f`` (its push-forward depends on the Jacobian) and zero for an identity-pullback one.
+        """
+        material = coordinate_derivative(expression, self.space_from.mesh, None, direction)
+        return material - ufl.dot(ufl.grad(expression), direction)
+
+    def _as_target_fields(self, values: np.ndarray) -> list[dolfinx.fem.Function]:
+        """``(points, *value, gdim)`` values as one displacement-space Function per value component."""
+        gdim = self.space_to.mesh.geometry.dim
+        values = values.reshape(self._points().num_points, -1, gdim)
+        fields = []
+        for component in range(values.shape[1]):
+            field = dolfinx.fem.Function(self._displacement_space)
+            field.x.array[: values.shape[0] * gdim] = values[:, component].reshape(-1)
+            field.x.scatter_forward()
+            fields.append(field)
+        return fields
+
+    def _target_motion_operator(self, fields: list[dolfinx.fem.Function]) -> MatrixFreeInterpolationOperator:
+        r"""The map ``dx_B -> g(x_i) . dx_B(x_i)`` from the target mesh's geometry space, one
+        ``g`` per target value component.
+
+        The target's interpolation points ride along with its own mesh, so this is an ordinary
+        same-mesh interpolation of ``dot(g, w)``.
         """
         assert self._mesh_to is not None
-        if "target_op" not in self._shape_workspace:
-            w = ufl.TrialFunction(self._mesh_to._ad_function_space)
-            expression = (
-                ufl.dot(grads[0], w) if self._value_size() == 1 else ufl.as_vector([ufl.dot(grad, w) for grad in grads])
-            )
-            self._shape_workspace["target_op"] = MatrixFreeInterpolationOperator(expression, self.space_to)
-        return self._shape_workspace["target_op"]
+        w = ufl.TrialFunction(self._mesh_to._ad_function_space)
+        dots = np.array([ufl.dot(field, w) for field in fields], dtype=object)
+        expression = dots[0] if not self._value_shape else ufl.as_tensor(dots.reshape(self._value_shape).tolist())
+        return MatrixFreeInterpolationOperator(expression, self.space_to)
 
-    def _contract(self, values: np.ndarray, grads: list[dolfinx.fem.Function], transpose: bool) -> np.ndarray:
-        r"""Contract with ``grad(u)(x_i)`` over the target's value components.
-
-        Forward (``transpose=False``): a displacement sampled at the target points, shape
-        ``(nodes, gdim)``, becomes ``dc_{i,m} = sum_k grad_m(x_i)_k s_{i,k}``. Reverse: an
-        adjoint value on the target, shape ``(nodes, value_size)``, becomes
-        ``sum_m lambda_{i,m} grad_m(x_i)_k``.
-        """
-        gdim = self.space_to.mesh.geometry.dim
-        stacked = np.stack([grad.x.array.reshape(-1, gdim) for grad in grads], axis=1)
-        if transpose:
-            return np.einsum("im,imk->ik", values.reshape(-1, len(grads)), stacked).reshape(-1)
-        return np.einsum("imk,ik->im", stacked, values.reshape(-1, gdim)).reshape(-1)
+    def _weights(self, vector) -> np.ndarray:
+        """The owned part of a target-space vector, ``(points, *value)``."""
+        num_points = self._points().num_points
+        size = int(np.prod(self._value_shape, dtype=int))
+        return vector.array[: num_points * size].reshape(num_points, *self._value_shape)
 
     def __str__(self):
         return f"interpolate_nonmatching_{self.space_from.mesh.name}_to_{self.space_to.mesh.name}"
@@ -353,7 +277,7 @@ class NonmatchingInterpolationBlock(Block):
             if tlm_input is None or not isinstance(dependency.output, Mesh):
                 continue
             out_func.x.array[: self._owned(out_func)] += self._tangent_geometry_component(
-                tlm_input, dependency.output, prepared["grad"]
+                tlm_input, dependency.output, prepared
             )[: self._owned(out_func)]
         out_func.x.scatter_forward()
 
@@ -378,33 +302,27 @@ class NonmatchingInterpolationBlock(Block):
         return any(isinstance(dependency.output, Mesh) for _, dependency in relevant_dependencies)
 
     def _prepared(self, inputs, needs_geometry: bool) -> dict:
-        """The transfer matrix, plus ``grad(u)`` at the target points when a mesh is involved."""
-        prepared = {"matrix": self._get_interpolation_matrix(), "grad": None}
+        """The transfer matrix, plus the source function and ``grad(u)`` at the target points
+        when a mesh is involved."""
+        prepared = {"matrix": self._get_interpolation_matrix(), "u": inputs[0], "grad": None}
         if self._tracks_geometry and needs_geometry:
-            prepared["grad"] = self._gradient_at_target_points(inputs[0])
+            prepared["grad"] = self._as_target_fields(self._points().evaluate(ufl.grad(inputs[0])))
         return prepared
 
-    def _tangent_geometry_component(self, direction, mesh: Mesh, grad_to: dolfinx.fem.Function) -> np.ndarray:
+    def _tangent_geometry_component(self, direction, mesh: Mesh, prepared: dict) -> np.ndarray:
         r"""The target dofs' response to displacing ``mesh`` by ``direction``.
 
-        Two terms, which are the same expression with opposite signs when one mesh plays both
-        roles -- interpolating a function onto its own mesh has no shape derivative, and this
-        reproduces that by cancellation rather than by a special case.
+        With ``c_i = u(x_i)``: ``grad(u)(x_i) . dx(x_i)`` for the target mesh, whose points move,
+        and the Eulerian derivative of ``u`` at ``x_i`` for the source mesh. On one mesh the two
+        cancel for an identity-pullback source, as interpolating onto your own mesh should.
         """
         scratch = _create_function(self.space_to)
         scratch.x.array[:] = 0.0
         if mesh is self._mesh_to:
-            self._target_motion_operator(grad_to).mult(direction.x, scratch.x, accumulate=True)
+            self._target_motion_operator(prepared["grad"]).mult(direction.x, scratch.x, accumulate=True)
         if mesh is self._mesh_from:
-            sampled = dolfinx.fem.Function(self._displacement_space())
-            sampled.x.array[:] = 0.0
-            mult = get_mult(
-                self._transfer_matrix(mesh._ad_function_space, self._displacement_space()),
-                transpose=False,
-                accumulate=False,
-            )
-            mult(direction.x, sampled.x)
-            scratch.x.array[:] -= self._contract(sampled.x.array, grad_to, transpose=False)
+            values = self._points().evaluate(self._eulerian(prepared["u"], direction))
+            scratch.x.array[: values.size] += values.reshape(-1)
         return scratch.x.array
 
     @staticmethod
@@ -428,7 +346,7 @@ class NonmatchingInterpolationBlock(Block):
         scratch.x.scatter_forward()
         return scratch.x.array
 
-    def _adjoint_geometry_component(self, adj_vector, mesh: Mesh, grad_to: dolfinx.fem.Function):
+    def _adjoint_geometry_component(self, adj_vector, mesh: Mesh, prepared: dict) -> dolfinx.fem.Function:
         """The transpose of :py:meth:`_tangent_geometry_component`, into ``mesh``'s geometry space."""
         out_func = self._geometry_output.get(id(mesh))
         if out_func is None:
@@ -438,18 +356,12 @@ class NonmatchingInterpolationBlock(Block):
 
         if mesh is self._mesh_to:
             out_func.x.array[:] += self._reduced_transpose(
-                self._target_motion_operator(grad_to), adj_vector, mesh._ad_function_space
+                self._target_motion_operator(prepared["grad"]), adj_vector, mesh._ad_function_space
             )
         if mesh is self._mesh_from:
-            sampled = dolfinx.fem.Function(self._displacement_space())
-            sampled.x.array[:] = -self._contract(adj_vector.array, grad_to, transpose=True)
-            mult = get_mult(
-                self._transfer_matrix(mesh._ad_function_space, self._displacement_space()),
-                transpose=True,
-                accumulate=True,
-            )
-            mult(sampled.x, out_func.x)
-        return out_func.x
+            test = ufl.TestFunction(mesh._ad_function_space)
+            self._points().apply_transpose(self._eulerian(prepared["u"], test), self._weights(adj_vector), out_func)
+        return out_func
 
     # --- Adjoint ---
 
@@ -461,7 +373,7 @@ class NonmatchingInterpolationBlock(Block):
         # The source function is always dependency 0; any tracked mesh was registered after it.
         if idx > 0:
             mesh = self.get_dependencies()[idx].output
-            return self._adjoint_geometry_component(adj_inputs[0], mesh, prepared["grad"])
+            return self._adjoint_geometry_component(adj_inputs[0], mesh, prepared).x
 
         if self._adj_output is None:
             self._adj_output = _create_function(self.space_from)
@@ -476,29 +388,28 @@ class NonmatchingInterpolationBlock(Block):
     # --- Hessian ---
 
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
-        """The transfer matrix, ``grad(u)`` at the target points, and the second-order fields.
+        r"""The transfer matrix, ``grad(u)`` at the target points, and the tangent-linear direction.
 
-        With ``c_i = u(x_i)``, directions ``p_k = (u_k, sigma_k, dx_k)`` for the coefficient, the
-        source mesh and the target mesh, and ``d_k = dx_k(x_i) - sigma_k(x_i)`` the motion of each
-        target point *relative to* the source mesh, the second derivative is
+        With ``c_i = u(x_i)``, a direction ``p = (du, sigma, dx)`` for the coefficient, the source
+        mesh and the target mesh, and ``E(f, sigma)`` the Eulerian derivative of a source field
+        (:py:meth:`_eulerian`), the first derivative is
 
-            d2c[p1, p2] = d1^T H_u d2 - grad(u).(grad(sigma2) d1) - grad(u).(grad(sigma1) d2)
-                          + grad(u1).d2 + grad(u2).d1,
+            dc[p] = du + E(u, sigma) + grad(u) dx,
 
-        everything evaluated at ``x_i``. It is derived in the source reference cell, where the
-        point is fixed by ``F_A(xi) = x_i``; the second derivatives of the source mapping cancel
-        between the two terms that carry them, so this holds on curved source cells too. Which
-        cell holds ``x_i`` contributes nothing: it is piecewise constant in the geometry. On one
-        mesh ``d_k = 0`` and the whole thing vanishes, as interpolating onto your own mesh should.
+        at ``x_i``. Differentiating again, with ``A = du1 + E(u, sigma1)``,
 
-        Here ``p1`` is the tangent-linear direction, fixed by the time this runs, so the terms
-        that do not involve ``p2`` are gathered into one field per value component,
-        ``q_m = H_m d1 - grad(sigma1)^T grad(u_m) + grad(u1_m)``, and
-        :py:meth:`evaluate_hessian_component` applies the transpose with respect to ``p2``.
+            d2c[p1, p2] = E(du2, sigma1) + grad(du2) dx1
+                          + E(A, sigma2) + grad(E(u, sigma2)) dx1
+                          + (grad(A) + dx1^T H_u) dx2,
+
+        grouped by the ``p2`` component each line is linear in. ``p1`` is the tangent-linear
+        direction; :py:meth:`evaluate_hessian_component` applies the transpose in ``p2``. On a
+        curved or Piola-mapped source, ``E`` carries the Jacobian's derivatives, which is why every
+        term is evaluated at the points rather than through a discontinuous intermediate space.
         """
         self._refresh_geometry()
         prepared = self._prepared(inputs, self._tracks_geometry)
-        prepared["second"] = self._second_order_fields(inputs[0], prepared["grad"]) if self._tracks_geometry else None
+        prepared["second"] = self._second_order_direction(inputs[0]) if self._tracks_geometry else None
         return prepared
 
     def _tlm_of(self, target) -> typing.Any:
@@ -508,104 +419,31 @@ class NonmatchingInterpolationBlock(Block):
                 return dependency.tlm_value
         return None
 
-    def _at_target_points(self, expression) -> np.ndarray:
-        """A ``(gdim,)``-valued expression on the source mesh, at the target points: ``(nodes, gdim)``.
-
-        Interpolated exactly into the discontinuous space on the source first, as in
-        :py:meth:`_gradient_at_target_points`, then transferred by point evaluation.
-        """
-        gdim = self.space_to.mesh.geometry.dim
-        grad_from = self._shape_workspace["grad_from"]
-        grad_from.interpolate(dolfinx.fem.Expression(expression, get_interpolation_points(grad_from.function_space)))
-        grad_from.x.scatter_forward()
-        values = dolfinx.fem.Function(self._displacement_space())
-        values.x.array[:] = 0.0
-        mult = get_mult(
-            self._transfer_matrix(grad_from.function_space, self._displacement_space()),
-            transpose=False,
-            accumulate=False,
-        )
-        mult(grad_from.x, values.x)
-        return values.x.array.reshape(-1, gdim).copy()
-
-    def _second_order_fields(self, func_from: dolfinx.fem.Function, grads: list) -> dict | None:
-        """``d1`` and the ``q_m`` of :py:meth:`prepare_evaluate_hessian`, or ``None`` with no direction."""
-        gdim = self.space_to.mesh.geometry.dim
-        value_size = self._value_size()
+    def _second_order_direction(self, func_from: dolfinx.fem.Function) -> dict | None:
+        """``du1``, ``sigma1``, ``dx1`` at the target points, and ``A``, or ``None`` with no direction."""
         u_dot = self.get_dependencies()[0].tlm_value
         sigma = self._tlm_of(self._mesh_from) if self._mesh_from is not None else None
         target_motion = self._tlm_of(self._mesh_to) if self._mesh_to is not None else None
         if u_dot is None and sigma is None and target_motion is None:
             return None
 
-        with stop_annotating():
-            d1 = np.zeros_like(grads[0].x.array).reshape(-1, gdim)
-            if target_motion is not None:
-                sampled = dolfinx.fem.Function(self._displacement_space())
-                # Same mesh: the target points' own motion. An Expression, since DOLFINx cannot
-                # interpolate a Function into a quadrature space (the split Piola case uses one).
+        moved = None
+        if target_motion is not None:
+            sampled = dolfinx.fem.Function(self._displacement_space)
+            # Same mesh: the target points' own motion. An Expression, since DOLFINx cannot
+            # interpolate a Function into a quadrature space (the split Piola case uses one).
+            with stop_annotating():
                 sampled.interpolate(
                     dolfinx.fem.Expression(target_motion, get_interpolation_points(sampled.function_space))
                 )
-                d1 += sampled.x.array.reshape(-1, gdim)
-            if sigma is not None:
-                sampled = dolfinx.fem.Function(self._displacement_space())
-                sampled.x.array[:] = 0.0
-                mult = get_mult(
-                    self._transfer_matrix(self._mesh_from._ad_function_space, self._displacement_space()),
-                    transpose=False,
-                    accumulate=False,
-                )
-                mult(sigma.x, sampled.x)
-                d1 -= sampled.x.array.reshape(-1, gdim)
-            # Collective: which branches run below involves scatters, so every rank must agree --
-            # a rank whose points happen not to move must still take the same path.
-            moves = self.space_to.mesh.comm.allreduce(bool(np.any(d1)), op=MPI.LOR)
+            gdim = self.space_to.mesh.geometry.dim
+            moved = sampled.x.array[: self._points().num_points * gdim].reshape(-1, gdim)
+        terms = [term for term in (u_dot, sigma and self._eulerian(func_from, sigma)) if term is not None]
+        return {"u_dot": u_dot, "sigma": sigma, "dx": moved, "A": sum(terms[1:], terms[0]) if terms else None}
 
-            grad_sigma = None
-            if sigma is not None:  # grad_sigma[i, r, l] = d(sigma_r)/dx_l at x_i
-                grad_sigma = np.stack([self._at_target_points(ufl.grad(sigma[r])) for r in range(gdim)], axis=1)
-            q = []
-            for m, grad_to in enumerate(grads):
-                u_m = func_from if value_size == 1 else func_from[m]
-                g_m = grad_to.x.array.reshape(-1, gdim)
-                q_m = np.zeros_like(g_m)
-                if moves:
-                    hessian = np.stack(
-                        [self._at_target_points(ufl.grad(ufl.grad(u_m)[k])) for k in range(gdim)], axis=1
-                    )
-                    q_m += np.einsum("ikl,il->ik", hessian, d1)
-                if grad_sigma is not None:
-                    q_m -= np.einsum("irl,ir->il", grad_sigma, g_m)
-                if u_dot is not None:
-                    q_m += self._at_target_points(ufl.grad(u_dot if value_size == 1 else u_dot[m]))
-                field = dolfinx.fem.Function(self._displacement_space())
-                field.x.array[:] = q_m.reshape(-1)
-                q.append(field)
-        return {"d1": d1, "moves": moves, "q": q}
-
-    def _gradient_transpose(self, weights: np.ndarray, space, component: int | None) -> np.ndarray:
-        """Transpose of ``f -> [grad(f_c)(x_i) . w_i]``, applied to ``weights`` ``(nodes, gdim)``, into ``space``.
-
-        The forward map is the exact interpolation of ``grad(f_c)`` into the discontinuous space on
-        the source followed by the point-evaluation transfer, so its transpose is the transfer's
-        transpose followed by the matrix-free gradient operator's, with ghosts reduced.
-        """
-        grad_space = self._shape_workspace["grad_from"].function_space
-        weighted = dolfinx.fem.Function(self._displacement_space())
-        weighted.x.array[:] = weights.reshape(-1)
-        pulled = dolfinx.fem.Function(grad_space)
-        pulled.x.array[:] = 0.0
-        get_mult(self._transfer_matrix(grad_space, self._displacement_space()), transpose=True, accumulate=False)(
-            weighted.x, pulled.x
-        )
-        key = f"R{space.ufl_element()}:{component}"
-        if key not in self._shape_workspace:
-            trial = ufl.TrialFunction(space)
-            self._shape_workspace[key] = MatrixFreeInterpolationOperator(
-                ufl.grad(trial if component is None else trial[component]), grad_space
-            )
-        return self._reduced_transpose(self._shape_workspace[key], pulled.x, space)
+    def _along_motion(self, weights: np.ndarray, moved: np.ndarray) -> np.ndarray:
+        """``weights`` ``(points, *value)`` times the target motion ``(points, gdim)``, for a ``grad`` term."""
+        return weights[..., None] * moved.reshape(moved.shape[0], *(1,) * (weights.ndim - 1), -1)
 
     def evaluate_hessian_component(
         self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None
@@ -613,40 +451,35 @@ class NonmatchingInterpolationBlock(Block):
         hessian_input = getattr(hessian_inputs[0], "x", hessian_inputs[0])
         adj_input = getattr(adj_inputs[0], "x", adj_inputs[0])
         second = prepared["second"]
-        gdim = self.space_to.mesh.geometry.dim
-        value_size = self._value_size()
+        points = self._points() if second is not None else None
+        u = prepared["u"]
 
         if idx > 0:
             mesh = self.get_dependencies()[idx].output
-            out = self._adjoint_geometry_component(hessian_input, mesh, prepared["grad"])
+            out = self._adjoint_geometry_component(hessian_input, mesh, prepared)
             if second is None:
-                return out
-            lam = adj_input.array.reshape(-1, value_size)
+                return out.x
+            lam = self._weights(adj_input)
             if mesh is self._mesh_to:
-                w = ufl.TrialFunction(mesh._ad_function_space)
-                q = second["q"]
-                operator = MatrixFreeInterpolationOperator(
-                    ufl.dot(q[0], w) if value_size == 1 else ufl.as_vector([ufl.dot(q_m, w) for q_m in q]),
-                    self.space_to,
-                )
-                out.array[:] += self._reduced_transpose(operator, adj_input, mesh._ad_function_space)
+                gdim = self.space_to.mesh.geometry.dim
+                q = np.zeros((points.num_points, *self._value_shape, gdim), dtype=lam.dtype)
+                if second["A"] is not None:
+                    q += points.evaluate(ufl.grad(second["A"]))
+                if second["dx"] is not None:
+                    hessian = points.evaluate(ufl.grad(ufl.grad(u)))
+                    q += np.einsum("i...kl,ik->i...l", hessian, second["dx"])
+                operator = self._target_motion_operator(self._as_target_fields(q))
+                out.x.array[:] += self._reduced_transpose(operator, adj_input, mesh._ad_function_space)
             if mesh is self._mesh_from:
-                weighted = dolfinx.fem.Function(self._displacement_space())
-                weighted.x.array[:] = -sum(
-                    lam[:, m, None] * q_m.x.array.reshape(-1, gdim) for m, q_m in enumerate(second["q"])
-                ).reshape(-1)
-                get_mult(
-                    self._transfer_matrix(mesh._ad_function_space, self._displacement_space()),
-                    transpose=True,
-                    accumulate=True,
-                )(weighted.x, out)
-                if second["moves"]:
-                    grads = [g.x.array.reshape(-1, gdim) for g in prepared["grad"]]
-                    for k in range(gdim):
-                        weights = sum(lam[:, m, None] * g[:, k, None] * second["d1"] for m, g in enumerate(grads))
-                        out.array[:] -= self._gradient_transpose(weights, mesh._ad_function_space, k)
-            out.scatter_forward()
-            return out
+                test = ufl.TestFunction(mesh._ad_function_space)
+                if second["A"] is not None:
+                    points.apply_transpose(self._eulerian(second["A"], test), lam, out)
+                if second["dx"] is not None:
+                    points.apply_transpose(
+                        ufl.grad(self._eulerian(u, test)), self._along_motion(lam, second["dx"]), out
+                    )
+            out.x.scatter_forward()
+            return out.x
 
         if self._hessian_output is None:
             self._hessian_output = _create_function(self.space_from)
@@ -656,11 +489,12 @@ class NonmatchingInterpolationBlock(Block):
 
         mult = get_mult(prepared["matrix"], transpose=True, accumulate=True)
         mult(hessian_input, out_func.x)
-        if second is not None and second["moves"]:
-            lam = adj_input.array.reshape(-1, value_size)
-            for m in range(value_size):
-                out_func.x.array[:] += self._gradient_transpose(
-                    lam[:, m, None] * second["d1"], self.space_from, None if value_size == 1 else m
-                )
+        if second is not None:
+            lam = self._weights(adj_input)
+            test = ufl.TestFunction(self.space_from)
+            if second["sigma"] is not None:
+                points.apply_transpose(self._eulerian(test, second["sigma"]), lam, out_func)
+            if second["dx"] is not None:
+                points.apply_transpose(ufl.grad(test), self._along_motion(lam, second["dx"]), out_func)
         out_func.x.scatter_forward()
         return out_func.x

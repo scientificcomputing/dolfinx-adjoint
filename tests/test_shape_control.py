@@ -15,6 +15,7 @@ import pytest
 import ufl
 
 import dolfinx_adjoint as dxa
+from dolfinx_adjoint.blocks.interpolation import ExprInterpolationBlock
 
 # A direct LU solve: the Taylor remainders checked below fall to ~1e-10, which an
 # iterative solve's own tolerance would swamp.
@@ -1689,18 +1690,20 @@ _PIOLA_IDS = ["RT-RT", "P2-RT", "RT-P1", "N1curl-N1curl"]
 
 
 @pytest.mark.parametrize("element_from,element_to", _PIOLA_PAIRS, ids=_PIOLA_IDS)
-def test_split_piola_nonmatching_forward_matches_dolfinx(element_from, element_to):
-    """Recording a Piola case as several blocks must not change the forward value.
+def test_piola_nonmatching_forward_matches_dolfinx(element_from, element_to):
+    """Recording a Piola case must not change the forward value.
 
-    The target step reads only the values at its interpolation points, and the source step is
-    exact on an affine mesh, so the split reproduces DOLFINx's direct interpolation.
+    A Piola-mapped target is split into a quadrature-space step and an expression interpolation,
+    which reads only the values at its interpolation points; a Piola-mapped source stays one
+    block. Either way the result is DOLFINx's direct interpolation.
     """
     pytest.importorskip("fenicsx_ii")
     d = dolfinx.fem.Function(dxa.geometry_function_space(_unit_square(7)))
     d.interpolate(_general_motion)
     J, _, _ = _piola_nonmatching_forward(element_from, element_to, "source", 0.3, d.x.array.copy())
-    split = pyadjoint.get_working_tape().get_blocks()
-    assert len(split) > 3, "expected the Piola case to be recorded as several blocks"
+    blocks = pyadjoint.get_working_tape().get_blocks()
+    split = any(isinstance(block, ExprInterpolationBlock) for block in blocks)
+    assert split == (element_to[0] != "Lagrange"), "only a Piola-mapped target is split"
 
     with pyadjoint.stop_annotating():
         mesh_a = _unit_square(7)
@@ -1892,6 +1895,86 @@ def _assert_hessian_by_value(J, controls, directions, rtol: float = 1e-5):
     Hh, fd = _hessian_and_finite_difference(Jhat, controls, directions)
     assert abs(fd) > 1e-9, "the direction must actually curve the functional"
     assert abs(Hh - fd) < rtol * abs(fd), f"hessian {Hh} vs finite difference {fd}"
+
+
+def _non_affine_quadrilateral(n: int = 4) -> dolfinx.mesh.Mesh:
+    """Unit-square quadrilaterals bent into non-parallelograms, so each cell map is bilinear."""
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, n, n, cell_type=dolfinx.mesh.CellType.quadrilateral)
+    x = mesh.geometry.x
+    x[:, 0] += 0.05 * x[:, 1] * (1 - x[:, 1]) * np.sin(3 * x[:, 0])
+    return mesh
+
+
+_NON_AFFINE_SOURCES = {"curved-P2": lambda: _curved_square(4), "non-affine-quadrilateral": _non_affine_quadrilateral}
+_NON_AFFINE_FAMILIES = ["Lagrange", "RT", "N1curl"]
+
+
+def _non_affine_nonmatching_forward(make_mesh, family: str, values=None, moved=("source",)):
+    """``int |interpolate_nonmatching(u, V_B)|^2 dx`` from a non-affine source mesh.
+
+    ``grad(u)`` and a Piola push-forward are rational on these cells, so any intermediate
+    polynomial space would make the shape derivative inexact. The target is an identity-pullback
+    space on an offset rectangle strictly inside the source. ``values`` displaces the source mesh.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = make_mesh()
+    mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.2, 0.2]), np.array([0.8, 0.8])], [5, 5])
+    mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+    if family == "Lagrange":
+        V_a = dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2))
+        V_b = dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1))
+        values_a = lambda x: np.sin(2.0 * x[0]) + x[1] ** 3  # noqa: E731
+        direction_a = lambda x: np.cos(x[0]) * x[1]  # noqa: E731
+    else:
+        V_a = dolfinx.fem.functionspace(mesh_a, (family, 1))
+        V_b = dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1, (2,)))
+        values_a = lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 2, x[0] * x[1] + 1.0))  # noqa: E731
+        direction_a = lambda x: np.vstack((np.cos(x[0]) * x[1], x[0] ** 2))  # noqa: E731
+    u = dxa.Function(V_a)
+    u.interpolate(values_a)
+    controls, directions = [], []
+    for mesh in [{"source": mesh_a, "target": mesh_b}[side] for side in moved]:
+        tracked = dxa.Mesh(mesh)
+        s = dxa.Function(dxa.geometry_function_space(tracked))
+        if values is not None:
+            s.x.array[:] = values
+        dxa.move(tracked, s)
+        h = dxa.Function(s.function_space)
+        h.interpolate(_general_motion)
+        controls.append(s)
+        directions.append(h)
+    u_b = dxa.interpolate_nonmatching(u, V_b)
+    J = dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx)
+    du = dxa.Function(V_a)
+    du.interpolate(direction_a)
+    return J, controls + [u], directions + [du]
+
+
+@pytest.mark.parametrize("family", _NON_AFFINE_FAMILIES)
+@pytest.mark.parametrize("mesh_kind", sorted(_NON_AFFINE_SOURCES))
+def test_shape_derivative_of_nonmatching_interpolation_from_a_non_affine_mesh(mesh_kind, family):
+    """Moving a curved or non-affine source mesh, with an identity or a Piola-mapped source."""
+    pytest.importorskip("fenicsx_ii")
+    make_mesh = _NON_AFFINE_SOURCES[mesh_kind]
+
+    def forward(values=None):
+        J, controls, _ = _non_affine_nonmatching_forward(make_mesh, family, values)
+        return J, controls[0], controls[0].function_space, None
+
+    d = dolfinx.fem.Function(dxa.geometry_function_space(make_mesh()))
+    d.interpolate(_general_motion)
+    _assert_gradient_by_value(forward, d.x.array.copy())
+
+
+@pytest.mark.parametrize("family", _NON_AFFINE_FAMILIES)
+@pytest.mark.parametrize("mesh_kind", sorted(_NON_AFFINE_SOURCES))
+def test_shape_hessian_of_nonmatching_interpolation_from_a_non_affine_mesh(mesh_kind, family):
+    """Second order with both meshes and the coefficient as controls, so every cross term is hit."""
+    pytest.importorskip("fenicsx_ii")
+    J, controls, directions = _non_affine_nonmatching_forward(
+        _NON_AFFINE_SOURCES[mesh_kind], family, moved=("source", "target")
+    )
+    _assert_hessian_by_value(J, controls, directions)
 
 
 @pytest.mark.parametrize("mesh_kind", sorted(_MESHES))

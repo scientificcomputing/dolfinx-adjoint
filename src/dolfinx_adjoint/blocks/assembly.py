@@ -25,6 +25,10 @@ class AssembleBlock(Block):
         entity_maps: Dictionary mapping meshes to entity maps for assembly.
     """
 
+    # If domain in input form was annotated or not at time of initialization. If annoated
+    # this stores the `ufl_id()` of the domain. If not annoated store `None`.
+    _unannotated_domain: int | None
+
     def __init__(
         self,
         form: ufl.Form,
@@ -165,6 +169,14 @@ class AssembleBlock(Block):
             raise ValueError("Forms with arity > 1 are not handled yet!")
 
     def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
+        """``self.form`` with every coefficient dependency replaced by its checkpointed value.
+
+        Shared by the recompute, TLM and Hessian sweeps. A mesh dependency needs no replacement:
+        the form references its coordinates, which the tape has already restored.
+
+        Returns:
+            The replaced UFL form.
+        """
         replaced_coeffs = {}
         for block_variable in self.get_dependencies():
             coeff = block_variable.output
@@ -175,6 +187,24 @@ class AssembleBlock(Block):
         return form
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
+        r"""The adjoint action :math:`(\partial F/\partial c)^*[\lambda]` for dependency ``c``.
+
+        For a functional (arity 0) this is the assembled vector :math:`\lambda\,\partial F/\partial c`
+        in the dual of ``c``'s space; a mesh dependency is differentiated through its
+        ``SpatialCoordinate``, into its coordinate space. Arity 1 is not implemented yet.
+
+        Args:
+            prepared: ``self.form`` with the dependencies replaced by their checkpointed values.
+            adj_inputs: ``[lambda]``, the adjoint seed of the output, a scalar for arity 0.
+            block_variable: The dependency ``c`` differentiated with respect to.
+
+        Returns:
+            The adjoint contribution to ``c``, a :py:class:`dolfinx.la.Vector`.
+
+        Raises:
+            ValueError: For a form of arity 1 or higher.
+            NotImplementedError: For a dependency that is neither a Function nor a Mesh.
+        """
         form = prepared
         adj_input = adj_inputs[0]
         c = block_variable.output
@@ -196,9 +226,22 @@ class AssembleBlock(Block):
         return self.compute_action_adjoint(adj_input, arity_form, form, c_rep, space)[0]
 
     def prepare_evaluate_tlm(self, inputs, tlm_inputs, relevant_outputs):
+        """The replaced form, as for :py:meth:`prepare_evaluate_adj`."""
         return self.prepare_evaluate_adj(inputs, tlm_inputs, self.get_dependencies())
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
+        r"""The directional derivative :math:`\sum_c (\partial F/\partial c)[\dot c]`.
+
+        Summed over the dependencies with a tangent-linear value :math:`\dot c`; a mesh
+        dependency is differentiated through its ``SpatialCoordinate``.
+
+        Args:
+            prepared: The replaced form from :py:meth:`prepare_evaluate_tlm`.
+
+        Returns:
+            A scalar for a functional (arity 0), a Function for a vector (arity 1), or ``0.0``
+            when no dependency has a tangent-linear value.
+        """
         form = prepared
         dform = 0.0
 
@@ -228,6 +271,7 @@ class AssembleBlock(Block):
         return dform
 
     def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
+        """The replaced form, as for :py:meth:`prepare_evaluate_adj`."""
         return self.prepare_evaluate_adj(inputs, adj_inputs, relevant_dependencies)
 
     def evaluate_hessian_component(
@@ -240,6 +284,30 @@ class AssembleBlock(Block):
         relevant_dependencies,
         prepared=None,
     ):
+        r"""The second-order adjoint contribution to dependency ``c1``.
+
+        With :math:`\hat\lambda` the Hessian seed of the output and :math:`\lambda` its adjoint
+        seed, this is
+
+        .. math::
+
+            (\partial F/\partial c_1)^*[\hat\lambda]
+            + \Big(\sum_{c_2} \partial^2 F/\partial c_1 \partial c_2 [\dot c_2]\Big)^*[\lambda],
+
+        the sum running over the dependencies with a tangent-linear value :math:`\dot c_2`.
+        Implemented for a functional (arity 0), like :py:meth:`evaluate_adj_component`.
+
+        Args:
+            prepared: The replaced form from :py:meth:`prepare_evaluate_hessian`.
+
+        Returns:
+            The contribution as a :py:class:`dolfinx.la.Vector`, or ``None`` for a dependency
+            that is neither a Function nor a Mesh.
+
+        Raises:
+            RuntimeError: For a :py:class:`dolfinx.fem.Constant` dependency, which should have
+                been replaced by a real-space coefficient earlier.
+        """
         form = prepared
         hessian_input = hessian_inputs[0]
         adj_input = adj_inputs[0]
@@ -289,9 +357,18 @@ class AssembleBlock(Block):
         return hessian_outputs
 
     def prepare_recompute_component(self, inputs, relevant_outputs):
+        """The replaced form, as for :py:meth:`prepare_evaluate_adj`."""
         return self.prepare_evaluate_adj(inputs, None, None)
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
+        """Reassemble the functional at the checkpointed dependency values.
+
+        Args:
+            prepared: The replaced form from :py:meth:`prepare_recompute_component`.
+
+        Returns:
+            The value, summed over all ranks, as an overloaded float.
+        """
         form = prepared
 
         compiled_form = dolfinx.fem.form(
