@@ -420,8 +420,8 @@ class ExprInterpolationBlock(Block):
         dE = ufl.derivative(current_expr, target_dep, du)
         return MatrixFreeInterpolationOperator(dE, self.space_to)
 
-    def _coordinate_derivative(self, expr: ufl.core.expr.Expr, direction) -> ufl.core.expr.Expr:
-        r"""Differentiate ``expr`` with respect to the mesh coordinates, along ``direction``.
+    def _coordinate_derivative(self, expr: ufl.core.expr.Expr, *directions) -> ufl.core.expr.Expr:
+        r"""Differentiate ``expr`` with respect to the mesh coordinates, along each of ``directions``.
 
         ``expand_derivatives`` leaves a {py:class}`ufl.classes.CoordinateDerivative` node in
         place -- it is normally expanded by the form compiler, after the pullback to reference
@@ -452,11 +452,18 @@ class ExprInterpolationBlock(Block):
         global vertex numbering, which displacing the coordinates does not change, so they are
         constant under a shape perturbation.
 
+        With two directions this is the second derivative, and **both** are taken in the reference
+        frame before anything is converted back. Converting after the first would leave
+        ``grad(direction)`` of the tangent-linear direction in the expression, a coefficient UFL
+        refuses to differentiate in physical space; kept as a ``ReferenceValue``, the direction is
+        held fixed in its dofs, which is what it is.
+
         Args:
             expr: The expression being interpolated, at its checkpointed dependency values.
-            direction: The perturbation of the coordinates -- an
-                {py:class}`ufl.Argument` on the geometry space for the adjoint, a
-                {py:class}`~dolfinx_adjoint.Function` for the tangent-linear model.
+            directions: The perturbations of the coordinates -- an {py:class}`ufl.Argument` on
+                the geometry space for the adjoint, a {py:class}`~dolfinx_adjoint.Function` for
+                the tangent-linear model; for the Hessian, the tangent-linear direction first and
+                the argument second.
 
         Returns:
             The expanded derivative, ready to interpolate.
@@ -471,9 +478,10 @@ class ExprInterpolationBlock(Block):
         pullback = self.space_to.ufl_element().pullback
         reference_expr = expr if pullback.is_identity else apply_pullback_inverse(pullback, expr, domain)
         reference_expr = map_expr_dag(GeometryLoweringApplier(preserve_types=(Jacobian,)), reference_expr)
-        derivative = ufl.algorithms.expand_derivatives(
-            ufl.derivative(reference_expr, ufl.SpatialCoordinate(self._mesh), ReferenceValue(direction))
-        )
+        derivative = reference_expr
+        for direction in directions:
+            derivative = ufl.derivative(derivative, ufl.SpatialCoordinate(self._mesh), ReferenceValue(direction))
+        derivative = ufl.algorithms.expand_derivatives(derivative)
         try:
             expanded = map_expr_dag(_ToPhysical(domain), apply_coordinate_derivatives(derivative))
             return expanded if pullback.is_identity else pullback.apply(expanded, domain)
@@ -569,85 +577,94 @@ class ExprInterpolationBlock(Block):
         return out_func
 
     # --- Hessian ---
-    def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
-        # The loops below index `inputs`/`self._deps` positionally and differentiate w.r.t.
-        # `inputs[i]`, which is the mesh itself rather than its coordinates for a mesh
-        # dependency. Rather than quietly compute the wrong second derivative, refuse -- the
-        # solver blocks refuse a shape Hessian for the same reason.
-        for index, dep in enumerate(self.get_dependencies()):
-            if isinstance(dep.output, Mesh) and (
-                dep.tlm_value is not None or any(index == idx for idx, _ in relevant_dependencies)
-            ):
-                raise NotImplementedError(
-                    "Second-order shape derivatives through an interpolated expression are "
-                    "not supported yet; only the first-order adjoint and the tangent-linear "
-                    "model are."
-                )
+    def _mesh_index(self) -> int | None:
+        """Position of the mesh among the dependencies, if it is one: right after the coefficients."""
+        return len(self._deps) if self._mesh is not None else None
 
+    def prepare_evaluate_hessian(self, inputs, hessian_inputs, adj_inputs, relevant_dependencies):
+        """Per relevant dependency, ``(J, H)``: the Jacobian, and the curvature along the TLM.
+
+        ``evaluate_hessian_component`` then forms ``J^T hessian_input + H^T adj_input``. The mesh
+        is handled like a coefficient, except that its derivatives are coordinate derivatives:
+        ``J`` along a geometry-space argument, and the mesh-mesh part of ``H`` as a second
+        coordinate derivative along the mesh's TLM value and that argument, both taken in the
+        reference frame (see :py:meth:`_coordinate_derivative`). A coefficient mixed with the
+        coordinates raises there, as it does at first order.
+        """
         operators = {}
+        mesh_index = self._mesh_index()
+        deps_bv = self.get_dependencies()
 
         # 1. Substitute current optimization step's inputs into the expression
         if inputs is not None:
             replace_map = {self._deps[i]: inputs[i] for i in range(len(self._deps))}
             current_expr = ufl.replace(self.expr, replace_map)
         else:
-            inputs = self._deps
-            replace_map = {d: d for d in self._deps}
+            inputs = list(self._deps) + ([self._mesh] if mesh_index is not None else [])
             current_expr = self.expr
 
-        # 2. Build the total first-order directional derivative: dE_total = sum( dE/dx_j * \delta x_j )
-        dE_total = None
-        deps_bv = self.get_dependencies()
-
-        for i, dep_bv in enumerate(deps_bv):
-            tlm_val = dep_bv.tlm_value
-
+        # 2. The first-order directional derivative along the coefficients' TLM values, in
+        #    physical form. The mesh's direction is kept apart: its contribution to the mesh's own
+        #    curvature has to stay in the reference frame (step 3).
+        dE_coefficients = None
+        for i in range(len(self._deps)):
+            tlm_val = deps_bv[i].tlm_value
             # Fallback for controls or unrecorded raw inputs
             if tlm_val is None and hasattr(inputs[i], "block_variable") and inputs[i].block_variable is not None:
                 tlm_val = inputs[i].block_variable.tlm_value
-
             if tlm_val is not None:
-                target_dep = inputs[i]
-                term = ufl.derivative(current_expr, target_dep, tlm_val)
-                dE_total = term if dE_total is None else dE_total + term
+                term = ufl.derivative(current_expr, inputs[i], tlm_val)
+                dE_coefficients = term if dE_coefficients is None else dE_coefficients + term
+        mesh_tlm = deps_bv[mesh_index].tlm_value if mesh_index is not None else None
 
         # 3. Assemble both the Jacobian and the Hessian matrix for each dependency
         for idx, _dep in relevant_dependencies:
-            # The standard Jacobian (J)
-            J_op = self._assemble_operator(idx, inputs)
+            if idx == mesh_index:
+                argument = ufl.TrialFunction(self._mesh._ad_function_space())
+                first = self._coordinate_derivative(current_expr, argument)
+                J_op = MatrixFreeInterpolationOperator(first, self.space_to)
+                curvature = []
+                if mesh_tlm is not None:
+                    curvature.append(self._coordinate_derivative(current_expr, mesh_tlm, argument))
+                if dE_coefficients is not None:
+                    curvature.append(self._coordinate_derivative(dE_coefficients, argument))
+                operators[idx] = (J_op, self._curvature_operator(curvature))
+                continue
 
-            # Matrix-free Curvature (H)
+            J_op = self._assemble_operator(idx, inputs)
+            dE_total = dE_coefficients
+            if mesh_tlm is not None:
+                mesh_term = self._coordinate_derivative(current_expr, mesh_tlm)
+                dE_total = mesh_term if dE_total is None else dE_total + mesh_term
             H_op = None
             if dE_total is not None:
                 target_dep_i = inputs[idx]
                 if hasattr(target_dep_i, "function_space"):
-                    V_in = target_dep_i.function_space
-                    du = ufl.TrialFunction(V_in)
-                    d2E = ufl.derivative(dE_total, target_dep_i, du)
-                    # ufl.derivative returns a lazy, unexpanded CoefficientDerivative node
-                    # that formally references `du` regardless of whether the expanded
-                    # expression actually depends on it (e.g. `dE_total` linear in
-                    # target_dep_i, as for a bare-coefficient expr -- its second
-                    # derivative is identically zero, but the *unexpanded* node still
-                    # reports one argument, previously causing a spurious H_op to be
-                    # compiled from a mesh-less zero expression). Expand derivatives
-                    # first so the argument count (and isinstance-zero check) reflect
-                    # the true, simplified expression.
-                    d2E = ufl.algorithms.apply_derivatives.apply_derivatives(d2E)
-
-                    if not isinstance(d2E, (int, float)):
-                        args = ufl.algorithms.extract_arguments(d2E)
-                        if len(args) == 1:
-                            H_op = MatrixFreeInterpolationOperator(d2E, self.space_to)
-                        elif len(args) > 1:
-                            raise ValueError(
-                                f"Second derivative of expression with respect to {target_dep_i}"
-                                + f" has more than one argument: {args}"
-                            )
-
+                    du = ufl.TrialFunction(target_dep_i.function_space)
+                    # ufl.derivative returns a lazy, unexpanded CoefficientDerivative node that
+                    # formally references `du` even when the expanded expression does not depend
+                    # on it (dE_total linear in target_dep_i has an identically zero second
+                    # derivative). Expand first so the argument check reflects the true expression.
+                    d2E = ufl.algorithms.apply_derivatives.apply_derivatives(ufl.derivative(dE_total, target_dep_i, du))
+                    H_op = self._curvature_operator([d2E])
             operators[idx] = (J_op, H_op)
 
         return operators
+
+    def _curvature_operator(self, terms: list) -> MatrixFreeInterpolationOperator | None:
+        """The matrix-free operator for the sum of ``terms``, or ``None`` if it is identically zero."""
+        terms = [term for term in terms if not isinstance(term, (int, float))]
+        if not terms:
+            return None
+        total = terms[0]
+        for term in terms[1:]:
+            total = total + term
+        args = ufl.algorithms.extract_arguments(total)
+        if not args:
+            return None
+        if len(args) > 1:
+            raise ValueError(f"A second derivative of '{self.expr}' has more than one argument: {args}")
+        return MatrixFreeInterpolationOperator(total, self.space_to)
 
     def evaluate_hessian_component(
         self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None
@@ -658,7 +675,8 @@ class ExprInterpolationBlock(Block):
         J_op, H_op = prepared[idx]
 
         if idx not in self._hessian_output:
-            self._hessian_output[idx] = _create_function(self._deps[idx].function_space)
+            space = self._mesh._ad_function_space() if idx == self._mesh_index() else self._deps[idx].function_space
+            self._hessian_output[idx] = _create_function(space)
         out_func = self._hessian_output[idx]
         out_func.x.array[:] = 0.0
 

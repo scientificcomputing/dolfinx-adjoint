@@ -1297,7 +1297,9 @@ def test_the_manual_pullback_inverse_matches_ufls(name):
     assert norm(reference - manual) < 1e-12 * norm(reference)
 
 
-def _nonmatching_forward(step, direction, moved: str, vector: bool = False, same_mesh: bool = False):
+def _nonmatching_forward(
+    step, direction, moved: str, vector: bool = False, same_mesh: bool = False, target_degree: int = 1
+):
     """A functional of ``interpolate_nonmatching(u, V_B)``, with one mesh displaced.
 
     ``u``'s dofs are set on the *undeformed* mesh, before the move. The adjoint holds a
@@ -1324,7 +1326,7 @@ def _nonmatching_forward(step, direction, moved: str, vector: bool = False, same
         s.x.array[:] = step * direction
     dxa.move(tracked, s)
 
-    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1, shape)))
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", target_degree, shape)))
     return dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx), s, S
 
 
@@ -1336,35 +1338,42 @@ def _contraction(n: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize(
-    "moved,vector,same_mesh",
+    "moved,vector,same_mesh,target_degree",
     [
-        ("target", False, False),
-        ("source", False, False),
-        ("target", True, False),
-        ("source", True, False),
-        ("target", False, True),
+        ("target", False, False, 1),
+        ("source", False, False, 1),
+        ("target", True, False, 1),
+        ("source", True, False, 1),
+        ("target", False, True, 1),
+        ("target", False, False, 2),
+        ("source", False, False, 2),
     ],
-    ids=["target", "source", "target-vector", "source-vector", "same-mesh"],
+    ids=["target", "source", "target-vector", "source-vector", "same-mesh", "target-P2", "source-P2"],
 )
-def test_shape_derivative_of_nonmatching_interpolation(moved, vector, same_mesh):
+def test_shape_derivative_of_nonmatching_interpolation(moved, vector, same_mesh, target_degree):
     """Both ways a non-matching interpolation depends on the geometry, checked by value.
 
     Writing ``c_i = u_A(x_i)`` for the target dofs: displacing the target moves the points,
     ``dc_i = grad(u_A)(x_i) . dx_B(x_i)``; displacing the source carries ``u_A`` along with its
     mesh, ``du_A = -grad(u_A) . s_A``. On one mesh the two cancel, leaving only the measure's
     contribution from the functional -- which a wrong sign on either would not.
+
+    The P2 targets matter in parallel: a P1 target's interpolation points are the geometry
+    vertices, so each row touches only its own vertex, while a P2 target's edge-midpoint rows
+    straddle vertices owned by different ranks. A missing ghost reduction was 2.3% wrong on three
+    ranks and invisible with P1.
     """
     pytest.importorskip("fenicsx_ii")
     h = _contraction(7 if (moved == "source" or same_mesh) else 5)
     eps = 1e-6
     # Every rebuild first: a clear_tape() under a live ReducedFunctional invalidates it.
     fd = (
-        float(_nonmatching_forward(eps, h, moved, vector, same_mesh)[0])
-        - float(_nonmatching_forward(-eps, h, moved, vector, same_mesh)[0])
+        float(_nonmatching_forward(eps, h, moved, vector, same_mesh, target_degree)[0])
+        - float(_nonmatching_forward(-eps, h, moved, vector, same_mesh, target_degree)[0])
     ) / (2 * eps)
     assert abs(fd) > 1e-8, "the direction must actually change the functional"
 
-    J, s, S = _nonmatching_forward(None, h, moved, vector, same_mesh)
+    J, s, S = _nonmatching_forward(None, h, moved, vector, same_mesh, target_degree)
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
     hf = dxa.Function(S)
     hf.x.array[:] = h
@@ -1393,15 +1402,123 @@ def test_nonmatching_interpolation_replays_at_the_moved_geometry(moved):
         assert abs(float(Jhat(f)) - rebuilt[step]) < 1e-11 * abs(rebuilt[step]), f"s = {step}"
 
 
-def test_nonmatching_shape_hessian_is_refused():
-    """The second derivative needs grad(grad(u)) and the derivative of the point location."""
-    pytest.importorskip("fenicsx_ii")
-    J, s, S = _nonmatching_forward(None, _contraction(5), "target")
+def _hessian_and_finite_difference(Jhat, controls, directions, eps=1e-4) -> tuple[float, float]:
+    """``<H h, h>`` summed over the controls, and a central difference of ``<dJ, h>``."""
+    Jhat(controls)
+    Jhat.derivative()
+    hessian = Jhat.hessian(directions)
+    hessian = hessian if isinstance(hessian, list) else [hessian]
+    Hh = sum(float(Hi._ad_dot(d)) for Hi, d in zip(hessian, directions))
+
+    def directional_gradient(scale: float) -> float:
+        Jhat([c._ad_add(d._ad_mul(scale)) for c, d in zip(controls, directions)])
+        gradient = Jhat.derivative()
+        gradient = gradient if isinstance(gradient, list) else [gradient]
+        return sum(float(g._ad_dot(d)) for g, d in zip(gradient, directions))
+
+    fd = (directional_gradient(eps) - directional_gradient(-eps)) / (2 * eps)
+    Jhat(controls)
+    return Hh, fd
+
+
+@pytest.mark.parametrize("family", ["Lagrange", "RT", "N1curl"])
+def test_shape_hessian_through_an_interpolated_expression(family):
+    """Second order through ``interpolate``, including a Piola-mapped target.
+
+    Both coordinate derivatives are taken in the reference frame before anything is converted
+    back; converting after the first would leave ``grad`` of the tangent-linear direction in the
+    expression, which UFL refuses to differentiate in physical space. The difference is checked
+    at a step where its truncation error (~ eps^2) is far below the tolerance.
+    """
+    mesh, S, s, _ = _shape_setup(6)
+    X = ufl.SpatialCoordinate(mesh)
+    if family == "Lagrange":
+        u = dxa.interpolate(ufl.sin(ufl.pi * X[0]) * X[1] ** 2, dolfinx.fem.functionspace(mesh, ("Lagrange", 2)))
+    else:
+        V = dolfinx.fem.functionspace(mesh, (family, 1))
+        u = dxa.interpolate(ufl.as_vector((X[1] ** 2 + X[0] ** 3, X[0] * X[1] + 2.0)), V)
+    J = dxa.assemble_scalar(ufl.inner(u, u) * ufl.dx)
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    hf = dxa.Function(S)
-    hf.interpolate(_dilation_values)
-    with pytest.raises(NotImplementedError, match="Second-order shape derivatives of a non-matching"):
-        Jhat.hessian(hf)
+    h = dxa.Function(S)
+    h.interpolate(lambda x: np.vstack((x[0] * (1.0 + 0.5 * x[1]), x[1] ** 2)))
+    Hh, fd = _hessian_and_finite_difference(Jhat, [s], [h])
+    assert abs(fd) > 1e-8, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < 1e-5 * abs(fd), f"hessian {Hh} vs finite difference {fd}"
+
+
+def _nonmatching_hessian_forward(moved: str, vector: bool, target_degree: int, u_control: bool):
+    """A non-matching interpolation with the target strictly inside the source, in general position.
+
+    General position is not cosmetic. At a target point lying on a source cell's edge,
+    ``grad(u)`` of a C0 field and ``grad(sigma)`` of the source displacement jump, so the shape
+    derivative there is one-sided -- and the second derivative, which reads ``grad(sigma)``, is
+    not defined. A target placed on the source's grid (as the first-order tests' is, harmlessly,
+    since they read only ``grad(u)`` of an exactly represented quadratic) sits on those edges.
+    Strictly inside also keeps every perturbed target point inside the source mesh.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.1, 0.1]), np.array([0.9, 0.9])], [5, 5])
+    mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+    tracked = {"source": [mesh_a], "target": [mesh_b], "both": [mesh_a, mesh_b]}[moved]
+    tracked = [dxa.Mesh(mesh) for mesh in tracked]
+
+    shape = (2,) if vector else ()
+    u = dxa.Function(dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2, shape)))
+    if vector:
+        u.interpolate(lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 3, x[0] * x[1] ** 2)))
+    else:
+        u.interpolate(lambda x: np.sin(2.0 * x[0]) + x[0] * x[1] ** 3)
+
+    controls, directions = [], []
+    for mesh in tracked:
+        s = dxa.Function(dxa.geometry_function_space(mesh))
+        dxa.move(mesh, s)
+        h = dxa.Function(s.function_space)
+        h.interpolate(lambda x: np.vstack((0.05 * (0.5 - x[0]) + 0.02 * x[0] * x[1], 0.04 * (0.5 - x[1]))))
+        controls.append(s)
+        directions.append(h)
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", target_degree, shape)))
+    J = dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx)
+    if u_control:
+        du = dxa.Function(u.function_space)
+        if vector:
+            du.interpolate(lambda x: np.vstack((np.cos(x[0]) * x[1], x[0] ** 2)))
+        else:
+            du.interpolate(lambda x: np.cos(x[0]) * x[1])
+        controls.append(u)
+        directions.append(du)
+    return J, controls, directions
+
+
+@pytest.mark.parametrize(
+    "moved,vector,target_degree,u_control",
+    [
+        ("source", False, 1, False),
+        ("source", True, 1, False),
+        ("source", False, 2, False),
+        ("target", False, 2, False),
+        ("both", False, 1, False),
+        ("both", False, 1, True),
+        ("source", True, 1, True),
+    ],
+    ids=["source", "source-vector", "source-P2", "target-P2", "both", "both+coefficient", "source-vector+coefficient"],
+)
+def test_shape_hessian_of_nonmatching_interpolation(moved, vector, target_degree, u_control):
+    r"""Second order through ``interpolate_nonmatching``, against a difference of the gradient.
+
+    With ``d_k = dx_k(x_i) - sigma_k(x_i)`` the motion of each target point relative to the
+    source mesh, ``d2c = d1^T H_u d2 - grad(u).(grad(sigma2) d1) - grad(u).(grad(sigma1) d2)
+    + grad(u1).d2 + grad(u2).d1``. The cases cover each term: the source Hessian ``H_u`` (P2
+    source), ``grad(sigma)`` (source moving), both meshes at once, and the coefficient cross
+    terms.
+    """
+    pytest.importorskip("fenicsx_ii")
+    J, controls, directions = _nonmatching_hessian_forward(moved, vector, target_degree, u_control)
+    Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    Hh, fd = _hessian_and_finite_difference(Jhat, controls, directions)
+    assert abs(fd) > 1e-9, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < 1e-6 * abs(fd) + 1e-13, f"hessian {Hh} vs finite difference {fd}"
 
 
 def test_nonmatching_shape_control_into_a_piola_mapped_space_is_refused():
