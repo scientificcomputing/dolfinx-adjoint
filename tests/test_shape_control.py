@@ -12,10 +12,15 @@ import dolfinx.fem.petsc
 import numpy as np
 import pyadjoint
 import pytest
+import scifem.compat
+import scifem.interpolation
+import scifem.mesh
 import ufl
 
 import dolfinx_adjoint as dxa
+from dolfinx_adjoint._surface_extension import TransposableSurfaceSubmeshExtension
 from dolfinx_adjoint.blocks.interpolation import ExprInterpolationBlock
+from dolfinx_adjoint.mesh import _surface_extension
 
 # A direct LU solve: the Taylor remainders checked below fall to ~1e-10, which an
 # iterative solve's own tolerance would swamp.
@@ -1975,6 +1980,269 @@ def test_shape_hessian_of_nonmatching_interpolation_from_a_non_affine_mesh(mesh_
         _NON_AFFINE_SOURCES[mesh_kind], family, moved=("source", "target")
     )
     _assert_hessian_by_value(J, controls, directions)
+
+
+_BOUNDARY_MESHES = {
+    "affine": lambda: _unit_square(5),
+    "curved-P2": lambda: _curved_square(4),
+    "quadrilateral": _non_affine_quadrilateral,
+}
+
+
+def _boundary_submesh(mesh: dolfinx.mesh.Mesh):
+    """The exterior facets of ``mesh`` as a submesh, its entity map, and the facets."""
+    fdim = mesh.topology.dim - 1
+    mesh.topology.create_connectivity(fdim, fdim + 1)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    facet_mesh, entity_map = dolfinx.mesh.create_submesh(mesh, fdim, facets)[:2]
+    return facet_mesh, entity_map, facets
+
+
+def _boundary_values(x: np.ndarray) -> np.ndarray:
+    return np.vstack((np.sin(3.0 * x[0]) + x[1] ** 2, x[0] * x[1] - 0.5 * x[1]))
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_transfer_from_boundary_extends_by_zero(mesh_kind):
+    """Every boundary node gets the boundary function's value, including a P2 geometry's
+    mid-edge nodes, every interior node gets zero, and restricting back returns the input."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _BOUNDARY_MESHES[mesh_kind]()
+    facet_mesh, entity_map, facets = _boundary_submesh(mesh)
+    S = dxa.geometry_function_space(mesh)
+    h = dxa.Function(dxa.geometry_function_space(facet_mesh))
+    h.interpolate(_boundary_values)
+    s = dxa.transfer_from_boundary(h, S, entity_map)
+
+    fdim = mesh.topology.dim - 1
+    gdim = mesh.geometry.dim
+    boundary = dolfinx.fem.locate_dofs_topological(S, fdim, facets)
+    owned = S.dofmap.index_map.size_local
+    boundary = boundary[boundary < owned]
+    interior = np.setdiff1d(np.arange(owned), boundary)
+    values = s.x.array.reshape(-1, gdim)
+    expected = _boundary_values(S.tabulate_dof_coordinates()[boundary].T).T
+    assert np.allclose(values[boundary], expected)
+    assert np.all(values[interior] == 0.0)
+
+    back = dolfinx.fem.Function(h.function_space)
+    num_facets = facet_mesh.topology.index_map(fdim).size_local
+    sub = np.arange(num_facets, dtype=np.int32)
+    entities = scifem.compat.compute_integration_domains(
+        dolfinx.fem.IntegralType.exterior_facet,
+        mesh.topology,
+        scifem.mesh.get_entity_map(entity_map)[:num_facets],
+    ).reshape(-1, 2)
+    scifem.interpolation.interpolate_to_surface_submesh(s, back, sub, entities)
+    assert np.allclose(back.x.array, h.x.array), "restricting the extension must return the input"
+
+
+@pytest.mark.parametrize("degree", [2, 3])
+@pytest.mark.parametrize(
+    "make_mesh",
+    [
+        lambda: _unit_square(4),
+        lambda: dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 4, 3, cell_type=dolfinx.mesh.CellType.quadrilateral),
+        lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2),
+        lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2, cell_type=dolfinx.mesh.CellType.hexahedron),
+    ],
+    ids=["triangle", "quadrilateral", "tetrahedron", "hexahedron"],
+)
+def test_transfer_from_boundary_orders_entity_interior_dofs(make_mesh, degree):
+    """Restricting the extension returns the input where facets carry several interior dofs.
+
+    From P3 an edge carries two dofs and a hexahedron's face four, whose order depends on how
+    the facet is oriented in its cell; the closure permutation has to get each one right.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = make_mesh()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", degree))
+    h = dxa.Function(dolfinx.fem.functionspace(facet_mesh, ("Lagrange", degree)))
+    h.interpolate(lambda x: np.sin(2.0 * x[0]) + x[1] ** 3 + x[0] * x[mesh.geometry.dim - 1])
+    u = dxa.transfer_from_boundary(h, V, entity_map)
+
+    fdim = mesh.topology.dim - 1
+    num_facets = facet_mesh.topology.index_map(fdim).size_local
+    sub = np.arange(num_facets, dtype=np.int32)
+    entities = scifem.compat.compute_integration_domains(
+        dolfinx.fem.IntegralType.exterior_facet, mesh.topology, scifem.mesh.get_entity_map(entity_map)[:num_facets]
+    ).reshape(-1, 2)
+    back = dolfinx.fem.Function(h.function_space)
+    scifem.interpolation.interpolate_to_surface_submesh(u, back, sub, entities)
+    assert np.allclose(back.x.array, h.x.array)
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_transfer_from_boundary_transpose(mesh_kind):
+    """<E q, w> = <q, E^T w>, summed over owned dofs on every rank."""
+    mesh = _BOUNDARY_MESHES[mesh_kind]()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    S = dxa.geometry_function_space(mesh)
+    Q = dxa.geometry_function_space(facet_mesh)
+    extension = _surface_extension(Q, S, entity_map)
+    rng = np.random.default_rng(MPI.COMM_WORLD.rank)
+    q = dolfinx.fem.Function(Q)
+    q.x.array[:] = rng.random(q.x.array.size)
+    q.x.scatter_forward()
+    w = dolfinx.fem.Function(S)
+    w.x.array[:] = rng.random(w.x.array.size)
+    u = dolfinx.fem.Function(S)
+    extension.apply(q, u)
+    transposed = dolfinx.fem.Function(Q)
+    extension.apply_transpose(w.x, transposed.x)
+    assert np.isclose(_directional(u, w, S), _directional(q, transposed, Q), rtol=1e-12)
+
+
+def test_transfer_from_boundary_interpolates_a_coarser_boundary_field():
+    """A P1 boundary field into a P2 geometry gives its interpolant: mid-edge nodes average the ends."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _curved_square(3)
+    facet_mesh, entity_map, facets = _boundary_submesh(mesh)
+    h = dxa.Function(dolfinx.fem.functionspace(facet_mesh, ("Lagrange", 1, (2,))))
+    h.interpolate(_boundary_values)
+    S = dxa.geometry_function_space(mesh)
+    s = dxa.transfer_from_boundary(h, S, entity_map)
+
+    # The reference: h evaluated at each boundary node of S, through its own submesh cell.
+    boundary = dolfinx.fem.locate_dofs_topological(S, mesh.topology.dim - 1, facets)
+    owned = S.dofmap.index_map.size_local
+    boundary = boundary[boundary < owned]
+    points = S.tabulate_dof_coordinates()[boundary]
+    tree = dolfinx.geometry.bb_tree(facet_mesh, facet_mesh.topology.dim)
+    candidates = dolfinx.geometry.compute_collisions_points(tree, points)
+    colliding = dolfinx.geometry.compute_colliding_cells(facet_mesh, candidates, points)
+    for row, node in enumerate(boundary):
+        cell = colliding.links(row)[:1]
+        if len(cell):
+            assert np.allclose(s.x.array.reshape(-1, 2)[node], h.eval(points[row], cell))
+
+
+def test_transfer_from_boundary_transpose_with_a_discontinuous_boundary_field():
+    """A DG boundary field is averaged at shared nodes; the map stays linear with an exact transpose."""
+    mesh = _unit_square(4)
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    S = dxa.geometry_function_space(mesh)
+    Q = dolfinx.fem.functionspace(facet_mesh, ("DG", 1, (2,)))
+    extension = _surface_extension(Q, S, entity_map)
+    rng = np.random.default_rng(MPI.COMM_WORLD.rank)
+    q = dolfinx.fem.Function(Q)
+    q.x.array[:] = rng.random(q.x.array.size)
+    q.x.scatter_forward()
+    w = dolfinx.fem.Function(S)
+    w.x.array[:] = rng.random(w.x.array.size)
+    u = dolfinx.fem.Function(S)
+    extension.apply(q, u)
+    transposed = dolfinx.fem.Function(Q)
+    extension.apply_transpose(w.x, transposed.x)
+    assert np.isclose(_directional(u, w, S), _directional(q, transposed, Q), rtol=1e-12)
+
+
+_PIOLA_BOUNDARY_MESHES = {
+    **_BOUNDARY_MESHES,
+    "tetrahedron": lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2),
+    "hexahedron": lambda: dolfinx.mesh.create_unit_cube(
+        MPI.COMM_WORLD, 2, 2, 2, cell_type=dolfinx.mesh.CellType.hexahedron
+    ),
+}
+
+
+@pytest.mark.parametrize("element", [("RT", 1), ("RT", 2), ("N1curl", 1), ("N1curl", 2)], ids=lambda e: f"{e[0]}{e[1]}")
+@pytest.mark.parametrize("mesh_kind", sorted(_PIOLA_BOUNDARY_MESHES))
+def test_surface_extension_transpose_into_a_piola_mapped_space(mesh_kind, element):
+    """<E q, w> = <q, E^T w> for an H(div) or H(curl) volume space, which ``transfer_from_boundary``
+    refuses since the extension then depends on the geometry."""
+    mesh = _PIOLA_BOUNDARY_MESHES[mesh_kind]()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    gdim = mesh.geometry.dim
+    Q = dolfinx.fem.functionspace(facet_mesh, ("Lagrange", 1, (gdim,)))
+    V = dolfinx.fem.functionspace(mesh, element)
+    with pytest.raises(ValueError, match="needs a Lagrange volume space"):
+        _surface_extension(Q, V, entity_map)
+
+    fdim = mesh.topology.dim - 1
+    num_facets = facet_mesh.topology.index_map(fdim).size_local
+    entities = scifem.compat.compute_integration_domains(
+        dolfinx.fem.IntegralType.exterior_facet, mesh.topology, scifem.mesh.get_entity_map(entity_map)[:num_facets]
+    ).reshape(-1, 2)
+    extension = TransposableSurfaceSubmeshExtension(
+        Q, V, np.arange(num_facets, dtype=np.int32), entities, entity_maps=[entity_map]
+    )
+    rng = np.random.default_rng(MPI.COMM_WORLD.rank)
+    q = dolfinx.fem.Function(Q)
+    q.x.array[:] = rng.random(q.x.array.size)
+    q.x.scatter_forward()
+    w = dolfinx.fem.Function(V)
+    w.x.array[:] = rng.random(w.x.array.size)
+    u = dolfinx.fem.Function(V)
+    extension.apply(q, u)
+    assert MPI.COMM_WORLD.allreduce(np.abs(u.x.array).max(initial=0.0), op=MPI.MAX) > 0.1
+    transposed = dolfinx.fem.Function(Q)
+    extension.apply_transpose(w.x, transposed.x)
+    assert np.isclose(_directional(u, w, V), _directional(q, transposed, Q), rtol=1e-12)
+
+
+def _boundary_control_forward(make_mesh, values=None):
+    """``int u^2 + |x|^2 dx`` for a Poisson solve on a mesh moved by a boundary-only displacement."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = make_mesh()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    h = dxa.Function(dxa.geometry_function_space(facet_mesh), name="boundary_displacement")
+    if values is not None:
+        h.x.array[:] = values
+    mesh = dxa.Mesh(mesh)
+    dxa.move(mesh, dxa.transfer_from_boundary(h, dxa.geometry_function_space(mesh), entity_map))
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 2))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
+        bcs=[_homogeneous_bc(V)],
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_boundary_control_",
+    )
+    uh = problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
+    return J, h, h.function_space, problem
+
+
+def _boundary_direction(make_mesh, scale: float = 1.0) -> np.ndarray:
+    facet_mesh, _, _ = _boundary_submesh(make_mesh())
+    d = dolfinx.fem.Function(dxa.geometry_function_space(facet_mesh))
+    d.interpolate(lambda x: scale * _general_motion(x))
+    return d.x.array.copy()
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_shape_derivative_with_respect_to_a_boundary_displacement(mesh_kind):
+    """Gradient and tangent-linear model with the boundary displacement as the control."""
+    make_mesh = _BOUNDARY_MESHES[mesh_kind]
+    h = _boundary_direction(make_mesh)
+    _assert_gradient_by_value(lambda values=None: _boundary_control_forward(make_mesh, values), h)
+
+    eps = 1e-6
+    fd = (
+        float(_boundary_control_forward(make_mesh, eps * h)[0])
+        - float(_boundary_control_forward(make_mesh, -eps * h)[0])
+    ) / (2 * eps)
+    J, control, space, _keep = _boundary_control_forward(make_mesh)
+    direction = dxa.Function(space)
+    direction.x.array[:] = h
+    tlm = float(pyadjoint.ReducedFunctional(J, pyadjoint.Control(control)).tlm(direction))
+    assert abs(tlm - fd) < 1e-6 * abs(fd), f"tangent-linear {tlm} vs finite difference {fd}"
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_shape_hessian_with_respect_to_a_boundary_displacement(mesh_kind):
+    """Second order through the boundary transfer, which passes the Hessian action through."""
+    make_mesh = _BOUNDARY_MESHES[mesh_kind]
+    J, control, space, _keep = _boundary_control_forward(make_mesh)
+    direction = dxa.Function(space)
+    direction.x.array[:] = _boundary_direction(make_mesh, scale=0.5)
+    _assert_hessian_by_value(J, [control], [direction])
 
 
 @pytest.mark.parametrize("mesh_kind", sorted(_MESHES))

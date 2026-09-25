@@ -90,7 +90,11 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     @classmethod
     def _ad_init_object(cls, obj):
-        return cls(obj.function_space, obj.x, obj.name)
+        # A copy: ``obj`` is often a block's cached adjoint vector, overwritten on the next sweep,
+        # and this is what ``Control.get_derivative`` hands the user.
+        out = cls(obj.function_space, name=obj.name)
+        out.x.array[:] = obj.x.array
+        return out
 
     @property
     def index_map(self) -> dolfinx.common.IndexMap:
