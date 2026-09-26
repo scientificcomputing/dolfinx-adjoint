@@ -9,7 +9,7 @@ from .assembly import assemble_scalar, assemble_vector, error_norm
 from .checkpointing import enable_disk_checkpointing
 from .function import assign
 from .interpolation import interpolate, interpolate_nonmatching
-from .mesh import annotate_mesh, geometry_function_space, move, transfer_from_boundary
+from .mesh import geometry_function_space, move, transfer_from_boundary
 from .solvers import LinearProblem, NonlinearProblem
 from .types import Constant, Function, Mesh, dirichletbc
 
@@ -42,7 +42,6 @@ __all__ = [
     "__program_name__",
     "interpolate",
     "interpolate_nonmatching",
-    "annotate_mesh",
     "geometry_function_space",
     "move",
     "transfer_from_boundary",
