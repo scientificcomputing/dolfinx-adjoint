@@ -15,8 +15,8 @@ from pyadjoint.overloaded_type import (
 from pyadjoint.tape import no_annotations
 from ufl.core.ufl_id import attach_ufl_id
 
+from ..blocks._assemble import assemble_compiled_form
 from ..blocks._vector import _SpecialVector, _vector
-from ..blocks.assembly import assemble_compiled_form
 from ..checkpointing import SnapshotCheckpoint, maybe_disk_checkpoint
 from ..utils import function_from_vector, gather
 
@@ -90,7 +90,11 @@ class Function(dolfinx.fem.Function, FloatingType):
 
     @classmethod
     def _ad_init_object(cls, obj):
-        return cls(obj.function_space, obj.x, obj.name)
+        # A copy: ``obj`` is often a block's cached adjoint vector, overwritten on the next sweep,
+        # and this is what ``Control.get_derivative`` hands the user.
+        out = cls(obj.function_space, name=obj.name)
+        out.x.array[:] = obj.x.array
+        return out
 
     @property
     def index_map(self) -> dolfinx.common.IndexMap:

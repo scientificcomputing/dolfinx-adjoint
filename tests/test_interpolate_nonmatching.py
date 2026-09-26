@@ -99,3 +99,56 @@ def test_nonmatching_2D_to_2D(use_petsc, assert_hessian_matches_finite_differenc
     mesh_to = create_unit_square(MPI.COMM_WORLD, 4, 4)
 
     _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc, assert_hessian_matches_finite_difference)
+
+
+@pytest.mark.parametrize("use_petsc", [False, True])
+@pytest.mark.parametrize(
+    "element_from,element_to",
+    [(("RT", 1), ("RT", 1)), (("Lagrange", 2, (2,)), ("N1curl", 1)), (("RT", 2), ("N1curl", 2))],
+    ids=["RT-RT", "P2-N1curl", "RT2-N1curl2"],
+)
+def test_nonmatching_into_a_piola_mapped_space(element_from, element_to, use_petsc):
+    """A coefficient gradient into a space whose dofs are Piola-mapped moments, not point values.
+
+    The forward pass runs through DOLFINx; the adjoint builds the fenicsx_ii transfer matrix,
+    which before fenicsx_ii 0.7.0 refused such targets. Checked by value against a central
+    difference of a forward rebuilt with plain DOLFINx, not only by Taylor rate.
+    """
+    pytest.importorskip("fenicsx_ii")
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_from = create_unit_square(MPI.COMM_WORLD, 7, 7)
+    mesh_to = create_unit_square(MPI.COMM_WORLD, 5, 5)
+    V_from = functionspace(mesh_from, element_from)
+    V_to = functionspace(mesh_to, element_to)
+    u = Function(V_from, name="u_control")
+    u.interpolate(lambda x: np.vstack((np.sin(x[0]) + x[1] ** 2, x[0] * x[1])))
+
+    v = interpolate_nonmatching(u, V_to, petsc_mat=use_petsc)
+    J = assemble_scalar(ufl.inner(v, v) ** 2 * ufl.dx)
+    Jh = pyadjoint.ReducedFunctional(J, pyadjoint.Control(u))
+    du = Function(V_from)
+    du.interpolate(lambda x: np.vstack((np.cos(np.pi * x[1]), x[0] ** 2)))
+
+    owned = V_from.dofmap.index_map.size_local * V_from.dofmap.index_map_bs
+    directional = MPI.COMM_WORLD.allreduce(
+        float(np.dot(Jh.derivative().x.array[:owned], du.x.array[:owned])), op=MPI.SUM
+    )
+
+    cells = np.arange(mesh_to.topology.index_map(mesh_to.topology.dim).size_local, dtype=np.int32)
+    data = dolfinx.fem.create_interpolation_data(V_to, V_from, cells, padding=1e-6)
+
+    def J_plain(step: float) -> float:
+        with pyadjoint.stop_annotating():
+            w = dolfinx.fem.Function(V_from)
+            w.x.array[:] = u.x.array + step * du.x.array
+            vw = dolfinx.fem.Function(V_to)
+            vw.interpolate_nonmatching(w, cells, data)
+            vw.x.scatter_forward()
+            local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(ufl.inner(vw, vw) ** 2 * ufl.dx))
+            return MPI.COMM_WORLD.allreduce(local, op=MPI.SUM)
+
+    eps = 1e-6
+    fd = (J_plain(eps) - J_plain(-eps)) / (2 * eps)
+    assert abs(fd) > 1e-6, f"the finite difference is ~0 ({fd}): this direction tests nothing"
+    assert np.isclose(directional, fd, rtol=1e-6), f"adjoint {directional} vs finite difference {fd}"
+    assert pyadjoint.taylor_test(Jh, u, du) > 1.9

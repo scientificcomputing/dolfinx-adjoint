@@ -9,7 +9,10 @@ import ufl
 from pyadjoint.overloaded_type import create_overloaded_object
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 
+from .blocks._assemble import assemble_compiled_form
 from .blocks.assembly import AssembleBlock
+from .types.function import Function
+from .ufl_utils import pin_quadrature_degrees
 
 
 def assemble_scalar(form: ufl.Form, **kwargs):
@@ -25,15 +28,13 @@ def assemble_scalar(form: ufl.Form, **kwargs):
             assembling with Arguments and coefficients form meshes that has some relation.
     """
     ad_block_tag = kwargs.pop("ad_block_tag", None)
+    # So every derivative of the functional uses the quadrature it was assembled with.
+    form = pin_quadrature_degrees(form)
+    options = _compile_options(kwargs)
 
     annotate = annotate_tape(kwargs)
     with stop_annotating():
-        compiled_form = dolfinx.fem.form(
-            form,
-            jit_options=kwargs.pop("jit_options", None),
-            form_compiler_options=kwargs.pop("form_compiler_options", None),
-            entity_maps=kwargs.pop("entity_maps", None),
-        )
+        compiled_form = dolfinx.fem.form(form, **options)
 
         local_output = dolfinx.fem.assemble_scalar(compiled_form)
         comm = compiled_form.mesh.comm
@@ -43,13 +44,54 @@ def assemble_scalar(form: ufl.Form, **kwargs):
     output = create_overloaded_object(output)
 
     if annotate:
-        block = AssembleBlock(form, ad_block_tag=ad_block_tag)
+        block = AssembleBlock(form, ad_block_tag=ad_block_tag, **options)
 
         tape = get_working_tape()
         tape.add_block(block)
 
         block.add_output(output.block_variable)
 
+    return output
+
+
+def _compile_options(kwargs: dict) -> dict:
+    """The form compilation options in ``kwargs``, removed from it."""
+    return {name: kwargs.pop(name, None) for name in ("jit_options", "form_compiler_options", "entity_maps")}
+
+
+def assemble_vector(form: ufl.Form, **kwargs) -> Function:
+    """Assemble a linear form, returning its entries as the dofs of a Function on the test space.
+
+    The result is a dual vector stored in a primal Function, so it can be used as a coefficient
+    downstream; its derivatives treat it as the vector of entries.
+
+    Args:
+        form: Linear form (UFL) to assemble, with a single test function.
+        kwargs: As for :py:func:`assemble_scalar`.
+
+    Returns:
+        The assembled vector as a Function, ghosts updated.
+
+    Raises:
+        ValueError: If ``form`` is not linear.
+    """
+    ad_block_tag = kwargs.pop("ad_block_tag", None)
+    form = pin_quadrature_degrees(form)
+    options = _compile_options(kwargs)
+    arguments = form.arguments()
+    if len(arguments) != 1:
+        raise ValueError(f"assemble_vector needs a linear form, got one with {len(arguments)} arguments.")
+
+    annotate = annotate_tape(kwargs)
+    with stop_annotating():
+        output = Function(arguments[0].ufl_function_space())
+        output.x.array[:] = 0.0
+        assemble_compiled_form(dolfinx.fem.form(form, **options), output.x)
+
+    if annotate:
+        block = AssembleBlock(form, ad_block_tag=ad_block_tag, **options)
+        get_working_tape().add_block(block)
+        block.add_output(output.create_block_variable())
     return output
 
 

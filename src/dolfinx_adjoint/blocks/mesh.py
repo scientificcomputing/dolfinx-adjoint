@@ -8,7 +8,8 @@ import numpy.typing as npt
 import pyadjoint
 from pyadjoint.tape import no_annotations
 
-from ..types.mesh import Mesh
+from ..types.function import _create_function
+from ..types.mesh import Mesh, apply_displacement
 from ._vector import _SpecialVector, _vector
 
 
@@ -131,8 +132,53 @@ class MoveBlock(pyadjoint.Block):
         earlier recompute -- which matters because a checkpoint schedule replays the
         forward many times.
         """
-        from ..mesh import apply_displacement
-
         mesh, displacement = inputs[0], inputs[1]
         apply_displacement(mesh, displacement)
         return mesh._ad_create_checkpoint()
+
+
+class BoundaryTransferBlock(pyadjoint.Block):
+    """Block recording :py:func:`~dolfinx_adjoint.transfer_from_boundary`, ``u = E h``.
+
+    ``E`` is ``scifem.interpolation.SurfaceSubmeshExtension``, with its transpose from
+    :py:mod:`dolfinx_adjoint._surface_extension`. It is linear and depends only on the topology,
+    so its tangent-linear action is ``E`` itself, its adjoint and Hessian actions are ``E^T``,
+    and moving the mesh does not change it.
+    """
+
+    def __init__(self, boundary_function: dolfinx.fem.Function, extension, ad_block_tag: str | None = None):
+        super().__init__(ad_block_tag=ad_block_tag)
+        self.add_dependency(boundary_function)
+        self._extension = extension
+
+    def __str__(self) -> str:
+        return "transfer_from_boundary"
+
+    def _transpose(self, vector) -> dolfinx.la.Vector:
+        # A copy, since apply_transpose scatters its input forward.
+        volume = _create_function(self._extension.V_volume)
+        volume.x.array[:] = getattr(vector, "array", vector)
+        out = _create_function(self._extension.V_surface)
+        self._extension.apply_transpose(volume.x, out.x)
+        return out.x
+
+    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
+        return self._transpose(adj_inputs[0])
+
+    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
+        if tlm_inputs[0] is None:
+            return None
+        out = _create_function(self._extension.V_volume)
+        self._extension.apply(tlm_inputs[0], out)
+        return out
+
+    def evaluate_hessian_component(
+        self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None
+    ):
+        return self._transpose(hessian_inputs[0])
+
+    @no_annotations
+    def recompute_component(self, inputs, block_variable, idx, prepared):
+        out = block_variable.saved_output
+        self._extension.apply(inputs[0], out)
+        return out

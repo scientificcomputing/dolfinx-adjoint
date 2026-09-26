@@ -7,10 +7,11 @@ import pyadjoint
 import ufl
 from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 
-from .blocks.mesh import MoveBlock
-from .types.mesh import Mesh, annotate_mesh, geometry_function_space
+from .blocks.mesh import BoundaryTransferBlock, MoveBlock
+from .interpolation import interpolate
+from .types.mesh import Mesh, annotate_mesh, apply_displacement, geometry_function_space
 
-__all__ = ["move", "annotate_mesh", "geometry_function_space", "apply_displacement"]
+__all__ = ["move", "annotate_mesh", "geometry_function_space", "apply_displacement", "transfer_from_boundary"]
 
 
 # Checkpoint schedules verified to give a correct shape derivative. The property that matters
@@ -85,22 +86,6 @@ def _reject_schedule_that_breaks_shape_derivatives() -> None:
         f"that retains every step -- {', '.join(sorted(_SHAPE_SAFE_SCHEDULES))} -- or no "
         "schedule at all."
     )
-
-
-def apply_displacement(mesh: dolfinx.mesh.Mesh, displacement: dolfinx.fem.Function) -> None:
-    """Add ``displacement`` to ``mesh``'s coordinates, without touching the tape.
-
-    The unannotated core of {py:func}`move`, shared with
-    {py:meth}`~dolfinx_adjoint.blocks.mesh.MoveBlock.recompute_component`.
-
-    Args:
-        mesh: The mesh to move. Must already be tracked -- wrap it with
-            {py:class}`dolfinx_adjoint.Mesh` where you create or read it.
-        displacement: The displacement, in the mesh's geometry function space.
-    """
-    displacement.x.scatter_forward()  # Ensure that ghost nodes are up to date
-    gdim = mesh.geometry.dim
-    mesh.geometry.x[:, :gdim] += displacement.x.array.reshape(-1, gdim)
 
 
 def _is_geometry_function(mesh: dolfinx.mesh.Mesh, candidate: typing.Any, V_geom: dolfinx.fem.FunctionSpace) -> bool:
@@ -196,8 +181,6 @@ def _as_geometry_displacement(
             (:py:func:`~dolfinx_adjoint.interpolate_nonmatching`), not something to do silently
             here.
     """
-    from .interpolation import interpolate
-
     if _is_geometry_function(mesh, displacement, V_geom):
         return displacement
 
@@ -338,3 +321,63 @@ def move(
     block.add_output(overloaded.create_block_variable())
 
     return overloaded
+
+
+def _surface_extension(V_boundary: dolfinx.fem.FunctionSpace, V: dolfinx.fem.FunctionSpace, entity_map):
+    """The surface-submesh extension, with its transpose, for a submesh made by ``create_submesh``."""
+    try:  # scifem is an optional dependency
+        from ._surface_extension import create_surface_extension
+    except ImportError as e:
+        raise ImportError("transfer_from_boundary needs scifem with SurfaceSubmeshExtension (after 0.25)") from e
+    return create_surface_extension(V_boundary, V, entity_map)
+
+
+def transfer_from_boundary(
+    boundary_function: dolfinx.fem.Function,
+    V: dolfinx.fem.FunctionSpace,
+    entity_map,
+    **kwargs,
+) -> dolfinx.fem.Function:
+    """Extend a function on a boundary submesh by zero into a volume space, recording it on the tape.
+
+    The counterpart of dolfin-adjoint's ``vector_boundary_to_mesh``, used to make a displacement
+    that only moves the boundary a control::
+
+        facet_mesh, entity_map = dolfinx.mesh.create_submesh(mesh, fdim, facets)[:2]
+        h = dolfinx_adjoint.Function(dolfinx_adjoint.geometry_function_space(facet_mesh))
+        s = dolfinx_adjoint.transfer_from_boundary(h, dolfinx_adjoint.geometry_function_space(mesh), entity_map)
+        dolfinx_adjoint.move(mesh, s)
+
+    The boundary function is evaluated at ``V``'s nodes on each boundary facet, every node of a
+    higher-order geometry included, and ``V`` is zero elsewhere (see
+    ``scifem.interpolation.SurfaceSubmeshExtension``). When ``boundary_function`` lives in
+    the trace of ``V``, this is the right inverse of ``scifem.interpolation.interpolate_to_surface_submesh``.
+    Where facets disagree at a shared node, as for a discontinuous ``boundary_function``, the node
+    gets their average; choosing a compatible space is up to the caller. Only boundary nodes move,
+    so for large displacements it is usually the data of a mesh-smoothing
+    problem rather than the displacement itself.
+
+    Args:
+        boundary_function: A function on a facet submesh of ``V``'s mesh.
+        V: The volume space to extend into, typically the mesh's geometry space.
+        entity_map: The submesh-to-parent entity map from :py:func:`dolfinx.mesh.create_submesh`.
+        kwargs: ``"annotate"`` and ``"ad_block_tag"``.
+
+    Returns:
+        The extension, in ``V``.
+
+    Raises:
+        ValueError: If ``V`` is not continuous Lagrange or the value sizes differ.
+    """
+    ad_block_tag = kwargs.pop("ad_block_tag", None)
+    annotate = annotate_tape(kwargs)
+    extension = _surface_extension(boundary_function.function_space, V, entity_map)
+    with stop_annotating():
+        out = dolfinx.fem.Function(V)
+        extension.apply(boundary_function, out)
+    output = pyadjoint.create_overloaded_object(out)
+    if annotate:
+        block = BoundaryTransferBlock(boundary_function, extension, ad_block_tag=ad_block_tag)
+        get_working_tape().add_block(block)
+        block.add_output(output.block_variable)
+    return output

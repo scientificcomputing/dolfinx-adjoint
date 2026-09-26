@@ -12,13 +12,19 @@ import dolfinx.fem.petsc
 import numpy as np
 import pyadjoint
 import pytest
+import scifem.compat
+import scifem.interpolation
+import scifem.mesh
 import ufl
 
 import dolfinx_adjoint as dxa
+from dolfinx_adjoint._surface_extension import TransposableSurfaceSubmeshExtension
+from dolfinx_adjoint.blocks.interpolation import ExprInterpolationBlock
+from dolfinx_adjoint.mesh import _surface_extension
 
 # A direct LU solve: the Taylor remainders checked below fall to ~1e-10, which an
 # iterative solve's own tolerance would swamp.
-_LU = {"ksp_type": "preonly", "pc_type": "lu"}
+_LU = {"ksp_type": "preonly", "pc_type": "lu", "pc_factor_mat_solver_type": "mumps"}
 _SNES = _LU | {"snes_type": "newtonls", "snes_atol": 1e-12, "snes_rtol": 1e-12, "snes_stol": 0.0}
 
 
@@ -27,7 +33,7 @@ def _unit_square(n: int = 8) -> dolfinx.mesh.Mesh:
 
 
 def _dilation_values(x: np.ndarray) -> np.ndarray:
-    """A uniform dilation about the origin, ``s(x) = x``, as interpolation values."""
+    """A uniform dilation about the origin, ``s(x) = x``: moves the boundary, tangles no cell."""
     return np.vstack((x[0], x[1]))
 
 
@@ -49,26 +55,6 @@ def _interior_bump(S: dolfinx.fem.FunctionSpace) -> dxa.Function:
     bump = dxa.Function(S)
     bump.interpolate(_interior_bump_values)
     return bump
-
-
-def _dilation(S: dolfinx.fem.FunctionSpace) -> dxa.Function:
-    """A displacement direction that is a genuine shape change, and admissible at every step.
-
-    The mesh geometry plays the role that a positive diffusivity plays in a coefficient
-    control: the problem is well posed only while the perturbed mesh is untangled, so the
-    direction has to be admissible at every ``m + h*dm``, not merely at the base point. A
-    dilation maps the unit square to ``(1 + h)`` times itself, so no cell can invert for
-    any ``h > -1``, far outside the range a Taylor test walks.
-    :py:func:`_assert_mesh_is_valid` checks that rather than assuming it.
-
-    It must also *move the boundary*. A displacement supported strictly inside the domain
-    only relabels which point of the domain each node sits at: the domain is unchanged, so
-    the shape derivative of a functional like ``int_Omega f dx`` is exactly zero and a
-    Taylor test on it measures nothing but round-off.
-    """
-    h = dxa.Function(S)
-    h.interpolate(_dilation_values)
-    return h
 
 
 def _cell_jacobians(mesh: dolfinx.mesh.Mesh) -> np.ndarray:
@@ -158,7 +144,8 @@ def test_shape_derivative_of_a_functional():
     J = dxa.assemble_scalar(ufl.sin(X[0]) * ufl.cos(X[1]) * ufl.dx + ufl.inner(X, X) * ufl.ds)
 
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
     assert np.isclose(Jhat(s), float(J))
     assert pyadjoint.taylor_test(Jhat, s, h) > 1.9
     _assert_mesh_is_valid(mesh, reference)
@@ -177,13 +164,16 @@ def test_shape_derivative_through_a_linear_problem():
         ufl.inner(f, v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_linear_",
     )
     uh = problem.solve()
     J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
 
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
     assert np.isclose(Jhat(s), float(J))
     assert pyadjoint.taylor_test(Jhat, s, h) > 1.9
     _assert_mesh_is_valid(mesh, reference)
@@ -205,13 +195,16 @@ def test_shape_derivative_through_a_nonlinear_problem():
         u=uh,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_SNES,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_nonlinear_",
     )
     problem.solve()
     J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
 
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
     assert np.isclose(Jhat(s), float(J))
     assert pyadjoint.taylor_test(Jhat, s, h) > 1.9
     _assert_mesh_is_valid(mesh, reference)
@@ -237,13 +230,16 @@ def test_shape_gradient_matches_a_finite_difference():
         ufl.inner(f, v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_fd_",
     )
     uh = problem.solve()
     J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
 
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
     directional = Jhat.derivative()._ad_dot(h)
 
     def J_at(step: float) -> float:
@@ -294,6 +290,8 @@ def test_shape_and_coefficient_controls_together():
         ufl.inner(m, v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_joint_",
     )
     uh = problem.solve()
@@ -301,7 +299,8 @@ def test_shape_and_coefficient_controls_together():
     J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
 
     Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(s), pyadjoint.Control(m)])
-    hs = _dilation(S)
+    hs = dxa.Function(S)
+    hs.interpolate(_dilation_values)
     hm = dxa.Function(Q)
     hm.x.array[:] = 0.5
     assert pyadjoint.taylor_test(Jhat, [s, m], [hs, hm]) > 1.9
@@ -323,7 +322,7 @@ def test_repeated_replay_is_stable():
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
 
     displaced = dxa.Function(S)
-    displaced.x.array[:] = _dilation(S).x.array * 0.05
+    displaced.interpolate(lambda x: 0.05 * _dilation_values(x))
     first = Jhat(displaced)
     for _ in range(3):
         assert np.isclose(Jhat(displaced), first, rtol=0, atol=1e-14)
@@ -343,7 +342,8 @@ def test_shape_hessian_of_a_functional():
     X = ufl.SpatialCoordinate(mesh)
     J = dxa.assemble_scalar(ufl.sin(X[0]) * ufl.cos(X[1]) * ufl.dx)
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
 
     Jhat(s)
     Jhat.derivative()
@@ -381,6 +381,8 @@ def test_shape_hessian_through_a_linear_problem(assert_hessian_matches_finite_di
         ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_hessian_linear_",
     )
     uh = problem.solve()
@@ -413,6 +415,8 @@ def test_shape_hessian_through_a_nonlinear_problem(assert_hessian_matches_finite
         u=uh,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_SNES,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_hessian_nonlinear_",
     )
     problem.solve()
@@ -443,6 +447,8 @@ def test_shape_and_coefficient_hessian_together():
         ufl.inner(m * ufl.sin(ufl.pi * X[0]), v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_hessian_joint_",
     )
     uh = problem.solve()
@@ -488,19 +494,22 @@ def test_gradient_is_correct_when_the_mesh_is_moved_twice():
         ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
         bcs=[_homogeneous_bc(V)],
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix="test_shape_two_moves_",
     )
     uh = problem.solve()
     J_first = ufl.inner(uh, uh) * ufl.dx
 
     second = dxa.Function(S)
-    second.x.array[:] = 0.05 * _dilation(S).x.array
+    second.interpolate(lambda x: 0.05 * _dilation_values(x))
     mesh = dxa.Mesh(mesh)
     dxa.move(mesh, second)
     J = dxa.assemble_scalar(J_first + ufl.inner(X, X) * ufl.dx)
 
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    h = _dilation(S)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
     assert np.isclose(Jhat(s), float(J))
     assert pyadjoint.taylor_test(Jhat, s, h) > 1.9
     _assert_mesh_is_valid(mesh, reference)
@@ -543,6 +552,8 @@ def _heat_loop(n_steps: int, displacement_values: np.ndarray | None = None, sche
         ufl.inner(u, v) * ufl.dx + dt * ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
         ufl.inner(u_prev, v) * ufl.dx + dt * ufl.inner(ufl.sin(ufl.pi * X[0]), v) * ufl.dx,
         petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
         petsc_options_prefix=f"test_shape_heat_{n_steps}_{id(schedule)}_",
     )
 
@@ -583,7 +594,7 @@ def test_time_dependent_shape_gradient_matches_a_finite_difference():
     directional = MPI.COMM_WORLD.allreduce(float(np.dot(gradient.x.array[:owned], h_values[:owned])), op=MPI.SUM)
 
     assert abs(fd) > 1e-6, f"the finite difference is ~0 ({fd}): this direction tests nothing"
-    assert np.isclose(directional, fd, rtol=1e-4), f"adjoint {directional} vs finite difference {fd}"
+    assert np.isclose(directional, fd, rtol=1e-7), f"adjoint {directional} vs finite difference {fd}"
 
 
 def test_shape_derivative_under_a_recomputing_schedule_is_refused():
@@ -634,8 +645,6 @@ def test_shape_derivative_of_a_blocked_problem():
     per-part mix-up would still give a self-consistent tape and a rate-2 Taylor test.
     """
     import basix.ufl
-
-    saddle_point = _LU | {"pc_factor_mat_solver_type": "mumps"}
 
     def solve_stokes(displacement_values: np.ndarray | None = None):
         pyadjoint.get_working_tape().clear_tape()
@@ -693,8 +702,9 @@ def test_shape_derivative_of_a_blocked_problem():
             rhs,
             u=[uh, ph],
             bcs=bcs,
-            petsc_options=saddle_point,
-            adjoint_petsc_options=saddle_point,
+            petsc_options=_LU,
+            adjoint_petsc_options=_LU,
+            tlm_petsc_options=_LU,
             petsc_options_prefix="test_shape_blocked_",
         )
         problem.solve()
@@ -718,7 +728,7 @@ def test_shape_derivative_of_a_blocked_problem():
     eps = 1e-5
     fd = (J_at(eps) - J_at(-eps)) / (2 * eps)
     assert abs(fd) > 1e-6, f"the finite difference is ~0 ({fd}): this direction tests nothing"
-    assert np.isclose(directional, fd, rtol=1e-4), f"adjoint {directional} vs finite difference {fd}"
+    assert np.isclose(directional, fd, rtol=1e-7), f"adjoint {directional} vs finite difference {fd}"
 
 
 def test_shape_derivative_through_an_interpolated_expression():
@@ -833,6 +843,8 @@ def test_shape_derivative_through_an_interpolated_dirichlet_value():
             ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx,
             bcs=[bc],
             petsc_options=_LU,
+            adjoint_petsc_options=_LU,
+            tlm_petsc_options=_LU,
             petsc_options_prefix=f"test_shape_bc_{counter[0]}_",
         )
         uh = problem.solve()
@@ -855,23 +867,93 @@ def test_shape_derivative_through_an_interpolated_dirichlet_value():
     assert np.isclose(directional, fd, rtol=1e-5), f"adjoint {directional} vs finite difference {fd}"
 
 
-def test_expression_mixing_a_coefficient_and_the_coordinates_is_refused():
-    """UFL cannot differentiate a coefficient w.r.t. the coordinates in physical space.
+_COEFFICIENT_INTERPOLATIONS = {
+    # The one case with no geometry dependence: mesh and basis functions move together.
+    "value-into-lagrange": (("Lagrange", 2), lambda u, x: u, ("Lagrange", 1)),
+    "grad-into-dg": (("Lagrange", 2), lambda u, x: ufl.grad(u), ("DG", 1, (2,))),
+    "div-into-dg": (("Lagrange", 2, (2,)), lambda u, x: ufl.div(u), ("DG", 1)),
+    "coefficient-times-coordinates": (("Lagrange", 2), lambda u, x: u * ufl.sin(ufl.pi * x[0]), ("Lagrange", 1)),
+    "lagrange-into-rt": (("Lagrange", 2, (2,)), lambda u, x: u, ("RT", 1)),
+    "rt-into-dg": (("RT", 1), lambda u, x: u, ("DG", 1, (2,))),
+    "n1curl-into-dg": (("N1curl", 1), lambda u, x: u, ("DG", 1, (2,))),
+}
 
-    That term would otherwise be dropped silently, so it has to raise.
+
+def _coefficient_interpolation_forward(case: str, step, direction):
+    """``int |interpolate(expr(u), Q)|^4 dx`` on a moved mesh, with ``u``'s dofs set beforehand.
+
+    ``u`` is filled before the move and so held fixed in its dofs, as the adjoint holds it.
+    The functional is quartic so that the second derivative is not trivially quadratic.
     """
-    mesh, S, s, _ = _shape_setup(4)
-    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
-    W = dolfinx.fem.functionspace(mesh, ("Lagrange", 2))
-    coefficient = dxa.Function(W)
-    coefficient.x.array[:] = 2.0
-    X = ufl.SpatialCoordinate(mesh)
-    uh = dxa.interpolate(coefficient * ufl.sin(ufl.pi * X[0]), V)
-    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
+    element_u, expression, element_q = _COEFFICIENT_INTERPOLATIONS[case]
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(6)
+    V = dolfinx.fem.functionspace(mesh, element_u)
+    u = dxa.Function(V)
+    if V.value_shape == ():
+        u.interpolate(lambda x: np.sin(2.0 * x[0]) + x[1] ** 3)
+    else:
+        u.interpolate(lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 3, x[0] * x[1] ** 2 + 1.0)))
+    S = dxa.geometry_function_space(mesh)
+    s = dxa.Function(S)
+    if step is not None:
+        s.x.array[:] = step * direction
+    mesh = dxa.Mesh(mesh)
+    dxa.move(mesh, s)
+    v = dxa.interpolate(expression(u, ufl.SpatialCoordinate(mesh)), dolfinx.fem.functionspace(mesh, element_q))
+    return dxa.assemble_scalar(ufl.inner(v, v) ** 2 * ufl.dx), s, S, u
 
+
+def _shear(x: np.ndarray) -> np.ndarray:
+    """A shape direction that is not a uniform dilation, to which Piola-mapped fields are blind."""
+    return np.vstack((x[0] * (1.0 + 0.5 * x[1]), x[1] ** 2))
+
+
+@pytest.mark.parametrize("case", sorted(_COEFFICIENT_INTERPOLATIONS))
+def test_shape_derivative_of_interpolating_a_coefficient(case):
+    """A coefficient's interpolation moves with the mesh unless it is a plain value into Lagrange.
+
+    ``grad(u) = ReferenceGrad(u) . K`` carries the inverse Jacobian, a Piola-mapped coefficient's
+    push-forward carries ``J`` and ``det J``, and a Piola-mapped target pulls back with them.
+    Without a mesh dependency for these the gradient was silently wrong -- 10x and of the wrong
+    sign for ``grad(u)`` -- so each is checked by value against a rebuilt forward.
+    """
+    shear = dxa.Function(dxa.geometry_function_space(_unit_square(6)))
+    shear.interpolate(_shear)
+    h = shear.x.array.copy()
+    eps = 1e-6
+    fd = (
+        float(_coefficient_interpolation_forward(case, eps, h)[0])
+        - float(_coefficient_interpolation_forward(case, -eps, h)[0])
+    ) / (2 * eps)
+    assert abs(fd) > 1e-8, "the direction must actually change the functional"
+
+    J, s, S, _ = _coefficient_interpolation_forward(case, None, h)
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
-    with pytest.raises(NotImplementedError, match="coefficient with respect to the coordinates"):
-        Jhat.derivative()
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    assert abs(_directional(Jhat.derivative(), hf, S) - fd) < 1e-6 * abs(fd)
+
+
+@pytest.mark.parametrize("case", ["grad-into-dg", "coefficient-times-coordinates", "lagrange-into-rt", "rt-into-dg"])
+def test_shape_hessian_of_interpolating_a_coefficient(case):
+    """Second order for the same interpolations, with the coefficient as a second control.
+
+    The coefficient control exercises the cross terms: the coordinate derivative of the
+    coefficient derivative, and the reverse.
+    """
+    J, s, S, u = _coefficient_interpolation_forward(case, None, None)
+    h = dxa.Function(S)
+    h.interpolate(_shear)
+    du = dxa.Function(u.function_space)
+    if u.function_space.value_shape == ():
+        du.interpolate(lambda x: np.cos(x[0]) * x[1])
+    else:
+        du.interpolate(lambda x: np.vstack((np.cos(x[0]) * x[1], x[0] ** 2)))
+    Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(s), pyadjoint.Control(u)])
+    Hh, fd = _hessian_and_finite_difference(Jhat, [s, u], [h, du])
+    assert abs(fd) > 1e-8, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < 1e-5 * abs(fd), f"hessian {Hh} vs finite difference {fd}"
 
 
 def test_move_refuses_a_recomputing_schedule():
@@ -1191,7 +1273,9 @@ def test_shape_derivative_of_interpolation_into_a_piola_mapped_space(family):
         u = dxa.interpolate(ufl.as_vector((X[1] ** 2 + 1.0, X[0] ** 2 + 2.0)), V)
         return dxa.assemble_scalar(ufl.inner(u, u) * ufl.dx), s, S
 
-    h = _dilation(dxa.geometry_function_space(_unit_square(6))).x.array.copy()
+    d = dxa.Function(dxa.geometry_function_space(_unit_square(6)))
+    d.interpolate(_dilation_values)
+    h = d.x.array.copy()
     eps = 1e-6
     fd = (float(forward(eps, h)[0]) - float(forward(-eps, h)[0])) / (2 * eps)
     assert abs(fd) > 1e-8, "the direction must actually change the functional"
@@ -1295,3 +1379,1187 @@ def test_the_manual_pullback_inverse_matches_ufls(name):
 
     assert norm(reference) > 1e-8, "the comparison must not be against zero"
     assert norm(reference - manual) < 1e-12 * norm(reference)
+
+
+def _nonmatching_forward(
+    step, direction, moved: str, vector: bool = False, same_mesh: bool = False, target_degree: int = 1
+):
+    """A functional of ``interpolate_nonmatching(u, V_B)``, with one mesh displaced.
+
+    ``u``'s dofs are set on the *undeformed* mesh, before the move. The adjoint holds a
+    coefficient's dofs fixed, so the finite difference has to as well; interpolating after the
+    move would re-sample the function at the moved nodes and hold the function fixed instead --
+    for a quadratic in P2 that makes a source-mesh displacement change nothing at all.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    mesh_b = mesh_a if same_mesh else _unit_square(5)
+    tracked = dxa.Mesh(mesh_a if moved == "source" else mesh_b)
+
+    shape = (2,) if vector else ()
+    V_a = dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2, shape))
+    u = dxa.Function(V_a)
+    if vector:
+        u.interpolate(lambda x: np.vstack((x[0] ** 2 + 2.0 * x[1], x[1] ** 2 - x[0])))
+    else:
+        u.interpolate(lambda x: x[0] ** 2 + 2.0 * x[1])
+
+    S = dxa.geometry_function_space(tracked)
+    s = dxa.Function(S)
+    if step is not None:
+        s.x.array[:] = step * direction
+    dxa.move(tracked, s)
+
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", target_degree, shape)))
+    return dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx), s, S
+
+
+def _contraction(n: int) -> np.ndarray:
+    """A displacement towards the centre, so the moved mesh stays inside the other one."""
+    d = dolfinx.fem.Function(dxa.geometry_function_space(_unit_square(n)))
+    d.interpolate(lambda x: np.vstack((0.3 * (0.5 - x[0]), 0.3 * (0.5 - x[1]))))
+    return d.x.array.copy()
+
+
+@pytest.mark.parametrize(
+    "moved,vector,same_mesh,target_degree",
+    [
+        ("target", False, False, 1),
+        ("source", False, False, 1),
+        ("target", True, False, 1),
+        ("source", True, False, 1),
+        ("target", False, True, 1),
+        ("target", False, False, 2),
+        ("source", False, False, 2),
+    ],
+    ids=["target", "source", "target-vector", "source-vector", "same-mesh", "target-P2", "source-P2"],
+)
+def test_shape_derivative_of_nonmatching_interpolation(moved, vector, same_mesh, target_degree):
+    """Both ways a non-matching interpolation depends on the geometry, checked by value.
+
+    Writing ``c_i = u_A(x_i)`` for the target dofs: displacing the target moves the points,
+    ``dc_i = grad(u_A)(x_i) . dx_B(x_i)``; displacing the source carries ``u_A`` along with its
+    mesh, ``du_A = -grad(u_A) . s_A``. On one mesh the two cancel, leaving only the measure's
+    contribution from the functional -- which a wrong sign on either would not.
+
+    The P2 targets matter in parallel: a P1 target's interpolation points are the geometry
+    vertices, so each row touches only its own vertex, while a P2 target's edge-midpoint rows
+    straddle vertices owned by different ranks. A missing ghost reduction was 2.3% wrong on three
+    ranks and invisible with P1.
+    """
+    pytest.importorskip("fenicsx_ii")
+    h = _contraction(7 if (moved == "source" or same_mesh) else 5)
+    eps = 1e-6
+    # Every rebuild first: a clear_tape() under a live ReducedFunctional invalidates it.
+    fd = (
+        float(_nonmatching_forward(eps, h, moved, vector, same_mesh, target_degree)[0])
+        - float(_nonmatching_forward(-eps, h, moved, vector, same_mesh, target_degree)[0])
+    ) / (2 * eps)
+    assert abs(fd) > 1e-8, "the direction must actually change the functional"
+
+    J, s, S = _nonmatching_forward(None, h, moved, vector, same_mesh, target_degree)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    assert abs(_directional(Jhat.derivative(), hf, S) - fd) < 1e-6 * abs(fd)
+    assert abs(float(Jhat.tlm(hf)) - fd) < 1e-6 * abs(fd), "the tangent-linear model must agree too"
+
+
+@pytest.mark.parametrize("moved", ["source", "target"])
+def test_nonmatching_interpolation_replays_at_the_moved_geometry(moved):
+    """Where the meshes sit relative to each other has to be recomputed on every replay.
+
+    ``interpolation_data`` locates each target point inside a source cell and stores its
+    reference coordinates there. Kept from the first evaluation, it describes a geometry that no
+    longer exists, and the replayed *value* is wrong before any derivative is involved -- 2% when
+    the target moves and more than 100% when the source does, for this displacement.
+    """
+    pytest.importorskip("fenicsx_ii")
+    h = _contraction(7 if moved == "source" else 5)
+    steps = (0.05, 0.10, 0.05)
+    rebuilt = {step: float(_nonmatching_forward(step, h, moved)[0]) for step in steps}
+    J, s, S = _nonmatching_forward(None, h, moved)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    for step in steps:
+        f = dxa.Function(S)
+        f.x.array[:] = step * h
+        assert abs(float(Jhat(f)) - rebuilt[step]) < 1e-11 * abs(rebuilt[step]), f"s = {step}"
+
+
+def _hessian_and_finite_difference(Jhat, controls, directions, eps=1e-4) -> tuple[float, float]:
+    """``<H h, h>`` summed over the controls, and a central difference of ``<dJ, h>``."""
+    Jhat(controls)
+    Jhat.derivative()
+    hessian = Jhat.hessian(directions)
+    hessian = hessian if isinstance(hessian, list) else [hessian]
+    Hh = sum(float(Hi._ad_dot(d)) for Hi, d in zip(hessian, directions))
+
+    def directional_gradient(scale: float) -> float:
+        Jhat([c._ad_add(d._ad_mul(scale)) for c, d in zip(controls, directions)])
+        gradient = Jhat.derivative()
+        gradient = gradient if isinstance(gradient, list) else [gradient]
+        return sum(float(g._ad_dot(d)) for g, d in zip(gradient, directions))
+
+    fd = (directional_gradient(eps) - directional_gradient(-eps)) / (2 * eps)
+    Jhat(controls)
+    return Hh, fd
+
+
+@pytest.mark.parametrize("family", ["Lagrange", "RT", "N1curl"])
+def test_shape_hessian_through_an_interpolated_expression(family):
+    """Second order through ``interpolate``, including a Piola-mapped target.
+
+    Both coordinate derivatives are taken in the reference frame before anything is converted
+    back; converting after the first would leave ``grad`` of the tangent-linear direction in the
+    expression, which UFL refuses to differentiate in physical space. The difference is checked
+    at a step where its truncation error (~ eps^2) is far below the tolerance.
+    """
+    mesh, S, s, _ = _shape_setup(6)
+    X = ufl.SpatialCoordinate(mesh)
+    if family == "Lagrange":
+        u = dxa.interpolate(ufl.sin(ufl.pi * X[0]) * X[1] ** 2, dolfinx.fem.functionspace(mesh, ("Lagrange", 2)))
+    else:
+        V = dolfinx.fem.functionspace(mesh, (family, 1))
+        u = dxa.interpolate(ufl.as_vector((X[1] ** 2 + X[0] ** 3, X[0] * X[1] + 2.0)), V)
+    J = dxa.assemble_scalar(ufl.inner(u, u) * ufl.dx)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    h = dxa.Function(S)
+    h.interpolate(lambda x: np.vstack((x[0] * (1.0 + 0.5 * x[1]), x[1] ** 2)))
+    Hh, fd = _hessian_and_finite_difference(Jhat, [s], [h])
+    assert abs(fd) > 1e-8, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < 1e-5 * abs(fd), f"hessian {Hh} vs finite difference {fd}"
+
+
+def _nonmatching_hessian_forward(moved: str, vector: bool, target_degree: int, u_control: bool):
+    """A non-matching interpolation with the target strictly inside the source, in general position.
+
+    General position is not cosmetic. At a target point lying on a source cell's edge,
+    ``grad(u)`` of a C0 field and ``grad(sigma)`` of the source displacement jump, so the shape
+    derivative there is one-sided -- and the second derivative, which reads ``grad(sigma)``, is
+    not defined. A target placed on the source's grid (as the first-order tests' is, harmlessly,
+    since they read only ``grad(u)`` of an exactly represented quadratic) sits on those edges.
+    Strictly inside also keeps every perturbed target point inside the source mesh.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.1, 0.1]), np.array([0.9, 0.9])], [5, 5])
+    mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+    tracked = {"source": [mesh_a], "target": [mesh_b], "both": [mesh_a, mesh_b]}[moved]
+    tracked = [dxa.Mesh(mesh) for mesh in tracked]
+
+    shape = (2,) if vector else ()
+    u = dxa.Function(dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2, shape)))
+    if vector:
+        u.interpolate(lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 3, x[0] * x[1] ** 2)))
+    else:
+        u.interpolate(lambda x: np.sin(2.0 * x[0]) + x[0] * x[1] ** 3)
+
+    controls, directions = [], []
+    for mesh in tracked:
+        s = dxa.Function(dxa.geometry_function_space(mesh))
+        dxa.move(mesh, s)
+        h = dxa.Function(s.function_space)
+        h.interpolate(lambda x: np.vstack((0.05 * (0.5 - x[0]) + 0.02 * x[0] * x[1], 0.04 * (0.5 - x[1]))))
+        controls.append(s)
+        directions.append(h)
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", target_degree, shape)))
+    J = dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx)
+    if u_control:
+        du = dxa.Function(u.function_space)
+        if vector:
+            du.interpolate(lambda x: np.vstack((np.cos(x[0]) * x[1], x[0] ** 2)))
+        else:
+            du.interpolate(lambda x: np.cos(x[0]) * x[1])
+        controls.append(u)
+        directions.append(du)
+    return J, controls, directions
+
+
+@pytest.mark.parametrize(
+    "moved,vector,target_degree,u_control",
+    [
+        ("source", False, 1, False),
+        ("source", True, 1, False),
+        ("source", False, 2, False),
+        ("target", False, 2, False),
+        ("both", False, 1, False),
+        ("both", False, 1, True),
+        ("source", True, 1, True),
+    ],
+    ids=["source", "source-vector", "source-P2", "target-P2", "both", "both+coefficient", "source-vector+coefficient"],
+)
+def test_shape_hessian_of_nonmatching_interpolation(moved, vector, target_degree, u_control):
+    r"""Second order through ``interpolate_nonmatching``, against a difference of the gradient.
+
+    With ``d_k = dx_k(x_i) - sigma_k(x_i)`` the motion of each target point relative to the
+    source mesh, ``d2c = d1^T H_u d2 - grad(u).(grad(sigma2) d1) - grad(u).(grad(sigma1) d2)
+    + grad(u1).d2 + grad(u2).d1``. The cases cover each term: the source Hessian ``H_u`` (P2
+    source), ``grad(sigma)`` (source moving), both meshes at once, and the coefficient cross
+    terms.
+    """
+    pytest.importorskip("fenicsx_ii")
+    J, controls, directions = _nonmatching_hessian_forward(moved, vector, target_degree, u_control)
+    Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    Hh, fd = _hessian_and_finite_difference(Jhat, controls, directions)
+    assert abs(fd) > 1e-9, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < 1e-6 * abs(fd) + 1e-13, f"hessian {Hh} vs finite difference {fd}"
+
+
+def _piola_nonmatching_forward(element_from, element_to, moved: str, step, direction):
+    """``int |interpolate_nonmatching(u, V_B)|^2 dx`` with one mesh displaced, in general position.
+
+    ``"same"`` interpolates onto the source's own mesh. The target otherwise sits strictly inside
+    the source and off its grid: a Piola-mapped field's tangential (or normal) component jumps
+    across cell boundaries, so a point evaluation there is not merely one-sided but discontinuous
+    in the geometry, and a finite difference measures the jump.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    if moved == "same":
+        mesh_b = mesh_a
+    else:
+        mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.1, 0.1]), np.array([0.9, 0.9])], [5, 5])
+        mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+    tracked = dxa.Mesh(mesh_b if moved == "target" else mesh_a)
+
+    V_a = dolfinx.fem.functionspace(mesh_a, element_from)
+    u = dxa.Function(V_a)
+    u.interpolate(lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 2, x[0] * x[1] + 1.0)))
+    S = dxa.geometry_function_space(tracked)
+    s = dxa.Function(S)
+    if step is not None:
+        s.x.array[:] = step * direction
+    dxa.move(tracked, s)
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, element_to))
+    return dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx), s, S
+
+
+def _general_motion(x: np.ndarray) -> np.ndarray:
+    """A contraction towards the centre with a shear on top, so no Piola invariance hides a term."""
+    return np.vstack((0.05 * (0.5 - x[0]) + 0.02 * x[0] * x[1], 0.04 * (0.5 - x[1]) + 0.01 * x[0] ** 2))
+
+
+@pytest.mark.parametrize("moved", ["target", "source", "same"])
+@pytest.mark.parametrize(
+    "element_from,element_to",
+    [
+        (("RT", 1), ("RT", 1)),
+        (("Lagrange", 2, (2,)), ("RT", 1)),
+        (("RT", 1), ("Lagrange", 1, (2,))),
+        (("N1curl", 1), ("N1curl", 1)),
+        (("Lagrange", 2, (2,)), ("N1curl", 2)),
+    ],
+    ids=["RT-RT", "P2-RT", "RT-P1", "N1curl-N1curl", "P2-N1curl2"],
+)
+def test_shape_derivative_of_nonmatching_interpolation_with_piola_spaces(element_from, element_to, moved):
+    """A Piola map on either side adds a term to each mesh's shape derivative.
+
+    A Piola-mapped target's dofs are ``M . P_B^-1(u_A(x_p))``, so moving the target mesh changes
+    ``J_B`` as well as the points. A Piola-mapped source changes with its mesh through ``J_A``
+    and ``det J_A``, not only by being carried along. On one mesh the terms cancel, leaving the
+    functional's own measure term. Checked by value, adjoint and tangent-linear.
+    """
+    pytest.importorskip("fenicsx_ii")
+    if moved == "same" and element_from[0] != "Lagrange" and element_to[0] == "Lagrange":
+        pytest.skip("point values of a Piola field at its own mesh's vertices jump with the geometry")
+    reference = (
+        _unit_square(7)
+        if moved != "target"
+        else dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.1, 0.1]), np.array([0.9, 0.9])], [5, 5])
+    )
+    d = dolfinx.fem.Function(dxa.geometry_function_space(reference))
+    d.interpolate(_general_motion)
+    h = d.x.array.copy()
+    eps = 1e-6
+    fd = (
+        float(_piola_nonmatching_forward(element_from, element_to, moved, eps, h)[0])
+        - float(_piola_nonmatching_forward(element_from, element_to, moved, -eps, h)[0])
+    ) / (2 * eps)
+    assert abs(fd) > 1e-8, "the direction must actually change the functional"
+
+    J, s, S = _piola_nonmatching_forward(element_from, element_to, moved, None, h)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    assert abs(_directional(Jhat.derivative(), hf, S) - fd) < 1e-6 * abs(fd)
+    assert abs(float(Jhat.tlm(hf)) - fd) < 1e-6 * abs(fd), "the tangent-linear model must agree too"
+
+
+_PIOLA_PAIRS = [
+    (("RT", 1), ("RT", 1)),
+    (("Lagrange", 2, (2,)), ("RT", 1)),
+    (("RT", 1), ("Lagrange", 1, (2,))),
+    (("N1curl", 1), ("N1curl", 1)),
+]
+_PIOLA_IDS = ["RT-RT", "P2-RT", "RT-P1", "N1curl-N1curl"]
+
+
+@pytest.mark.parametrize("element_from,element_to", _PIOLA_PAIRS, ids=_PIOLA_IDS)
+def test_piola_nonmatching_forward_matches_dolfinx(element_from, element_to):
+    """Recording a Piola case must not change the forward value.
+
+    A Piola-mapped target is split into a quadrature-space step and an expression interpolation,
+    which reads only the values at its interpolation points; a Piola-mapped source stays one
+    block. Either way the result is DOLFINx's direct interpolation.
+    """
+    pytest.importorskip("fenicsx_ii")
+    d = dolfinx.fem.Function(dxa.geometry_function_space(_unit_square(7)))
+    d.interpolate(_general_motion)
+    J, _, _ = _piola_nonmatching_forward(element_from, element_to, "source", 0.3, d.x.array.copy())
+    blocks = pyadjoint.get_working_tape().get_blocks()
+    split = any(isinstance(block, ExprInterpolationBlock) for block in blocks)
+    assert split == (element_to[0] != "Lagrange"), "only a Piola-mapped target is split"
+
+    with pyadjoint.stop_annotating():
+        mesh_a = _unit_square(7)
+        mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.1, 0.1]), np.array([0.9, 0.9])], [5, 5])
+        mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+        V_a = dolfinx.fem.functionspace(mesh_a, element_from)
+        u = dolfinx.fem.Function(V_a)
+        u.interpolate(lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 2, x[0] * x[1] + 1.0)))
+        mesh_a.geometry.x[:, :2] += 0.3 * d.x.array.reshape(-1, 2)  # after u: its dofs move with the mesh
+        V_b = dolfinx.fem.functionspace(mesh_b, element_to)
+        cells = np.arange(mesh_b.topology.index_map(2).size_local, dtype=np.int32)
+        v = dolfinx.fem.Function(V_b)
+        v.interpolate_nonmatching(u, cells, dolfinx.fem.create_interpolation_data(V_b, V_a, cells, padding=1e-6))
+        local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(ufl.inner(v, v) * ufl.dx))
+        direct = MPI.COMM_WORLD.allreduce(local, op=MPI.SUM)
+    assert abs(float(J) - direct) < 1e-12 * abs(direct), f"split {float(J)} vs direct {direct}"
+
+
+def _piola_nonmatching_hessian_forward(element_from, element_to, moved: str):
+    """``_piola_nonmatching_forward`` at zero displacement, with every tracked mesh a control
+    and the coefficient as a further one."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.1, 0.1]), np.array([0.9, 0.9])], [5, 5])
+    mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+    tracked = [dxa.Mesh(mesh) for mesh in {"source": [mesh_a], "target": [mesh_b], "both": [mesh_a, mesh_b]}[moved]]
+    V_a = dolfinx.fem.functionspace(mesh_a, element_from)
+    u = dxa.Function(V_a)
+    u.interpolate(lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 2, x[0] * x[1] + 1.0)))
+    controls, directions = [], []
+    for mesh in tracked:
+        s = dxa.Function(dxa.geometry_function_space(mesh))
+        dxa.move(mesh, s)
+        h = dxa.Function(s.function_space)
+        h.interpolate(_general_motion)
+        controls.append(s)
+        directions.append(h)
+    u_b = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, element_to))
+    J = dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx)
+    du = dxa.Function(V_a)
+    du.interpolate(lambda x: np.vstack((np.cos(x[0]) * x[1], x[0] ** 2)))
+    controls.append(u)
+    directions.append(du)
+    return J, controls, directions
+
+
+@pytest.mark.parametrize("moved", ["target", "source", "both"])
+@pytest.mark.parametrize("element_from,element_to", _PIOLA_PAIRS, ids=_PIOLA_IDS)
+def test_shape_hessian_of_nonmatching_interpolation_with_piola_spaces(element_from, element_to, moved):
+    """Second order with a Piola map on either side, against a difference of the gradient.
+
+    Every tracked mesh and the coefficient are controls at once, so the cross terms between the
+    Piola maps, the point motion and the coefficient direction are all exercised.
+    """
+    pytest.importorskip("fenicsx_ii")
+    J, controls, directions = _piola_nonmatching_hessian_forward(element_from, element_to, moved)
+    Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    Hh, fd = _hessian_and_finite_difference(Jhat, controls, directions)
+    assert abs(fd) > 1e-9, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < 1e-6 * abs(fd), f"hessian {Hh} vs finite difference {fd}"
+
+
+def test_nonmatching_interpolation_without_shape_control_still_works():
+    """The refusal must not reach the ordinary case, which is most of them."""
+    pytest.importorskip("fenicsx_ii")
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = _unit_square(7)
+    mesh_b = _unit_square(5)
+    V = dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2))
+    u = dxa.Function(V)
+    u.x.array[:] = 1.0
+
+    ub = dxa.interpolate_nonmatching(u, dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1)))
+    J = dxa.assemble_scalar(ufl.inner(ub, ub) * ufl.dx)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(u))
+    h = dxa.Function(V)
+    h.interpolate(lambda x: np.sin(np.pi * x[0]) * np.cos(np.pi * x[1]))
+    assert pyadjoint.taylor_test(Jhat, u, h) > 1.9
+
+
+# --- Coverage of the rows that were untested --------------------------------------------------
+#
+# Each checked by value: gradients against a central difference of an independently rebuilt
+# forward, Hessians against a central difference of the gradient.
+
+
+def _curved_square(n: int = 4) -> dolfinx.mesh.Mesh:
+    """A unit square with a curved (P2) geometry: straight-sided cells mapped by a smooth bend.
+
+    Built on rank 0 and partitioned by ``create_mesh``. Edge nodes follow basix's order,
+    edge ``i`` opposite vertex ``i``.
+    """
+    import basix.ufl
+
+    if MPI.COMM_WORLD.rank == 0:
+        m = 2 * n + 1
+        grid = np.array([(i / (m - 1), j / (m - 1)) for j in range(m) for i in range(m)])
+
+        def node(i, j):
+            return j * m + i
+
+        cells = []
+        for j in range(n):
+            for i in range(n):
+                a, b, c, d = (2 * i, 2 * j), (2 * i + 2, 2 * j), (2 * i, 2 * j + 2), (2 * i + 2, 2 * j + 2)
+                mid = (2 * i + 1, 2 * j + 1)
+                cells.append(
+                    [node(*a), node(*b), node(*d), node(2 * i + 2, 2 * j + 1), node(*mid), node(2 * i + 1, 2 * j)]
+                )
+                cells.append(
+                    [node(*a), node(*d), node(*c), node(2 * i + 1, 2 * j + 2), node(2 * i, 2 * j + 1), node(*mid)]
+                )
+        x = grid.copy()
+        x[:, 0] += 0.08 * grid[:, 1] * (1 - grid[:, 1])  # bends the vertical lines
+        x[:, 1] += 0.06 * np.sin(np.pi * grid[:, 0])  # and the horizontal ones
+        cells_arr = np.array(cells, dtype=np.int64)
+    else:
+        x = np.zeros((0, 2))
+        cells_arr = np.zeros((0, 6), dtype=np.int64)
+    element = ufl.Mesh(basix.ufl.element("Lagrange", "triangle", 2, shape=(2,)))
+    return dolfinx.mesh.create_mesh(MPI.COMM_WORLD, cells_arr, element, x)
+
+
+_MESHES = {
+    "curved-P2": lambda: _curved_square(4),
+    "quadrilateral": lambda: dolfinx.mesh.create_unit_square(
+        MPI.COMM_WORLD, 5, 5, cell_type=dolfinx.mesh.CellType.quadrilateral
+    ),
+    "tetrahedron": lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 3, 3, 3),
+    "hexahedron": lambda: dolfinx.mesh.create_unit_cube(
+        MPI.COMM_WORLD, 2, 2, 2, cell_type=dolfinx.mesh.CellType.hexahedron
+    ),
+}
+
+
+def _bend(x: np.ndarray, gdim: int) -> np.ndarray:
+    """A non-uniform displacement direction in ``gdim`` dimensions."""
+    return np.vstack([x[k] * (1.0 + 0.5 * x[(k + 1) % gdim]) for k in range(gdim)])
+
+
+def _poisson_forward(make_mesh, values=None):
+    """``int u^2 + |x|^2 dx`` for a Poisson solve with a coordinate-dependent source."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = make_mesh()
+    S = dxa.geometry_function_space(mesh)
+    s = dxa.Function(S)
+    if values is not None:
+        s.x.array[:] = values
+    mesh = dxa.Mesh(mesh)
+    dxa.move(mesh, s)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
+        bcs=[_homogeneous_bc(V)],
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_cells_",
+    )
+    uh = problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
+    return J, s, S, problem
+
+
+def _direction_values(make_mesh, scale: float = 1.0) -> np.ndarray:
+    mesh = make_mesh()
+    d = dolfinx.fem.Function(dxa.geometry_function_space(mesh))
+    gdim = mesh.geometry.dim
+    d.interpolate(lambda x: scale * _bend(x, gdim))
+    return d.x.array.copy()
+
+
+def _assert_gradient_by_value(forward, h: np.ndarray, eps: float = 1e-6, rtol: float = 1e-6):
+    fd = (float(forward(eps * h)[0]) - float(forward(-eps * h)[0])) / (2 * eps)
+    assert abs(fd) > 1e-8, f"the finite difference is ~0 ({fd}): this direction tests nothing"
+    J, s, S, _keep = forward()
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    hf = dxa.Function(S)
+    hf.x.array[:] = h
+    directional = _directional(Jhat.derivative(), hf, S)
+    assert abs(directional - fd) < rtol * abs(fd), f"adjoint {directional} vs finite difference {fd}"
+
+
+def _assert_hessian_by_value(J, controls, directions, rtol: float = 1e-5):
+    Jhat = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
+    Hh, fd = _hessian_and_finite_difference(Jhat, controls, directions)
+    assert abs(fd) > 1e-9, "the direction must actually curve the functional"
+    assert abs(Hh - fd) < rtol * abs(fd), f"hessian {Hh} vs finite difference {fd}"
+
+
+def _non_affine_quadrilateral(n: int = 4) -> dolfinx.mesh.Mesh:
+    """Unit-square quadrilaterals bent into non-parallelograms, so each cell map is bilinear."""
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, n, n, cell_type=dolfinx.mesh.CellType.quadrilateral)
+    x = mesh.geometry.x
+    x[:, 0] += 0.05 * x[:, 1] * (1 - x[:, 1]) * np.sin(3 * x[:, 0])
+    return mesh
+
+
+_NON_AFFINE_SOURCES = {"curved-P2": lambda: _curved_square(4), "non-affine-quadrilateral": _non_affine_quadrilateral}
+_NON_AFFINE_FAMILIES = ["Lagrange", "RT", "N1curl"]
+
+
+def _non_affine_nonmatching_forward(make_mesh, family: str, values=None, moved=("source",)):
+    """``int |interpolate_nonmatching(u, V_B)|^2 dx`` from a non-affine source mesh.
+
+    ``grad(u)`` and a Piola push-forward are rational on these cells, so any intermediate
+    polynomial space would make the shape derivative inexact. The target is an identity-pullback
+    space on an offset rectangle strictly inside the source. ``values`` displaces the source mesh.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh_a = make_mesh()
+    mesh_b = dolfinx.mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.2, 0.2]), np.array([0.8, 0.8])], [5, 5])
+    mesh_b.geometry.x[:, :2] += np.array([0.0123, 0.0071])
+    if family == "Lagrange":
+        V_a = dolfinx.fem.functionspace(mesh_a, ("Lagrange", 2))
+        V_b = dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1))
+        values_a = lambda x: np.sin(2.0 * x[0]) + x[1] ** 3  # noqa: E731
+        direction_a = lambda x: np.cos(x[0]) * x[1]  # noqa: E731
+    else:
+        V_a = dolfinx.fem.functionspace(mesh_a, (family, 1))
+        V_b = dolfinx.fem.functionspace(mesh_b, ("Lagrange", 1, (2,)))
+        values_a = lambda x: np.vstack((np.sin(2.0 * x[0]) + x[1] ** 2, x[0] * x[1] + 1.0))  # noqa: E731
+        direction_a = lambda x: np.vstack((np.cos(x[0]) * x[1], x[0] ** 2))  # noqa: E731
+    u = dxa.Function(V_a)
+    u.interpolate(values_a)
+    controls, directions = [], []
+    for mesh in [{"source": mesh_a, "target": mesh_b}[side] for side in moved]:
+        tracked = dxa.Mesh(mesh)
+        s = dxa.Function(dxa.geometry_function_space(tracked))
+        if values is not None:
+            s.x.array[:] = values
+        dxa.move(tracked, s)
+        h = dxa.Function(s.function_space)
+        h.interpolate(_general_motion)
+        controls.append(s)
+        directions.append(h)
+    u_b = dxa.interpolate_nonmatching(u, V_b)
+    J = dxa.assemble_scalar(ufl.inner(u_b, u_b) * ufl.dx)
+    du = dxa.Function(V_a)
+    du.interpolate(direction_a)
+    return J, controls + [u], directions + [du]
+
+
+@pytest.mark.parametrize("family", _NON_AFFINE_FAMILIES)
+@pytest.mark.parametrize("mesh_kind", sorted(_NON_AFFINE_SOURCES))
+def test_shape_derivative_of_nonmatching_interpolation_from_a_non_affine_mesh(mesh_kind, family):
+    """Moving a curved or non-affine source mesh, with an identity or a Piola-mapped source."""
+    pytest.importorskip("fenicsx_ii")
+    make_mesh = _NON_AFFINE_SOURCES[mesh_kind]
+
+    def forward(values=None):
+        J, controls, _ = _non_affine_nonmatching_forward(make_mesh, family, values)
+        return J, controls[0], controls[0].function_space, None
+
+    d = dolfinx.fem.Function(dxa.geometry_function_space(make_mesh()))
+    d.interpolate(_general_motion)
+    _assert_gradient_by_value(forward, d.x.array.copy())
+
+
+@pytest.mark.parametrize("family", _NON_AFFINE_FAMILIES)
+@pytest.mark.parametrize("mesh_kind", sorted(_NON_AFFINE_SOURCES))
+def test_shape_hessian_of_nonmatching_interpolation_from_a_non_affine_mesh(mesh_kind, family):
+    """Second order with both meshes and the coefficient as controls, so every cross term is hit."""
+    pytest.importorskip("fenicsx_ii")
+    J, controls, directions = _non_affine_nonmatching_forward(
+        _NON_AFFINE_SOURCES[mesh_kind], family, moved=("source", "target")
+    )
+    _assert_hessian_by_value(J, controls, directions)
+
+
+_BOUNDARY_MESHES = {
+    "affine": lambda: _unit_square(5),
+    "curved-P2": lambda: _curved_square(4),
+    "quadrilateral": _non_affine_quadrilateral,
+}
+
+
+def _boundary_submesh(mesh: dolfinx.mesh.Mesh):
+    """The exterior facets of ``mesh`` as a submesh, its entity map, and the facets."""
+    fdim = mesh.topology.dim - 1
+    mesh.topology.create_connectivity(fdim, fdim + 1)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    facet_mesh, entity_map = dolfinx.mesh.create_submesh(mesh, fdim, facets)[:2]
+    return facet_mesh, entity_map, facets
+
+
+def _boundary_values(x: np.ndarray) -> np.ndarray:
+    return np.vstack((np.sin(3.0 * x[0]) + x[1] ** 2, x[0] * x[1] - 0.5 * x[1]))
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_transfer_from_boundary_extends_by_zero(mesh_kind):
+    """Every boundary node gets the boundary function's value, including a P2 geometry's
+    mid-edge nodes, every interior node gets zero, and restricting back returns the input."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _BOUNDARY_MESHES[mesh_kind]()
+    facet_mesh, entity_map, facets = _boundary_submesh(mesh)
+    S = dxa.geometry_function_space(mesh)
+    h = dxa.Function(dxa.geometry_function_space(facet_mesh))
+    h.interpolate(_boundary_values)
+    s = dxa.transfer_from_boundary(h, S, entity_map)
+
+    fdim = mesh.topology.dim - 1
+    gdim = mesh.geometry.dim
+    boundary = dolfinx.fem.locate_dofs_topological(S, fdim, facets)
+    owned = S.dofmap.index_map.size_local
+    boundary = boundary[boundary < owned]
+    interior = np.setdiff1d(np.arange(owned), boundary)
+    values = s.x.array.reshape(-1, gdim)
+    expected = _boundary_values(S.tabulate_dof_coordinates()[boundary].T).T
+    assert np.allclose(values[boundary], expected)
+    assert np.all(values[interior] == 0.0)
+
+    back = dolfinx.fem.Function(h.function_space)
+    num_facets = facet_mesh.topology.index_map(fdim).size_local
+    sub = np.arange(num_facets, dtype=np.int32)
+    entities = scifem.compat.compute_integration_domains(
+        dolfinx.fem.IntegralType.exterior_facet,
+        mesh.topology,
+        scifem.mesh.get_entity_map(entity_map)[:num_facets],
+    ).reshape(-1, 2)
+    scifem.interpolation.interpolate_to_surface_submesh(s, back, sub, entities)
+    assert np.allclose(back.x.array, h.x.array), "restricting the extension must return the input"
+
+
+@pytest.mark.parametrize("degree", [2, 3])
+@pytest.mark.parametrize(
+    "make_mesh",
+    [
+        lambda: _unit_square(4),
+        lambda: dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 4, 3, cell_type=dolfinx.mesh.CellType.quadrilateral),
+        lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2),
+        lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2, cell_type=dolfinx.mesh.CellType.hexahedron),
+    ],
+    ids=["triangle", "quadrilateral", "tetrahedron", "hexahedron"],
+)
+def test_transfer_from_boundary_orders_entity_interior_dofs(make_mesh, degree):
+    """Restricting the extension returns the input where facets carry several interior dofs.
+
+    From P3 an edge carries two dofs and a hexahedron's face four, whose order depends on how
+    the facet is oriented in its cell; the closure permutation has to get each one right.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = make_mesh()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", degree))
+    h = dxa.Function(dolfinx.fem.functionspace(facet_mesh, ("Lagrange", degree)))
+    h.interpolate(lambda x: np.sin(2.0 * x[0]) + x[1] ** 3 + x[0] * x[mesh.geometry.dim - 1])
+    u = dxa.transfer_from_boundary(h, V, entity_map)
+
+    fdim = mesh.topology.dim - 1
+    num_facets = facet_mesh.topology.index_map(fdim).size_local
+    sub = np.arange(num_facets, dtype=np.int32)
+    entities = scifem.compat.compute_integration_domains(
+        dolfinx.fem.IntegralType.exterior_facet, mesh.topology, scifem.mesh.get_entity_map(entity_map)[:num_facets]
+    ).reshape(-1, 2)
+    back = dolfinx.fem.Function(h.function_space)
+    scifem.interpolation.interpolate_to_surface_submesh(u, back, sub, entities)
+    assert np.allclose(back.x.array, h.x.array)
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_transfer_from_boundary_transpose(mesh_kind):
+    """<E q, w> = <q, E^T w>, summed over owned dofs on every rank."""
+    mesh = _BOUNDARY_MESHES[mesh_kind]()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    S = dxa.geometry_function_space(mesh)
+    Q = dxa.geometry_function_space(facet_mesh)
+    extension = _surface_extension(Q, S, entity_map)
+    rng = np.random.default_rng(MPI.COMM_WORLD.rank)
+    q = dolfinx.fem.Function(Q)
+    q.x.array[:] = rng.random(q.x.array.size)
+    q.x.scatter_forward()
+    w = dolfinx.fem.Function(S)
+    w.x.array[:] = rng.random(w.x.array.size)
+    u = dolfinx.fem.Function(S)
+    extension.apply(q, u)
+    transposed = dolfinx.fem.Function(Q)
+    extension.apply_transpose(w.x, transposed.x)
+    assert np.isclose(_directional(u, w, S), _directional(q, transposed, Q), rtol=1e-12)
+
+
+def test_transfer_from_boundary_interpolates_a_coarser_boundary_field():
+    """A P1 boundary field into a P2 geometry gives its interpolant: mid-edge nodes average the ends."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _curved_square(3)
+    facet_mesh, entity_map, facets = _boundary_submesh(mesh)
+    h = dxa.Function(dolfinx.fem.functionspace(facet_mesh, ("Lagrange", 1, (2,))))
+    h.interpolate(_boundary_values)
+    S = dxa.geometry_function_space(mesh)
+    s = dxa.transfer_from_boundary(h, S, entity_map)
+
+    # The reference: h evaluated at each boundary node of S, through its own submesh cell.
+    boundary = dolfinx.fem.locate_dofs_topological(S, mesh.topology.dim - 1, facets)
+    owned = S.dofmap.index_map.size_local
+    boundary = boundary[boundary < owned]
+    points = S.tabulate_dof_coordinates()[boundary]
+    tree = dolfinx.geometry.bb_tree(facet_mesh, facet_mesh.topology.dim)
+    candidates = dolfinx.geometry.compute_collisions_points(tree, points)
+    colliding = dolfinx.geometry.compute_colliding_cells(facet_mesh, candidates, points)
+    for row, node in enumerate(boundary):
+        cell = colliding.links(row)[:1]
+        if len(cell):
+            assert np.allclose(s.x.array.reshape(-1, 2)[node], h.eval(points[row], cell))
+
+
+def test_transfer_from_boundary_transpose_with_a_discontinuous_boundary_field():
+    """A DG boundary field is averaged at shared nodes; the map stays linear with an exact transpose."""
+    mesh = _unit_square(4)
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    S = dxa.geometry_function_space(mesh)
+    Q = dolfinx.fem.functionspace(facet_mesh, ("DG", 1, (2,)))
+    extension = _surface_extension(Q, S, entity_map)
+    rng = np.random.default_rng(MPI.COMM_WORLD.rank)
+    q = dolfinx.fem.Function(Q)
+    q.x.array[:] = rng.random(q.x.array.size)
+    q.x.scatter_forward()
+    w = dolfinx.fem.Function(S)
+    w.x.array[:] = rng.random(w.x.array.size)
+    u = dolfinx.fem.Function(S)
+    extension.apply(q, u)
+    transposed = dolfinx.fem.Function(Q)
+    extension.apply_transpose(w.x, transposed.x)
+    assert np.isclose(_directional(u, w, S), _directional(q, transposed, Q), rtol=1e-12)
+
+
+_PIOLA_BOUNDARY_MESHES = {
+    **_BOUNDARY_MESHES,
+    "tetrahedron": lambda: dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2),
+    "hexahedron": lambda: dolfinx.mesh.create_unit_cube(
+        MPI.COMM_WORLD, 2, 2, 2, cell_type=dolfinx.mesh.CellType.hexahedron
+    ),
+}
+
+
+@pytest.mark.parametrize("element", [("RT", 1), ("RT", 2), ("N1curl", 1), ("N1curl", 2)], ids=lambda e: f"{e[0]}{e[1]}")
+@pytest.mark.parametrize("mesh_kind", sorted(_PIOLA_BOUNDARY_MESHES))
+def test_surface_extension_transpose_into_a_piola_mapped_space(mesh_kind, element):
+    """<E q, w> = <q, E^T w> for an H(div) or H(curl) volume space, which ``transfer_from_boundary``
+    refuses since the extension then depends on the geometry."""
+    mesh = _PIOLA_BOUNDARY_MESHES[mesh_kind]()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    gdim = mesh.geometry.dim
+    Q = dolfinx.fem.functionspace(facet_mesh, ("Lagrange", 1, (gdim,)))
+    V = dolfinx.fem.functionspace(mesh, element)
+    with pytest.raises(ValueError, match="needs a Lagrange volume space"):
+        _surface_extension(Q, V, entity_map)
+
+    fdim = mesh.topology.dim - 1
+    num_facets = facet_mesh.topology.index_map(fdim).size_local
+    entities = scifem.compat.compute_integration_domains(
+        dolfinx.fem.IntegralType.exterior_facet, mesh.topology, scifem.mesh.get_entity_map(entity_map)[:num_facets]
+    ).reshape(-1, 2)
+    extension = TransposableSurfaceSubmeshExtension(
+        Q, V, np.arange(num_facets, dtype=np.int32), entities, entity_maps=[entity_map]
+    )
+    rng = np.random.default_rng(MPI.COMM_WORLD.rank)
+    q = dolfinx.fem.Function(Q)
+    q.x.array[:] = rng.random(q.x.array.size)
+    q.x.scatter_forward()
+    w = dolfinx.fem.Function(V)
+    w.x.array[:] = rng.random(w.x.array.size)
+    u = dolfinx.fem.Function(V)
+    extension.apply(q, u)
+    assert MPI.COMM_WORLD.allreduce(np.abs(u.x.array).max(initial=0.0), op=MPI.MAX) > 0.1
+    transposed = dolfinx.fem.Function(Q)
+    extension.apply_transpose(w.x, transposed.x)
+    assert np.isclose(_directional(u, w, V), _directional(q, transposed, Q), rtol=1e-12)
+
+
+def _boundary_control_forward(make_mesh, values=None):
+    """``int u^2 + |x|^2 dx`` for a Poisson solve on a mesh moved by a boundary-only displacement."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = make_mesh()
+    facet_mesh, entity_map, _ = _boundary_submesh(mesh)
+    h = dxa.Function(dxa.geometry_function_space(facet_mesh), name="boundary_displacement")
+    if values is not None:
+        h.x.array[:] = values
+    mesh = dxa.Mesh(mesh)
+    dxa.move(mesh, dxa.transfer_from_boundary(h, dxa.geometry_function_space(mesh), entity_map))
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 2))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
+        bcs=[_homogeneous_bc(V)],
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_boundary_control_",
+    )
+    uh = problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
+    return J, h, h.function_space, problem
+
+
+def _boundary_direction(make_mesh, scale: float = 1.0) -> np.ndarray:
+    facet_mesh, _, _ = _boundary_submesh(make_mesh())
+    d = dolfinx.fem.Function(dxa.geometry_function_space(facet_mesh))
+    d.interpolate(lambda x: scale * _general_motion(x))
+    return d.x.array.copy()
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_shape_derivative_with_respect_to_a_boundary_displacement(mesh_kind):
+    """Gradient and tangent-linear model with the boundary displacement as the control."""
+    make_mesh = _BOUNDARY_MESHES[mesh_kind]
+    h = _boundary_direction(make_mesh)
+    _assert_gradient_by_value(lambda values=None: _boundary_control_forward(make_mesh, values), h)
+
+    eps = 1e-6
+    fd = (
+        float(_boundary_control_forward(make_mesh, eps * h)[0])
+        - float(_boundary_control_forward(make_mesh, -eps * h)[0])
+    ) / (2 * eps)
+    J, control, space, _keep = _boundary_control_forward(make_mesh)
+    direction = dxa.Function(space)
+    direction.x.array[:] = h
+    tlm = float(pyadjoint.ReducedFunctional(J, pyadjoint.Control(control)).tlm(direction))
+    assert abs(tlm - fd) < 1e-6 * abs(fd), f"tangent-linear {tlm} vs finite difference {fd}"
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_BOUNDARY_MESHES))
+def test_shape_hessian_with_respect_to_a_boundary_displacement(mesh_kind):
+    """Second order through the boundary transfer, which passes the Hessian action through."""
+    make_mesh = _BOUNDARY_MESHES[mesh_kind]
+    J, control, space, _keep = _boundary_control_forward(make_mesh)
+    direction = dxa.Function(space)
+    direction.x.array[:] = _boundary_direction(make_mesh, scale=0.5)
+    _assert_hessian_by_value(J, [control], [direction])
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_MESHES))
+def test_shape_gradient_on_curved_3d_and_tensor_product_meshes(mesh_kind):
+    """Nothing is specific to affine triangles: P2 geometry, quadrilaterals, tetrahedra, hexahedra."""
+    make_mesh = _MESHES[mesh_kind]
+    _assert_gradient_by_value(lambda values=None: _poisson_forward(make_mesh, values), _direction_values(make_mesh))
+
+
+@pytest.mark.parametrize("mesh_kind", sorted(_MESHES))
+def test_shape_hessian_on_curved_3d_and_tensor_product_meshes(mesh_kind):
+    """The second-order chain on the same meshes."""
+    make_mesh = _MESHES[mesh_kind]
+    J, s, S, _keep = _poisson_forward(make_mesh)
+    h = dxa.Function(S)
+    h.x.array[:] = _direction_values(make_mesh, scale=0.1)
+    _assert_hessian_by_value(J, [s], [h])
+
+
+def test_shape_hessian_of_a_time_dependent_problem():
+    """Second order through a time loop, where every step's residual carries the previous state."""
+    J, s, S, _keep = _heat_loop(3)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
+    h.x.array[:] *= 0.1
+    _assert_hessian_by_value(J, [s], [h])
+
+
+@pytest.mark.parametrize(
+    "integrand",
+    [
+        pytest.param(lambda m: ufl.dot(ufl.SpatialCoordinate(m), ufl.FacetNormal(m)) * ufl.ds, id="x.n*ds"),
+        pytest.param(
+            lambda m: ufl.FacetArea(m) * ufl.inner(ufl.SpatialCoordinate(m), ufl.SpatialCoordinate(m)) * ufl.ds,
+            id="FacetArea*x.x*ds",
+        ),
+        pytest.param(
+            lambda m: ufl.avg(ufl.sin(ufl.SpatialCoordinate(m)[0]) * ufl.SpatialCoordinate(m)[1] ** 2) * ufl.dS,
+            id="avg(...)*dS",
+        ),
+    ],
+)
+def test_shape_hessian_of_facet_functionals(integrand):
+    """Second order over exterior and interior facet integrals."""
+    mesh, S, s, _ = _shape_setup(6)
+    J = dxa.assemble_scalar(integrand(mesh))
+    h = dxa.Function(S)
+    h.interpolate(_shear)
+    _assert_hessian_by_value(J, [s], [h])
+
+
+@pytest.mark.parametrize("family", ["RT", "N1curl"])
+def test_shape_hessian_of_a_form_with_a_piola_mapped_coefficient(family):
+    """Second order for a Piola-mapped coefficient held fixed in its dofs."""
+    mesh, S, s, _ = _shape_setup(6)
+    V = dolfinx.fem.functionspace(mesh, (family, 1))
+    u = dxa.Function(V)
+    imap = V.dofmap.index_map
+    indices = np.arange(imap.size_local + imap.num_ghosts, dtype=np.int32)
+    u.x.array[:] = np.sin(imap.local_to_global(indices).astype(np.float64))
+    J = dxa.assemble_scalar(ufl.inner(u, u) ** 2 * ufl.dx)
+    h = dxa.Function(S)
+    h.interpolate(_shear)
+    _assert_hessian_by_value(J, [s], [h])
+
+
+def test_shape_hessian_through_an_interpolated_dirichlet_value():
+    """Second order when a Dirichlet value is built from the coordinates on a moving boundary."""
+    mesh, S, s, _ = _shape_setup(6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_value = dxa.interpolate(X[0] ** 2 + X[1], V)
+    bc = dxa.dirichletbc(boundary_value, dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets))
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx,
+        bcs=[bc],
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_hessian_bc_",
+    )
+    uh = problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
+    h.x.array[:] *= 0.1
+    _assert_hessian_by_value(J, [s], [h])
+
+
+def test_shape_hessian_of_a_move_by_an_expression():
+    """Second order through ``move`` by an expression, with respect to the coefficient in it."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dxa.Mesh(_unit_square(6))
+    Q = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    alpha = dxa.Function(Q, name="amplitude")
+    alpha.x.array[:] = 0.1
+    x = ufl.SpatialCoordinate(mesh)
+    dxa.move(mesh, alpha * ufl.as_vector((x[0] * (1.0 + x[1]), x[1])))
+    X = ufl.SpatialCoordinate(mesh)
+    J = dxa.assemble_scalar(ufl.sin(X[0]) * X[1] ** 2 * ufl.dx)
+    direction = dxa.Function(Q)
+    direction.interpolate(lambda p: 1.0 + p[0])
+    _assert_hessian_by_value(J, [alpha], [direction])
+
+
+def _two_moves_forward(values=None):
+    """A solve after the first move and a functional after a second, fixed one."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(6)
+    S = dxa.geometry_function_space(mesh)
+    s = dxa.Function(S)
+    if values is not None:
+        s.x.array[:] = values
+    # Built on the undeformed mesh, so its values do not depend on the first move.
+    second = dxa.Function(S)
+    second.interpolate(lambda x: np.vstack((0.05 * x[0] * x[1], 0.03 * x[0])))
+    mesh = dxa.Mesh(mesh)
+    dxa.move(mesh, s)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(ufl.sin(ufl.pi * X[0]) * ufl.cos(ufl.pi * X[1]), v) * ufl.dx,
+        bcs=[_homogeneous_bc(V)],
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_two_moves_fd_",
+    )
+    uh = problem.solve()
+    dxa.move(mesh, second)
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx + ufl.inner(X, X) * ufl.dx)
+    return J, s, S, problem
+
+
+def test_shape_gradient_after_two_moves_matches_a_finite_difference():
+    """Each block is differentiated at the geometry it saw; checked by value, not by Taylor rate."""
+    _assert_gradient_by_value(_two_moves_forward, _direction_values(lambda: _unit_square(6)))
+
+
+def test_shape_hessian_of_a_blocked_problem():
+    """Second order through a blocked Taylor-Hood Stokes solve."""
+    import basix.ufl
+
+    mesh, S, s, _ = _shape_setup(4)
+    V = dolfinx.fem.functionspace(mesh, basix.ufl.element("Lagrange", mesh.basix_cell(), 2, shape=(2,)))
+    Q = dolfinx.fem.functionspace(mesh, basix.ufl.element("Lagrange", mesh.basix_cell(), 1))
+    W = ufl.MixedFunctionSpace(V, Q)
+    u, p = ufl.TrialFunctions(W)
+    v, q = ufl.TestFunctions(W)
+    X = ufl.SpatialCoordinate(mesh)
+    f = ufl.as_vector((ufl.sin(ufl.pi * X[1]), ufl.cos(ufl.pi * X[0])))
+    a = ufl.extract_blocks(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx - ufl.div(v) * p * ufl.dx - ufl.div(u) * q * ufl.dx
+    )
+    rhs = ufl.extract_blocks(ufl.inner(f, v) * ufl.dx + dolfinx.fem.Constant(mesh, 0.0) * q * ufl.dx)
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    walls = dolfinx.mesh.locate_entities_boundary(
+        mesh, mesh.topology.dim - 1, lambda pt: np.isclose(pt[1], 0.0) | np.isclose(pt[1], 1.0) | np.isclose(pt[0], 0.0)
+    )
+    no_slip = np.zeros(2, dtype=dolfinx.default_scalar_type)
+    bcs = [dolfinx.fem.dirichletbc(no_slip, dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, walls), V)]
+    uh, ph = dxa.Function(V), dxa.Function(Q)
+    problem = dxa.LinearProblem(
+        a,
+        rhs,
+        u=[uh, ph],
+        bcs=bcs,
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_hessian_blocked_",
+    )
+    problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(ufl.grad(uh), ufl.grad(uh)) * ufl.dx)
+    h = _interior_bump(S)
+    h.x.array[:] *= 0.1
+    _assert_hessian_by_value(J, [s], [h])
+
+
+def _stokes_with_a_trigonometric_source(values=None):
+    """Taylor-Hood Stokes whose source FFCx has to integrate with an estimated quadrature degree."""
+    import basix.ufl
+
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(4)
+    S = dxa.geometry_function_space(mesh)
+    s = dxa.Function(S)
+    if values is not None:
+        s.x.array[:] = values
+    mesh = dxa.Mesh(mesh)
+    dxa.move(mesh, s)
+    V = dolfinx.fem.functionspace(mesh, basix.ufl.element("Lagrange", mesh.basix_cell(), 2, shape=(2,)))
+    Q = dolfinx.fem.functionspace(mesh, basix.ufl.element("Lagrange", mesh.basix_cell(), 1))
+    W = ufl.MixedFunctionSpace(V, Q)
+    u, p = ufl.TrialFunctions(W)
+    v, q = ufl.TestFunctions(W)
+    X = ufl.SpatialCoordinate(mesh)
+    f = ufl.as_vector((ufl.sin(ufl.pi * X[1]), ufl.cos(ufl.pi * X[0])))
+    a = ufl.extract_blocks(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx - ufl.div(v) * p * ufl.dx - ufl.div(u) * q * ufl.dx
+    )
+    rhs = ufl.extract_blocks(ufl.inner(f, v) * ufl.dx + dolfinx.fem.Constant(mesh, 0.0) * q * ufl.dx)
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    walls = dolfinx.mesh.locate_entities_boundary(
+        mesh, mesh.topology.dim - 1, lambda pt: np.isclose(pt[1], 0.0) | np.isclose(pt[1], 1.0) | np.isclose(pt[0], 0.0)
+    )
+    no_slip = np.zeros(2, dtype=dolfinx.default_scalar_type)
+    bcs = [dolfinx.fem.dirichletbc(no_slip, dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, walls), V)]
+    uh, ph = dxa.Function(V), dxa.Function(Q)
+    problem = dxa.LinearProblem(
+        a,
+        rhs,
+        u=[uh, ph],
+        bcs=bcs,
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_quadrature_stokes_",
+    )
+    problem.solve()
+    return dxa.assemble_scalar(ufl.inner(ufl.grad(uh), ufl.grad(uh)) * ufl.dx), s, S, problem
+
+
+def test_shape_gradient_uses_the_forward_quadrature():
+    """A derivative form must be integrated with the rule its forward form was integrated with.
+
+    FFCx estimates a quadrature degree per form, so without pinning, ``dF/dX`` got a different
+    degree than ``F`` and was not the exact derivative of what was assembled: 1.5e-3 relative
+    here, falling only with mesh refinement. The tolerance is set far below that.
+    """
+    h = dxa.Function(dxa.geometry_function_space(_unit_square(4)))
+    h.interpolate(_interior_bump_values)
+    _assert_gradient_by_value(_stokes_with_a_trigonometric_source, h.x.array.copy(), rtol=1e-7)
+
+
+def _nonlinear_coefficient_forward(amplitude: float):
+    """A coarse nonlinear diffusion ``exp(3 m)``, whose derivative in ``m`` FFCx would give its own degree."""
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = _unit_square(3)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    Q = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    m = dxa.Function(Q, name="m")
+    m.interpolate(lambda x: amplitude * (1.0 + x[0] * x[1]))
+    uh = dxa.Function(V)
+    v = ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    F = ufl.inner(ufl.exp(3 * m) * ufl.grad(uh), ufl.grad(v)) * ufl.dx - ufl.sin(4 * X[0]) * v * ufl.dx
+    problem = dxa.NonlinearProblem(
+        F, u=uh, bcs=[_homogeneous_bc(V)], petsc_options=_SNES, petsc_options_prefix="test_quadrature_nonlinear_"
+    )
+    problem.solve()
+    return dxa.assemble_scalar(uh * uh * ufl.dx), m, Q, problem
+
+
+def test_coefficient_gradient_uses_the_forward_quadrature():
+    """The same holds for a coefficient derivative: 8.5e-6 relative before pinning."""
+    J, m, Q, _keep = _nonlinear_coefficient_forward(0.5)
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(m))
+    dm = dxa.Function(Q)
+    dm.interpolate(lambda x: np.cos(x[0]) + x[1])
+    directional = _directional(Jhat.derivative(), dm, Q)
+    eps = 1e-6
+    values = m.x.array.copy()
+
+    def J_at(step: float) -> float:
+        f = dxa.Function(Q)
+        f.x.array[:] = values + step * dm.x.array
+        return float(Jhat(f))
+
+    fd = (J_at(eps) - J_at(-eps)) / (2 * eps)
+    assert abs(fd) > 1e-8
+    assert abs(directional - fd) < 1e-7 * abs(fd), f"adjoint {directional} vs finite difference {fd}"
+
+
+def test_shape_tangent_linear_through_an_interpolated_dirichlet_value():
+    """The tangent-linear model when a Dirichlet value is built from the coordinates.
+
+    The geometry's direction reaches the solve twice, as the shape term in its right-hand side
+    and as the bc value's own direction; in parallel that combination used to double-count ghost
+    contributions (3e-3 on two ranks), and the Hessian built on it inherited the error.
+    """
+    mesh, S, s, _ = _shape_setup(6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    X = ufl.SpatialCoordinate(mesh)
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_value = dxa.interpolate(X[0] ** 2 + X[1], V)
+    bc = dxa.dirichletbc(boundary_value, dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, facets))
+    problem = dxa.LinearProblem(
+        ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx,
+        ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx,
+        bcs=[bc],
+        petsc_options=_LU,
+        adjoint_petsc_options=_LU,
+        tlm_petsc_options=_LU,
+        petsc_options_prefix="test_shape_tlm_bc_",
+    )
+    uh = problem.solve()
+    J = dxa.assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
+    h = dxa.Function(S)
+    h.interpolate(_dilation_values)
+    h.x.array[:] *= 0.1
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(s))
+    tlm = float(Jhat.tlm(h))
+    eps = 1e-6
+    f = dxa.Function(S)
+    f.x.array[:] = eps * h.x.array
+    J_plus = float(Jhat(f))
+    f.x.array[:] = -eps * h.x.array
+    J_minus = float(Jhat(f))
+    fd = (J_plus - J_minus) / (2 * eps)
+    assert abs(fd) > 1e-8
+    assert abs(tlm - fd) < 1e-7 * abs(fd), f"tangent-linear {tlm} vs finite difference {fd}"
