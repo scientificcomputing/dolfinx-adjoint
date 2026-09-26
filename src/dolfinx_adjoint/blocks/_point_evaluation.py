@@ -1,8 +1,35 @@
 """Exact evaluation of source-mesh expressions at another mesh's points, through fenicsx_ii."""
 
+import os
+import tempfile
+
 import dolfinx
 import numpy as np
 import ufl
+
+#: Set to keep the point-evaluation kernels in FFCx's persistent cache instead of a per-process
+#: temporary one -- worthwhile only when the same points recur between runs, as in the test suite.
+PERSISTENT_CACHE_VARIABLE = "DOLFINX_ADJOINT_PERSISTENT_POINT_CACHE"
+_process_cache: tempfile.TemporaryDirectory | None = None
+
+
+def _jit_options() -> dict | None:
+    """Where the point-evaluation kernels are compiled to.
+
+    The evaluation points are compiled into each kernel, and in a shape optimization they move
+    with every iteration, so almost every kernel is used by one geometry only. In FFCx's shared,
+    persistent cache they would accumulate without bound. Instead each process compiles them into
+    its own temporary directory, created on first use and removed when the process exits. It is
+    shared by every evaluator in the process, so a geometry seen twice in a run -- the forward and
+    the adjoint of one control value -- still compiles once. Being private to the process, it also
+    cannot be left holding a half-written kernel that another process then waits on.
+    """
+    if os.environ.get(PERSISTENT_CACHE_VARIABLE):
+        return None
+    global _process_cache
+    if _process_cache is None:
+        _process_cache = tempfile.TemporaryDirectory(prefix="dolfinx_adjoint_points_")
+    return {"cache_dir": _process_cache.name}
 
 
 class SourcePointEvaluator:
@@ -15,7 +42,9 @@ class SourcePointEvaluator:
     Points outside the source mesh get zero, as in :py:meth:`dolfinx.fem.Function.interpolate_nonmatching`.
 
     The points are the owned nodes of ``points_space``, in its dof order. The evaluation is
-    collective: every rank has to call the same methods in the same order.
+    collective: every rank has to call the same methods in the same order. Its kernels go to a
+    per-process temporary cache unless ``DOLFINX_ADJOINT_PERSISTENT_POINT_CACHE`` is set; see
+    :py:func:`_jit_options`.
 
     Args:
         mesh_from: The source mesh, at its current geometry.
@@ -53,6 +82,7 @@ class SourcePointEvaluator:
             self._exchange.evaluated_cells,
             batch_size=self._batch_size,
             dtype=dtype,
+            jit_options=_jit_options(),
         )
 
     def evaluate(self, expression: ufl.core.expr.Expr, dtype=dolfinx.default_scalar_type) -> np.ndarray:

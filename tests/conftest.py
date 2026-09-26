@@ -1,6 +1,12 @@
+import os
+
 import numpy as np
 import pyadjoint
 import pytest
+
+# The tests evaluate at the same points on every run, so keep the point-evaluation kernels in
+# FFCx's persistent cache: a cold run of the shape tests takes ~50 s on 2-3 ranks, a warm one ~3 s.
+os.environ.setdefault("DOLFINX_ADJOINT_PERSISTENT_POINT_CACHE", "1")
 
 
 @pytest.fixture
