@@ -17,7 +17,7 @@ from ..compat import bcs_by_block
 from ..types import Function
 from ..typing_utils import MaybeBlocked, MaybeBlockedMatrix, NestedSequence
 from ..ufl_utils import assign_mixed_parts, sum_form
-from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form
+from .assembly import _create_vector, _SpecialVector, _vector, assemble_compiled_form, assemble_compiled_forms
 
 if typing.TYPE_CHECKING:
     from ..solvers import LinearProblem, NonlinearProblem
@@ -1007,10 +1007,7 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
         _, seed_placeholders, _ = problem._get_or_build_tlm_rhs_templates()
 
         fixed_template = hessian_templates.fixed[c]
-        hessian_output = _create_vector(fixed_template, W)
-        hessian_output.array[:] = 0.0
-        assemble_compiled_form(fixed_template, hessian_output)
-
+        terms = [fixed_template]
         for _, bv in relevant_dependencies:
             c2 = bv.output
             if isinstance(c2, dolfinx.fem.DirichletBC):
@@ -1021,11 +1018,16 @@ class _ProblemBlockBase(pyadjoint.Block, abc.ABC):
             template = hessian_templates.cross.get((c, c2))
             if template is None:
                 continue
+            # Each dependency has its own seed placeholder, so all of them can be set
+            # before any term is assembled.
             seed2 = seed_placeholders[c2]
             seed2.x.array[:] = tlm_input.x.array[:]
             seed2.x.scatter_forward()
-            assemble_compiled_form(template, hessian_output)
+            terms.append(template)
 
+        hessian_output = _create_vector(fixed_template, W)
+        hessian_output.array[:] = 0.0
+        assemble_compiled_forms(terms, hessian_output)
         hessian_output.array[:] *= -1.0
         return hessian_output
 
