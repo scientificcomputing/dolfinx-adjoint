@@ -3,6 +3,7 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pyadjoint
+import pytest
 import ufl
 from pyadjoint.overloaded_type import Weakref
 
@@ -347,3 +348,103 @@ def test_time_dependent_bc_replay():
     Jhat(m)
     min_rate_grad = pyadjoint.taylor_test(Jhat, m, pert)
     assert np.isclose(min_rate_grad, 2.0, rtol=1e-2, atol=5e-2), f"Expected 2.0, got {min_rate_grad}"
+
+
+def _unit_square_boundary_bc_setup():
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    a = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx + ufl.inner(u, v) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(mesh, 0.0), v) * ufl.dx
+    return V, boundary_dofs, a, L
+
+
+@pytest.mark.parametrize("annotate", [True, False])
+def test_bc_value_updated_after_construction_is_used_by_solve(annotate):
+    """As with a plain dolfinx.fem.dirichletbc, a bc built on a Function `g` must apply
+    `g`'s value *at solve time*, not a snapshot taken when the bc was constructed --
+    the standard time-dependent-bc pattern (construct once, update `g` every step).
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    V, boundary_dofs, a, L = _unit_square_boundary_bc_setup()
+
+    g = Function(V, name="bc_value")
+    bc = dirichletbc(g, boundary_dofs)
+    uh = Function(V, name="state")
+    problem = LinearProblem(a, L, u=uh, bcs=[bc], petsc_options=direct_solve)
+
+    for value in [1.0, 3.0]:
+        if annotate:
+            assign(value, g)
+        else:
+            with pyadjoint.stop_annotating():
+                g.x.array[:] = value
+        problem.solve(annotate=annotate)
+        assert np.allclose(uh.x.array[boundary_dofs], value)
+
+
+def test_time_dependent_bc_replay_and_gradient_follow_updated_value():
+    """Replay and gradient of a multi-step solve whose bc value `g` is re-assigned from
+    a control before every step: each solve must depend on `g`'s value at that step,
+    both in the forward run and on the tape.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    V, boundary_dofs, a, L = _unit_square_boundary_bc_setup()
+
+    m = Function(V, name="control")
+    m.interpolate(lambda x: 1.0 + x[0] * x[1])
+
+    g = Function(V, name="bc_value")
+    bc = dirichletbc(g, boundary_dofs)
+    uh = Function(V, name="state")
+    problem = LinearProblem(
+        a,
+        L,
+        u=uh,
+        bcs=[bc],
+        petsc_options=direct_solve,
+        adjoint_petsc_options=direct_solve,
+        tlm_petsc_options=direct_solve,
+    )
+
+    J = 0.0
+    for k in [1.0, 2.0, 3.0]:
+        assign(k * m, g)
+        problem.solve()
+        assert np.allclose(uh.x.array[boundary_dofs], k * m.x.array[boundary_dofs])
+        J += assemble_scalar(ufl.inner(uh, uh) * ufl.dx)
+    J_forward = float(J)
+
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(m))
+    assert np.isclose(float(Jhat(m)), J_forward, rtol=1e-10, atol=1e-12)
+
+    # J is quadratic in m, so J(2m) = 4 J(m) exactly.
+    m2 = Function(V)
+    m2.x.array[:] = 2.0 * m.x.array
+    assert np.isclose(float(Jhat(m2)), 4.0 * J_forward, rtol=1e-10)
+
+    h = Function(V)
+    h.interpolate(lambda x: np.cos(np.pi * x[0]))
+    Jhat(m)
+    assert pyadjoint.taylor_test(Jhat, m, h) > 1.9
+
+
+def test_bc_value_updated_after_construction_packed_value():
+    """As test_bc_value_updated_after_construction_is_used_by_solve, but for a packed
+    value (an expression of `g`): each overloaded solve re-packs it from `g`."""
+    pyadjoint.get_working_tape().clear_tape()
+    V, boundary_dofs, a, L = _unit_square_boundary_bc_setup()
+
+    g = Function(V, name="bc_value")
+    bc = dirichletbc(2 * g, boundary_dofs, V=V)
+    uh = Function(V, name="state")
+    problem = LinearProblem(a, L, u=uh, bcs=[bc], petsc_options=direct_solve)
+
+    for value in [1.0, 3.0]:
+        assign(value, g)
+        problem.solve()
+        assert np.allclose(uh.x.array[boundary_dofs], 2 * value)

@@ -784,6 +784,12 @@ class _ProblemBase(abc.ABC):
             The solution Function, or one per output block for a blocked problem.
         """
         annotate = pyadjoint.annotate_tape({"annotate": annotate})
+        # Bring every overloaded bc's packed value (and, when annotating, its tape
+        # dependency) up to date with its source before this solve reads it -- see
+        # dolfinx_adjoint.types.dirichletbc.DirichletBC._ad_refresh.
+        for bc in self.bcs:
+            if (refresh := getattr(bc, "_ad_refresh", None)) is not None:
+                refresh(annotate)
         block = self._make_block() if annotate else None
         if annotate:
             assert block is not None

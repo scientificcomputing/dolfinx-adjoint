@@ -3,13 +3,21 @@ import numpy as np
 import numpy.typing as npt
 import pyadjoint
 import ufl
-from pyadjoint.overloaded_type import FloatingType, create_overloaded_object
+from pyadjoint.overloaded_type import FloatingType, OverloadedType, create_overloaded_object
 from pyadjoint.tape import get_working_tape, stop_annotating
+from ufl.corealg.traversal import traverse_unique_terminals
 
 from ..blocks.dirichletbc import DirichletBCBlock, build_cpp_bc_and_kwargs
 from ..blocks.interpolation import ExprInterpolationBlock
 from ..compat import get_interpolation_points
 from .function import Function
+
+
+def _tracked_terminals(expr: ufl.core.expr.Expr) -> list[OverloadedType]:
+    """The tape-tracked coefficients a bc value expression depends on -- exactly the
+    dependencies :py:class:`~dolfinx_adjoint.blocks.interpolation.ExprInterpolationBlock`
+    records for it."""
+    return [op for op in traverse_unique_terminals(expr) if isinstance(op, OverloadedType)]
 
 
 def _pack_bc_value(g, V: dolfinx.fem.FunctionSpace, annotate: bool) -> Function:
@@ -44,6 +52,12 @@ def _pack_bc_value(g, V: dolfinx.fem.FunctionSpace, annotate: bool) -> Function:
 class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
     """A class overloading :py:class:`dolfinx.fem.DirichletBC` to support
     it being used as a control variable in the adjoint framework.
+
+    Like a plain dolfinx bc, the bc follows later updates to `g`: every
+    :py:class:`~dolfinx_adjoint.LinearProblem`/:py:class:`~dolfinx_adjoint.NonlinearProblem`
+    solve applies (and, when annotating, records a dependency on) `g`'s value at the time
+    of that solve, see :py:meth:`_ad_refresh`. Only those overloaded solves do this: a
+    plain ``dolfinx.fem.petsc`` solve reads the packed ``bc.g`` as last refreshed.
 
     Args:
         g: The value of the Dirichlet BC. May be a :py:class:`dolfinx_adjoint.Function`,
@@ -94,6 +108,13 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         # dolfinx_adjoint.compat.bcs_by_block normalises both flavours instead.
         self._packed_g = g_packed
 
+        # Keep the *source* value (not just its packed snapshot) so the bc follows later
+        # updates to it -- see _ad_refresh, which every Problem solve calls.
+        self._source_expr = ufl.as_ufl(g)
+        self._pack_expr = dolfinx.fem.Expression(self._source_expr, get_interpolation_points(V_used))
+        self._ad_annotated = annotate
+        self._packed_from = self._source_block_variables() if annotate else []
+
         FloatingType.__init__(
             self,
             g_packed,
@@ -113,6 +134,43 @@ class DirichletBC(dolfinx.fem.DirichletBC, FloatingType):
         """The packed bc value: always the Python-level :py:class:`dolfinx_adjoint.Function`
         on `V`, never dolfinx 0.11's cpp ``Function``. See :py:func:`_pack_bc_value`."""
         return self._packed_g
+
+    def _source_block_variables(self) -> list:
+        return [op.block_variable for op in _tracked_terminals(self._source_expr)]
+
+    def _ad_refresh(self, annotate: bool) -> None:
+        """Bring the bc up to date with its source value `g` before a solve reads it.
+
+        The packed ``bc.g`` (see :py:func:`_pack_bc_value`) is a separate Function from
+        `g`, so it is re-interpolated from `g` here; otherwise an update to `g` after the bc
+        was built -- ``assign(new_value, g)`` each time step -- would never reach the solve.
+
+        When annotating, and any tracked coefficient of `g` has a newer block variable
+        than the one the bc's current tape entry was recorded from, a fresh
+        :py:class:`~dolfinx_adjoint.blocks.interpolation.ExprInterpolationBlock` and
+        :py:class:`~dolfinx_adjoint.blocks.dirichletbc.DirichletBCBlock` are recorded, so
+        the solve that follows depends on the bc value at this point of the tape rather
+        than on the value at construction time.
+
+        Args:
+            annotate: Whether the solve about to consume this bc is being annotated.
+        """
+        with stop_annotating():
+            self._packed_g.interpolate(self._pack_expr)
+            self._packed_g.x.scatter_forward()
+
+        if not (annotate and self._ad_annotated):
+            return
+        current = self._source_block_variables()
+        if len(current) == len(self._packed_from) and all(a is b for a, b in zip(current, self._packed_from)):
+            return
+
+        tape = get_working_tape()
+        block = ExprInterpolationBlock(self._source_expr, self._packed_g)
+        tape.add_block(block)
+        block.add_output(self._packed_g.create_block_variable())
+        self._ad_annotate_block()
+        self._packed_from = current
 
     def _ad_create_checkpoint(self):
         return self
