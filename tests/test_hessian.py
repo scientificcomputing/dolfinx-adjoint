@@ -233,7 +233,7 @@ def test_constant_hessian_linear_operator():
     assert H_val > 0.0, f"Operator Hessian failed! Value is {H_val}"
 
 
-def test_hessian_cross_term_in_parallel():
+def test_hessian_cross_term_in_parallel(assert_hessian_matches_finite_difference):
     """Hessian of a two-step implicit/explicit heat equation whose control multiplies the
     previous state on the right-hand side, so the solve block has a non-zero mixed term
     d2F/(dm du_old) on top of its pure d2F/dm2 term.
@@ -270,6 +270,4 @@ def test_hessian_cross_term_in_parallel():
     Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(m))
     h = dolfinx_adjoint.Function(V)
     h.interpolate(lambda x: np.cos(3 * x[0]) * x[1])
-    results = pyadjoint.taylor_to_dict(Jhat, m, h)
-    assert min(results["R1"]["Rate"]) > 1.9
-    assert min(results["R2"]["Rate"]) > 2.9
+    assert_hessian_matches_finite_difference(Jhat, m, h)
