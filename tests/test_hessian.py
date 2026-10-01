@@ -231,3 +231,43 @@ def test_constant_hessian_linear_operator():
     H_val = hessian_action.x.array[0]
 
     assert H_val > 0.0, f"Operator Hessian failed! Value is {H_val}"
+
+
+def test_hessian_cross_term_in_parallel(assert_hessian_matches_finite_difference):
+    """Hessian of a two-step implicit/explicit heat equation whose control multiplies the
+    previous state on the right-hand side, so the solve block has a non-zero mixed term
+    d2F/(dm du_old) on top of its pure d2F/dm2 term.
+
+    Both terms are accumulated into one output vector. In parallel that must not count the
+    first term's shared (ghosted) dofs twice, which shows up as a Hessian Taylor rate of 2
+    instead of 3. On a single process there are no ghosts and this passes either way; CI's
+    ``mpirun -n 2`` run is what exercises it.
+    """
+    pyadjoint.get_working_tape().clear_tape()
+    mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    m = dolfinx_adjoint.Function(V, name="m")
+    m.interpolate(lambda x: 1.0 + 0.3 * x[0])
+
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    uh = dolfinx_adjoint.Function(V, name="u")
+    u_old = dolfinx_adjoint.Function(V, name="u_old")
+    x = ufl.SpatialCoordinate(mesh)
+    f = ufl.sin(3 * x[0]) * x[1]
+    a = u * v * ufl.dx + 0.5 * m * ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+    L = (u_old + f) * v * ufl.dx - 0.5 * m * ufl.inner(ufl.grad(u_old), ufl.grad(v)) * ufl.dx
+    opts = {"ksp_type": "preonly", "pc_type": "lu"}
+    problem = dolfinx_adjoint.LinearProblem(
+        a, L, u=uh, petsc_options=opts, adjoint_petsc_options=opts, tlm_petsc_options=opts
+    )
+
+    J = 0.0
+    for _ in range(2):
+        problem.solve()
+        dolfinx_adjoint.assign(uh, u_old)
+        J += dolfinx_adjoint.assemble_scalar(uh * uh * ufl.dx)
+
+    Jhat = pyadjoint.ReducedFunctional(J, pyadjoint.Control(m))
+    h = dolfinx_adjoint.Function(V)
+    h.interpolate(lambda x: np.cos(3 * x[0]) * x[1])
+    assert_hessian_matches_finite_difference(Jhat, m, h)
