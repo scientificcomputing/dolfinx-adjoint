@@ -9,6 +9,8 @@ parts:
     - file: "demos/topology_optimization.py"
     - file: "demos/demo_nonmatching_grids.py"
     - file: "demos/emi_membrane_current_control.py"
+    - file: "demos/point_observations.py"
+    - file: "demos/boundary_control.py"
 
   - caption: Time-dependent PDE control
     chapters:
