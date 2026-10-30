@@ -6,5 +6,5 @@ WORKDIR /tmp/
 
 COPY . ./dolfinx-adjoint
 RUN apt update && apt install -y graphviz-dev &&  apt-get clean
-RUN python3 -m pip install ./dolfinx-adjoint[all]
+RUN python3 -m pip install ./dolfinx-adjoint[all] --no-build-isolation
 RUN rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
