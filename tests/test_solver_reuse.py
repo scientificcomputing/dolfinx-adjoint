@@ -41,7 +41,11 @@ def _run_heat_steps(num_steps: int, monkeypatch) -> int:
     uh = Function(V, name="state")
     u_prev = Function(V, name="state_prev")
 
-    F = (u - u_prev) / dt * v * ufl.dx + ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx - m * v * ufl.dx
+    F = (
+        ufl.inner((u - u_prev) / dt, v) * ufl.dx
+        + ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+        - ufl.inner(m, v) * ufl.dx
+    )
     a, L = ufl.system(F)
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -128,7 +132,7 @@ def test_recompute_does_not_corrupt_original_control():
 
     f = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0))
     a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
-    L = f * v * ufl.dx
+    L = ufl.inner(f, v) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -191,7 +195,7 @@ def test_nonlinear_recompute_does_not_corrupt_original_control():
     u1 = Function(V, name="state")
     u1.interpolate(lambda x: np.ones_like(x[0]))
     v1 = ufl.TestFunction(V)
-    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - ufl.inner(f, v1) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -257,7 +261,7 @@ def test_linear_adjoint_lhs_compiled_once():
 
     f = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0))
     a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
-    L = f * v * ufl.dx
+    L = ufl.inner(f, v) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -315,7 +319,7 @@ def test_nonlinear_adjoint_lhs_compiled_once():
     u1 = Function(V, name="state")
     u1.interpolate(lambda x: np.ones_like(x[0]))
     v1 = ufl.TestFunction(V)
-    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - ufl.inner(f, v1) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -382,7 +386,7 @@ def test_tlm_rhs_templates_compiled_once():
 
     f = dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0))
     a = m * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
-    L = f * v * ufl.dx
+    L = ufl.inner(f, v) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -452,7 +456,7 @@ def test_tlm_skips_inactive_dependency_with_singular_derivative():
     m.interpolate(lambda x: 1.0 + x[0] ** 2 + x[1] ** 2)
 
     a = (1.0 + ufl.sqrt(c)) * ufl.inner(ufl.grad(u_trial), ufl.grad(v)) * ufl.dx
-    L = m * v * ufl.dx
+    L = ufl.inner(m, v) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -507,7 +511,7 @@ def test_nonlinear_tlm_rhs_templates_compiled_once():
     u1 = Function(V, name="state")
     u1.interpolate(lambda x: np.ones_like(x[0]))
     v1 = ufl.TestFunction(V)
-    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - ufl.inner(f, v1) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -597,6 +601,10 @@ def test_linear_problem_released_by_refcounting_not_gc():
         "ksp_error_if_not_converged": True,
         "pc_factor_mat_solver_type": "mumps",
     }
+    # Restore whatever the collector was set to rather than enabling it unconditionally:
+    # under ``mpirun`` conftest.py disables it for the whole session, and re-enabling it
+    # here would reintroduce exactly the rank-nondeterministic finalisation described there.
+    collector_was_enabled = gc.isenabled()
     gc.disable()
     try:
         problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
@@ -612,7 +620,8 @@ def test_linear_problem_released_by_refcounting_not_gc():
             "between MPI ranks"
         )
     finally:
-        gc.enable()
+        if collector_was_enabled:
+            gc.enable()
 
 
 def test_nonlinear_problem_released_by_refcounting_not_gc():
@@ -628,7 +637,7 @@ def test_nonlinear_problem_released_by_refcounting_not_gc():
     u1 = Function(V, name="state")
     u1.interpolate(lambda x: np.ones_like(x[0]))
     v1 = ufl.TestFunction(V)
-    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - ufl.inner(f, v1) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -646,6 +655,10 @@ def test_nonlinear_problem_released_by_refcounting_not_gc():
         "snes_error_if_not_converged": True,
     }
     options.update(direct_options)
+    # Restore whatever the collector was set to rather than enabling it unconditionally:
+    # under ``mpirun`` conftest.py disables it for the whole session, and re-enabling it
+    # here would reintroduce exactly the rank-nondeterministic finalisation described there.
+    collector_was_enabled = gc.isenabled()
     gc.disable()
     try:
         problem = NonlinearProblem(F1, u=u1, bcs=[bc], petsc_options=options, adjoint_petsc_options=direct_options)
@@ -661,7 +674,8 @@ def test_nonlinear_problem_released_by_refcounting_not_gc():
             "between MPI ranks"
         )
     finally:
-        gc.enable()
+        if collector_was_enabled:
+            gc.enable()
 
 
 def test_linear_problem_rebuilt_after_garbage_collection():
@@ -735,7 +749,7 @@ def test_nonlinear_problem_rebuilt_after_garbage_collection():
     u1 = Function(V, name="state")
     u1.interpolate(lambda x: np.ones_like(x[0]))
     v1 = ufl.TestFunction(V)
-    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - f * v1 * ufl.dx
+    F1 = (1 + u1**2) * ufl.inner(ufl.grad(u1), ufl.grad(v1)) * ufl.dx - ufl.inner(f, v1) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
@@ -805,7 +819,10 @@ def test_default_petsc_options_prefix_is_unique_per_problem():
     assert linear_a._petsc_options_prefix != linear_b._petsc_options_prefix
 
     u1 = Function(V, name="state")
-    F = ufl.inner((1 + u1**2) * u1, v) * ufl.dx - ufl.inner(dolfinx.fem.Constant(mesh, 1.0), v) * ufl.dx
+    F = (
+        ufl.inner((1 + u1**2) * u1, v) * ufl.dx
+        - ufl.inner(dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(1.0)), v) * ufl.dx
+    )
     nonlinear_a = NonlinearProblem(F, u=u1)
     nonlinear_b = NonlinearProblem(F, u=u1)
     assert nonlinear_a._petsc_options_prefix != nonlinear_b._petsc_options_prefix
@@ -851,7 +868,7 @@ def test_nonlinear_blocked_problem_templates_compiled_once():
         + ufl.inner(ph, ufl.div(v)) * dx
         - ufl.inner(f, v) * dx
     )
-    F1 = ufl.inner(q, ufl.div(uh)) * dx
+    F1 = ufl.inner(ufl.div(uh), q) * dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)

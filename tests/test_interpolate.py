@@ -14,6 +14,7 @@ from dolfinx_adjoint.blocks.interpolation import (
     _INTERPOLATION_MATRIX_CACHE,
     ExprInterpolationBlock,
     InterpolationBlock,
+    MatrixFreeInterpolationOperator,
     _get_interpolation_matrix,
 )
 
@@ -395,3 +396,38 @@ def test_interpolation_matrix_cache_does_not_leak_across_transient_spaces(mesh_1
 
     gc.collect()
     assert len(_INTERPOLATION_MATRIX_CACHE) <= baseline + 1
+
+
+@pytest.mark.parametrize("target_has_same_cell_count", [False, True])
+def test_expr_interpolation_onto_another_mesh_is_refused(mesh_2D, target_has_same_cell_count: bool):
+    """A target space on a different mesh must be refused, not answered wrongly.
+
+    ``MatrixFreeInterpolationOperator`` builds its cell-local data from the expression's own
+    mesh and then reads both spaces' dofmaps with the same cell indices, so the two spaces have
+    to share a mesh for any of those indices to mean the same thing. Neither this package's
+    reshape fast path nor scifem's general ``prepare_interpolation_data`` takes the cell map
+    that a submesh target would need.
+
+    Both parametrisations matter, because the two failure modes are different in kind. With a
+    different cell count the mismatch used to surface as a bare ``ValueError`` from ``reshape``,
+    naming neither space and pointing at a line that is not where the mistake was made. With the
+    *same* cell count -- an unrelated mesh, or a submesh that happens to keep as many cells as
+    its parent -- it used to reshape cleanly and build an operator that silently paired up
+    unrelated cells, which is the worse of the two: a wrong gradient rather than an error.
+    """
+    tdim = mesh_2D.topology.dim
+    if target_has_same_cell_count:
+        target_mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 12, 14)
+    else:
+        left_cells = dolfinx.mesh.locate_entities(mesh_2D, tdim, lambda x: x[0] <= 0.5 + 1e-12)
+        target_mesh, _, _, _ = dolfinx.mesh.create_submesh(mesh_2D, tdim, left_cells)
+
+    V = dolfinx.fem.functionspace(mesh_2D, ("Lagrange", 1))
+    W = dolfinx.fem.functionspace(target_mesh, ("Lagrange", 1))
+
+    u = Function(V, name="source")
+    u.interpolate(lambda x: 1.0 + x[0])
+    dE = ufl.derivative(2.0 * u, u, ufl.TrialFunction(V))
+
+    with pytest.raises(NotImplementedError, match="different mesh"):
+        MatrixFreeInterpolationOperator(dE, W)

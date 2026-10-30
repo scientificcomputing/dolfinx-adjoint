@@ -134,7 +134,7 @@ def test_constant_hessian_linear_source():
 
     # m is just a source term (linear dependence)
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
-    L = m * v * ufl.dx
+    L = ufl.inner(m, v) * ufl.dx
 
     domain.topology.create_connectivity(domain.topology.dim - 1, domain.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(domain.topology)
@@ -192,7 +192,7 @@ def test_constant_hessian_linear_operator():
 
     # m multiplies u (non-linear dependence on the parameter)
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx + m * ufl.inner(u, v) * ufl.dx
-    L = f * v * ufl.dx
+    L = ufl.inner(f, v) * ufl.dx
 
     domain.topology.create_connectivity(domain.topology.dim - 1, domain.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(domain.topology)

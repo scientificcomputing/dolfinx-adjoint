@@ -43,7 +43,10 @@ def test_assign_linear_combination(mesh_1D):
     h = Function(V)
     rng = np.random.default_rng(seed=42)
     num_dofs_local = (V.dofmap.index_map.size_local + V.dofmap.index_map.num_ghosts) * V.dofmap.index_map_bs
-    rand = rng.random(size=num_dofs_local, dtype=h.dtype)
+    # Deliberately not dtype=h.dtype: NumPy's generator draws only real floats, and
+    # under a complex build that dtype is complex. A real perturbation direction, cast on
+    # assignment into the (possibly complex) array, is what is wanted in either build.
+    rand = rng.random(size=num_dofs_local)
     h.x.array[:] = rand
     h.x.scatter_forward()
     assert pyadjoint.taylor_test(rf, f, h) > 1.9
@@ -71,7 +74,10 @@ def test_assign_lincomb_real_space(mesh_1D):
     h = Function(R)
     rng = np.random.default_rng(seed=42)
     num_dofs_local = (R.dofmap.index_map.size_local + R.dofmap.index_map.num_ghosts) * R.dofmap.index_map_bs
-    rand = rng.random(size=num_dofs_local, dtype=h.dtype)
+    # Deliberately not dtype=h.dtype: NumPy's generator draws only real floats, and
+    # under a complex build that dtype is complex. A real perturbation direction, cast on
+    # assignment into the (possibly complex) array, is what is wanted in either build.
+    rand = rng.random(size=num_dofs_local)
     h.x.array[:] = rand
     h.x.scatter_forward()
     assert pyadjoint.taylor_test(rf, r, h) > 1.9
@@ -79,7 +85,10 @@ def test_assign_lincomb_real_space(mesh_1D):
     rf2 = pyadjoint.ReducedFunctional(J, pyadjoint.Control(v))
     hv = Function(V)
     num_dofs_local = (V.dofmap.index_map.size_local + V.dofmap.index_map.num_ghosts) * V.dofmap.index_map_bs
-    rand = rng.random(size=num_dofs_local, dtype=hv.dtype)
+    # Deliberately not dtype=hv.dtype: NumPy's generator draws only real floats, and
+    # under a complex build that dtype is complex. A real perturbation direction, cast on
+    # assignment into the (possibly complex) array, is what is wanted in either build.
+    rand = rng.random(size=num_dofs_local)
     hv.x.array[:] = rand
     hv.x.scatter_forward()
     assert pyadjoint.taylor_test(rf2, v, hv) > 1.9

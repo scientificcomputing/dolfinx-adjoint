@@ -134,13 +134,13 @@ def _tape_heat_equation(V, n_steps, schedule=None, disk=False, use_mpio=None):
     # schedule would read whatever value happens to be in uh at replay time instead of the
     # checkpointed one. The state update is therefore an explicit, tape-recorded assignment,
     # matching _tape_snes_heat_equation below.
-    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - f * v) * ufl.dx
+    F = (ufl.inner((u - u_prev) / dt, v) + nu * ufl.inner(ufl.grad(u), ufl.grad(v)) - ufl.inner(f, v)) * ufl.dx
     a, L = ufl.system(F)
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
     boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
-    bc = dolfinx.fem.dirichletbc(0.0, boundary_dofs, V)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
 
     problem = dolfinx_adjoint.LinearProblem(
         a,
@@ -161,7 +161,7 @@ def _tape_heat_equation(V, n_steps, schedule=None, disk=False, use_mpio=None):
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
-    return rf, controls, _perturbation_directions(V, n_steps)
+    return problem.keep_alive(rf), controls, _perturbation_directions(V, n_steps)
 
 
 def _gradient(rf, controls):
@@ -234,7 +234,7 @@ def _tape_bc_control_heat_equation(V, n_steps, schedule=None, disk=False):
     v = ufl.TestFunction(V)
     uh = dolfinx_adjoint.Function(V, name="solution")
     u_prev = dolfinx_adjoint.Function(V, name="previous")
-    F = ((u - u_prev) / dt * v + nu * ufl.inner(ufl.grad(u), ufl.grad(v))) * ufl.dx
+    F = (ufl.inner((u - u_prev) / dt, v) + nu * ufl.inner(ufl.grad(u), ufl.grad(v))) * ufl.dx
     a, L = ufl.system(F)
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -263,7 +263,7 @@ def _tape_bc_control_heat_equation(V, n_steps, schedule=None, disk=False):
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
-    return rf, controls, _perturbation_directions(V, n_steps)
+    return problem.keep_alive(rf), controls, _perturbation_directions(V, n_steps)
 
 
 def _bc_control_schedule(kind, n_steps):
@@ -395,12 +395,12 @@ def _tape_snes_heat_equation(V, n_steps, schedule=None, solution_dependent_diffu
     u_prev = dolfinx_adjoint.Function(V, name="previous")
 
     nu = (1 + uh**2) if solution_dependent_diffusivity else 1.0
-    F = ((uh - u_prev) / dt * v + nu * ufl.inner(ufl.grad(uh), ufl.grad(v)) - f * v) * ufl.dx
+    F = (ufl.inner((uh - u_prev) / dt, v) + nu * ufl.inner(ufl.grad(uh), ufl.grad(v)) - ufl.inner(f, v)) * ufl.dx
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
     boundary_dofs = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
-    bc = dolfinx.fem.dirichletbc(0.0, boundary_dofs, V)
+    bc = dolfinx.fem.dirichletbc(dolfinx.default_scalar_type(0.0), boundary_dofs, V)
 
     snes_options = {
         "snes_type": "newtonls",
@@ -426,7 +426,7 @@ def _tape_snes_heat_equation(V, n_steps, schedule=None, solution_dependent_diffu
         J = J + dolfinx_adjoint.assemble_scalar(dt * uh**2 * ufl.dx)
 
     rf = pyadjoint.ReducedFunctional(J, [pyadjoint.Control(c) for c in controls])
-    return rf, controls, _perturbation_directions(V, n_steps)
+    return problem.keep_alive(rf), controls, _perturbation_directions(V, n_steps)
 
 
 @pytest.mark.parametrize("solution_dependent_diffusivity", [False, True])
