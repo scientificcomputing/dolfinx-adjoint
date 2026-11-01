@@ -3,11 +3,15 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pyadjoint
+import pytest
 import ufl
 
 import dolfinx_adjoint
 
+requires_petsc = pytest.mark.skipif(not dolfinx.has_petsc4py, reason="needs DOLFINx built with PETSc")
 
+
+@requires_petsc
 def test_constant_hessian():
     pyadjoint.get_working_tape().clear_tape()
 
@@ -116,6 +120,7 @@ def test_constant_hessian_assemble_only():
     assert np.isclose(H_val, 1.0), f"Expected 1.0, got {H_val}"
 
 
+@requires_petsc
 def test_constant_hessian_linear_source():
     """
     Test 2: Does LinearProblemBlock support TLM and SOA for linear parameters?
@@ -175,6 +180,7 @@ def test_constant_hessian_linear_source():
     assert H_val > 0.0, f"Linear source Hessian failed! Value is {H_val}"
 
 
+@requires_petsc
 def test_constant_hessian_linear_operator():
     """
     Test 3: Does LinearProblemBlock support cross-derivatives (d2F/dudm)?

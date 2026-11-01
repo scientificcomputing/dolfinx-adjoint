@@ -3,12 +3,16 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pyadjoint
+import pytest
 import ufl
 from pyadjoint.overloaded_type import Weakref
 
-from dolfinx_adjoint import Constant, Function, LinearProblem, assemble_scalar, assign, dirichletbc
+import dolfinx_adjoint
+from dolfinx_adjoint import Constant, Function, assemble_scalar, assign, dirichletbc
 from dolfinx_adjoint.blocks.dirichletbc import DirichletBCBlock
 from dolfinx_adjoint.blocks.interpolation import ExprInterpolationBlock
+
+requires_petsc = pytest.mark.skipif(not dolfinx.has_petsc4py, reason="needs DOLFINx built with PETSc")
 
 direct_solve = {
     "ksp_type": "preonly",
@@ -35,7 +39,7 @@ def _poisson_bc_control_problem(mesh, g):
     bc = dirichletbc(g, boundary_dofs, V=V)
 
     uh = Function(V, name="state")
-    problem = LinearProblem(
+    problem = dolfinx_adjoint.LinearProblem(
         a,
         L,
         u=uh,
@@ -93,6 +97,7 @@ def _assert_bc_control_gradient_and_hessian(Jhat, m0, h, *, hessian_atol):
         )
 
 
+@requires_petsc
 def test_scalar_dirichletbc_control_function_value():
     """Gradient and Hessian of a scalar Poisson objective w.r.t. a Function-valued
     Dirichlet bc, the case where DirichletBCBlock's dependency (bc.g, see
@@ -117,6 +122,7 @@ def test_scalar_dirichletbc_control_function_value():
     _assert_bc_control_gradient_and_hessian(Jhat, g0, h, hessian_atol=1e-2)
 
 
+@requires_petsc
 def test_scalar_dirichletbc_control_constant_value():
     """Gradient and Hessian of a scalar Poisson objective w.r.t. a Constant-valued
     Dirichlet bc: `g` lives on its own private single-dof real space, broadcast across
@@ -140,6 +146,7 @@ def test_scalar_dirichletbc_control_constant_value():
     _assert_bc_control_gradient_and_hessian(Jhat, g0, h, hessian_atol=1e-6)
 
 
+@requires_petsc
 def test_scalar_dirichletbc_general_expression():
     """A Dirichlet bc value built from a genuine nonlinear UFL expression of a control
     (``m**3``, mirroring legacy dolfin-adjoint's ``test_simple_expression`` -- ported
@@ -271,6 +278,7 @@ def test_dirichletbc_recompute():
         assert np.allclose(bc.g.x.array, value)
 
 
+@requires_petsc
 def test_time_dependent_bc_replay():
     pyadjoint.get_working_tape().clear_tape()
 
@@ -309,7 +317,7 @@ def test_time_dependent_bc_replay():
         "ksp_error_if_not_converged": True,
         "pc_factor_mat_solver_type": "mumps",
     }
-    problem = LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
+    problem = dolfinx_adjoint.LinearProblem(a, L, bcs=[bc], u=uh, petsc_options=petsc_options)
 
     J = 0.0
 

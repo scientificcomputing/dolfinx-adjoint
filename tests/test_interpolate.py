@@ -22,6 +22,9 @@ petsc_options = [False]
 if getattr(dolfinx, "has_petsc", False) and getattr(dolfinx, "has_petsc4py", False):
     petsc_options.append(True)
 
+# The L2 Riesz map solves a mass-matrix system with PETSc.
+riesz_representation = "L2" if dolfinx.has_petsc4py else "l2"
+
 
 @pytest.fixture(scope="module")
 def mesh_1D():
@@ -127,7 +130,7 @@ def test_interpolation_taylor_test(mesh_var_name: str, request, use_petsc):
     J = assemble_scalar(error)
 
     derivative_options = {
-        "riesz_representation": "L2",
+        "riesz_representation": riesz_representation,
         "petsc_options": {"ksp_type": "preonly", "pc_type": "lu", "pc_factor_mat_solver_type": "mumps"},
     }
 
@@ -168,6 +171,7 @@ def test_interpolation_taylor_test(mesh_var_name: str, request, use_petsc):
 @pytest.mark.parametrize("use_petsc", petsc_options)
 def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
     """Verifies that the TLM and Adjoint for a UFL expression satisfy the adjoint identity."""
+    pytest.importorskip("scifem")
     mesh = mesh_2D
 
     V_from = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
@@ -237,6 +241,7 @@ def test_expr_interpolation_adjoint_property(mesh_2D, use_petsc):
 @pytest.mark.parametrize("use_petsc", petsc_options)
 def test_expr_interpolation_taylor_test_function(mesh_2D, use_petsc):
     """Verifies convergence rates when optimizing a Function inside a UFL expression."""
+    pytest.importorskip("scifem")
     pyadjoint.get_working_tape().clear_tape()
     mesh = mesh_2D
 
@@ -264,7 +269,7 @@ def test_expr_interpolation_taylor_test_function(mesh_2D, use_petsc):
     J = assemble_scalar(error)
 
     derivative_options = {
-        "riesz_representation": "L2",
+        "riesz_representation": riesz_representation,
         "petsc_options": {"ksp_type": "preonly", "pc_type": "lu", "pc_factor_mat_solver_type": "mumps"},
     }
 
@@ -296,6 +301,7 @@ def test_expr_interpolation_taylor_test_function(mesh_2D, use_petsc):
 @pytest.mark.parametrize("use_petsc", petsc_options)
 def test_expr_interpolation_taylor_test_constant(mesh_2D, use_petsc):
     """Verifies convergence rates when optimizing a Constant inside a UFL expression."""
+    pytest.importorskip("scifem")
     pyadjoint.get_working_tape().clear_tape()
     mesh = mesh_2D
 

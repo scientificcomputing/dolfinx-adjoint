@@ -1,6 +1,23 @@
+import dolfinx
 import numpy as np
 import pyadjoint
 import pytest
+
+# DOLFINx built without PETSc (e.g. on Windows) has no dolfinx.fem.petsc, which these modules
+# use throughout via LinearProblem/NonlinearProblem; the remaining modules skip test by test.
+collect_ignore = (
+    []
+    if dolfinx.has_petsc4py
+    else [
+        "test_blocked_problem.py",
+        "test_checkpointing.py",
+        "test_linear_solver.py",
+        "test_nonlinear_problem.py",
+        "test_poisson_mother.py",
+        "test_solver_reuse.py",
+        "test_tlm_update.py",
+    ]
+)
 
 
 @pytest.fixture
