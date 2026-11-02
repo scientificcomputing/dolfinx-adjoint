@@ -1,0 +1,56 @@
+name: Test package on Windows
+
+# DOLFINx on Windows is built without PETSc, so this checks that dolfinx-adjoint imports and that
+# everything not built on the PETSc solvers works there (the rest of the test suite is skipped).
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The DOLFINx wheels for Windows need Intel MPI.
+      - name: Install MPI
+        run: python -m pip install impi-rt mpi4py
+
+      # Only the FEniCSx packages come from TestPyPI; their other dependencies are resolved from
+      # PyPI in the next step, so nothing else can be picked up from TestPyPI.
+      - name: Install DOLFINx (built without PETSc) from TestPyPI
+        run: >
+          python -m pip install --pre --no-deps --index-url https://test.pypi.org/simple/
+          fenics-dolfinx fenics-basix fenics-ffcx fenics-ufl
+
+      # Not the test extra: scifem only ships as source needing PETSc to build, and fenicsx_ii needs
+      # PETSc, so the tests that use them are skipped.
+      - name: Install package
+        run: python -m pip install . pytest
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Check DOLFINx is built without PETSc
+        run: python -c "import dolfinx; assert not dolfinx.has_petsc4py; print(dolfinx.__version__)"
+
+      - name: Run tests
+        run: python -m pytest -vs -rs tests

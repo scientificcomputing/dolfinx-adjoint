@@ -5,7 +5,6 @@ import weakref
 from typing import Callable
 
 import dolfinx
-import dolfinx.fem.petsc
 import numpy as np
 import ufl
 from fenicsx_compat import require_module
@@ -137,7 +136,10 @@ def _build_interpolation_matrix(
 ) -> _MatrixCSRWorkspace | "PETSc.Mat":
     """Assemble the interpolation matrix for a pair of spaces."""
     if use_petsc:
-        petsc_mat = dolfinx.fem.petsc.interpolation_matrix(space_from, space_to)
+        # Imported lazily: DOLFINx built without PETSc (e.g. on Windows) has no dolfinx.fem.petsc.
+        from dolfinx.fem.petsc import interpolation_matrix as petsc_interpolation_matrix
+
+        petsc_mat = petsc_interpolation_matrix(space_from, space_to)
         petsc_mat.assemble()
         return petsc_mat
 

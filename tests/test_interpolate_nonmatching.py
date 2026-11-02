@@ -10,6 +10,9 @@ from dolfinx.mesh import create_unit_cube, create_unit_square
 
 from dolfinx_adjoint import Function, assemble_scalar, interpolate_nonmatching
 
+# Builds the transfer matrix with fenicsx_ii, which itself needs PETSc.
+pytest.importorskip("fenicsx_ii")
+
 
 def _run_adjoint_and_taylor_test(mesh_from, mesh_to, use_petsc, assert_hessian_matches_finite_difference):
     """Helper function to test Adjoint symmetry and Taylor convergence."""
