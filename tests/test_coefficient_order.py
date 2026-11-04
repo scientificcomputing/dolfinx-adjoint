@@ -7,6 +7,8 @@ import ufl
 from dolfinx_adjoint import Constant, Function
 from dolfinx_adjoint.solvers import LinearProblem, NonlinearProblem
 
+requires_petsc = pytest.mark.skipif(not dolfinx.has_petsc4py, reason="needs DOLFINx built with PETSc")
+
 
 def test_function_and_constant_share_ufl_id_counter():
     """A Function and a Constant never get the same ufl_id, and a Constant uses up only one id."""
@@ -19,6 +21,7 @@ def test_function_and_constant_share_ufl_id_counter():
     assert Constant(mesh, 1.0, ufl_id=ids[0]).ufl_id() == ids[0]
 
 
+@requires_petsc
 @pytest.mark.parametrize("reverse", [False, True])
 def test_placeholder_order_independent_of_hash(monkeypatch, reverse):
     """Placeholder creation is collective, so its order must not follow set iteration order.
