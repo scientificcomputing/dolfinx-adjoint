@@ -43,6 +43,17 @@ def collect_coefficients(form: ufl.BaseForm | typing.Sequence | None) -> set[Fun
     return coefficients
 
 
+def sort_coefficients(coefficients: typing.Iterable[Function]) -> list[Function]:
+    """Sort ``coefficients`` into the same order on every MPI rank.
+
+    Use where the order drives collective operations, such as creating a ``Function``.
+    The key is UFL's ``count()``, drawn from one counter shared by all coefficient
+    types, so it is unique and identical on every rank. ``ufl_id()`` is not: ties fall
+    back to set iteration order, which depends on the per-process ``PYTHONHASHSEED``.
+    """
+    return sorted(coefficients, key=lambda c: c.count())
+
+
 def _map_block_variables_to_form(
     form: NestedSequence[ufl.Form | None],
     block_variables: typing.Iterable[pyadjoint.block_variable.BlockVariable],
@@ -1181,8 +1192,7 @@ class LinearProblemBlock(_ProblemBlockBase):
         else:
             raise RuntimeError(f"Unknown type for unknown function u={type(self._u)}.")
 
-        sorted_coefficients = sorted(coeffs, key=lambda c: c.ufl_id())
-        for c in sorted_coefficients:
+        for c in sort_coefficients(coeffs):
             self.add_dependency(c, no_duplicates=True)
 
         # Cache form parameters for later
@@ -1417,8 +1427,7 @@ class NonlinearProblemBlock(_ProblemBlockBase):
         u_list = self._u if isinstance(self._u, list) else [self._u]
         coeffs = collect_coefficients(J) | collect_coefficients(self._rhs)
         coeffs -= set(u_list)
-        sorted_coeffs = sorted(coeffs, key=lambda c: c.ufl_id())
-        for c in sorted_coeffs:
+        for c in sort_coefficients(coeffs):
             self.add_dependency(c, no_duplicates=True)
 
         # Cache form parameters for later
