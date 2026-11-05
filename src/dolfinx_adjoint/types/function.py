@@ -281,7 +281,6 @@ class Function(dolfinx.fem.Function, FloatingType):
         return self._x
 
 
-@attach_ufl_id
 class Constant(Function):
     """A class overloading {py:class}`dolfinx.fem.Constant`
     to support it being used as a control variable in
@@ -306,10 +305,9 @@ class Constant(Function):
         name: str | None = None,
         ufl_id: int | None = None,
     ):
-        self._ufl_id = self._init_ufl_id(ufl_id)
-
+        # Draw the ufl_id from Function's counter, so that no Function and Constant share one
         V = real_functionspace(domain, value_shape=numpy.shape(c))
-        super().__init__(V, name=name)
+        super().__init__(V, name=name, ufl_id=ufl_id)
         self.x.array[:] = c
 
     @property

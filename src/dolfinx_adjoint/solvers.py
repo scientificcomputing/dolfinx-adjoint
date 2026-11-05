@@ -14,6 +14,7 @@ from .blocks.solvers import (
     NonlinearProblemBlock,
     _ProblemBlockBase,
     collect_coefficients,
+    sort_coefficients,
 )
 from .petsc_utils import HomogeneousBCLinearProblem
 from .types import Function
@@ -942,9 +943,8 @@ class LinearProblem(_ProblemBase, dolfinx.fem.petsc.LinearProblem):
             if set(u_list).issubset(coefficients):
                 raise ValueError("The unknown `u` should not be part of the coefficients of a linear problem.")
         # Has to be sorted when creating placeholders, as function creation is a collective operation
-        sorted_coefficients = sorted(coefficients, key=lambda c: c.ufl_id())
         self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
-            c: dolfinx.fem.Function(c.function_space) for c in sorted_coefficients
+            c: dolfinx.fem.Function(c.function_space) for c in sort_coefficients(coefficients)
         }
         a_R, L_R, P_R = recursive_replace((a, L, P), self._value_placeholders)  # type: ignore[misc]
         super().__init__(
@@ -1159,9 +1159,8 @@ class NonlinearProblem(_ProblemBase, dolfinx.fem.petsc.NonlinearProblem):
         if J is not None:
             coefficients |= collect_coefficients(J) - set(u_list)
         # Has to be sorted when creating placeholders, as function creation is a collective operation
-        sorted_coefficients = sorted(coefficients, key=lambda c: c.ufl_id())
         self._value_placeholders: dict[dolfinx.fem.Function, dolfinx.fem.Function] = {
-            c: dolfinx.fem.Function(c.function_space) for c in sorted_coefficients
+            c: dolfinx.fem.Function(c.function_space) for c in sort_coefficients(coefficients)
         }
 
         # Initialize nonlinear solver
