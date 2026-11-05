@@ -5,7 +5,6 @@ import pytest
 import ufl
 
 from dolfinx_adjoint import Constant, Function
-from dolfinx_adjoint.solvers import LinearProblem, NonlinearProblem
 
 requires_petsc = pytest.mark.skipif(not dolfinx.has_petsc4py, reason="needs DOLFINx built with PETSc")
 
@@ -33,6 +32,8 @@ def test_placeholder_order_independent_of_hash(monkeypatch, reverse):
     on odd ranks, and in serial between the two parametrizations. Both coefficients live
     in the same space, so a wrong order fails the assertion rather than deadlocking.
     """
+    from dolfinx_adjoint.solvers import LinearProblem, NonlinearProblem
+
     comm = MPI.COMM_WORLD
     order = ["g", "f"] if reverse != (comm.rank % 2 == 1) else ["f", "g"]
     original_hash = Function.__hash__
