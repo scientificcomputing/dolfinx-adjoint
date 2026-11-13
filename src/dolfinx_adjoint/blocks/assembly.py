@@ -43,6 +43,32 @@ def assemble_compiled_form(
     return tensor
 
 
+def assemble_compiled_forms(
+    forms: typing.Sequence[dolfinx.fem.Form], tensor: typing.Union[dolfinx.la.Vector, _SpecialVector]
+) -> typing.Union[dolfinx.la.Vector, _SpecialVector]:
+    """Accumulate several compiled rank-1 forms into ``tensor``, exchanging ghosts once.
+
+    Calling :py:func:`assemble_compiled_form` repeatedly on the same vector is wrong in
+    parallel: each call ends in a forward scatter that leaves the ghost entries holding
+    copies of their owners' values, and the next call's reverse scatter adds those copies
+    back into the owners again. Here every form's local contribution is summed first, and
+    the ghost contributions are sent to their owners once at the end.
+
+    Args:
+        forms: Compiled rank-1 forms on the same test space as ``tensor``.
+        tensor: The vector to accumulate into.
+    Returns:
+        ``tensor`` itself (mutated in place).
+    """
+    for form in forms:
+        if form.rank != 1:
+            raise NotImplementedError("Only 1-form accumulation is supported.")
+        dolfinx.fem.assemble._assemble_vector_array(tensor.array, form)
+    tensor.scatter_reverse(dolfinx.la.InsertMode.add)
+    tensor.scatter_forward()
+    return tensor
+
+
 class AssembleBlock(Block):
     """Block for assembling a symbolic UFL form into a tensor.
 
